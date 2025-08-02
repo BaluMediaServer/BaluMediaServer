@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFramework>net9.0-android</TargetFramework>
+		<UseMaui>true</UseMaui>
+		<SupportedOSPlatformVersion>26</SupportedOSPlatformVersion>
+		<Nullable>enable</Nullable>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<!-- NuGet Package Properties -->
+		<GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+		<PackageId>BaluMediaServer.CameraStreamer</PackageId>
+		<PackageVersion>1.0.0</PackageVersion>
+		<Authors>Nakano Miku 13</Authors>
+		<Company>Balu Media Server</Company>
+		<Product>Balu Media Camera Streamer</Product>
+		<Description>Android camera streaming library with dual camera support for MAUI applications</Description>
+		<Copyright>Copyright © Balu Media Server 2025</Copyright>
+		<PackageTags>android;camera;streaming;maui;dual-camera</PackageTags>
+		<PackageProjectUrl>https://github.com/BaluMediaServer</PackageProjectUrl>
+		<RepositoryUrl>https://github.com/BaluMediaServer/BaluMediaServer</RepositoryUrl>
+		<RepositoryType>git</RepositoryType>
+		<PackageLicenseExpression>MIT</PackageLicenseExpression>
+		<PackageReleaseNotes>Initial release with dual camera support</PackageReleaseNotes>
+		
+		<!-- Include symbols for debugging -->
+		<IncludeSymbols>true</IncludeSymbols>
+		<SymbolPackageFormat>snupkg</SymbolPackageFormat>
+		
+		<!-- Include dependencies -->
+		<DevelopmentDependency>false</DevelopmentDependency>
+	</PropertyGroup>
+
+
+	<ItemGroup>
+		<PackageReference Include="Microsoft.Maui.Essentials" Version="$(MauiVersion)" />
+		<PackageReference Include="Microsoft.Maui.Controls" Version="9.0.51" />
+	</ItemGroup>
+	<ItemGroup>
+		<AndroidLibrary Include="Jar\camerastreamer-release.aar" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<TransformFile Include="Transforms\Metadata.xml" />
+	</ItemGroup>
+</Project>

@@ -1,0 +1,116 @@
+<metadata>
+  <!-- Remove all AndroidX namespaces - they're already in .NET Android -->
+  <remove-node path="/api/package[starts-with(@name, 'androidx.')]" />
+  
+  <!-- Remove Android core namespaces -->
+  <remove-node path="/api/package[starts-with(@name, 'android.')]" />
+  
+  <!-- Remove Kotlin runtime classes -->
+  <remove-node path="/api/package[starts-with(@name, 'kotlin.')]" />
+  <remove-node path="/api/package[starts-with(@name, 'kotlinx.')]" />
+  
+  <!-- Remove Java core classes -->
+  <remove-node path="/api/package[starts-with(@name, 'java.')]" />
+  <remove-node path="/api/package[starts-with(@name, 'javax.')]" />
+  
+  <!-- Remove org.jetbrains annotations -->
+  <remove-node path="/api/package[starts-with(@name, 'org.jetbrains.')]" />
+  
+  <!-- Keep only your library's package -->
+  <!-- Fix naming conventions for your library -->
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']" name="managedName">Com.BaluMedia.CameraStreamer</attr>
+  
+  <!-- VideoFrame data class -->
+  <!-- Fix VideoFrame data property - remove the component methods to avoid duplicates -->
+  <remove-node path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='VideoFrame']/method[@name='component1']" />
+  <remove-node path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='VideoFrame']/method[@name='component2']" />
+  <remove-node path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='VideoFrame']/method[@name='component3']" />
+  <remove-node path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='VideoFrame']/method[@name='component4']" />
+  <remove-node path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='VideoFrame']/method[@name='component5']" />
+  <remove-node path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='VideoFrame']/method[@name='component6']" />
+  <remove-node path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='VideoFrame']/method[@name='component7']" />
+  
+  <!-- Remove copy methods if they cause issues -->
+  <remove-node path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='VideoFrame']/method[@name='copy']" />
+  
+  <!-- Map VideoFrame properties -->
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='VideoFrame']/method[@name='getData']" name="propertyName">Data</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='VideoFrame']/method[@name='getWidth']" name="propertyName">Width</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='VideoFrame']/method[@name='getHeight']" name="propertyName">Height</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='VideoFrame']/method[@name='getTimestamp']" name="propertyName">Timestamp</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='VideoFrame']/method[@name='getFormat']" name="propertyName">Format</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='VideoFrame']/method[@name='getCameraId']" name="propertyName">CameraId</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='VideoFrame']/method[@name='getCameraType']" name="propertyName">CameraType</attr>
+  
+  <!-- Ensure VideoFrame constructor is visible -->
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='VideoFrame']/constructor" name="visibility">public</attr>
+  
+  <!-- CameraType enum -->
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraType']" name="visibility">public</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraType']/field[@name='FRONT']" name="managedName">Front</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraType']/field[@name='BACK']" name="managedName">Back</attr>
+  
+  <!-- Front Camera Callback Interface -->
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/interface[@name='FrontCameraFrameCallback']" name="visibility">public</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/interface[@name='FrontCameraFrameCallback']/method[@name='onFrameAvailable']" name="managedName">OnFrameAvailable</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/interface[@name='FrontCameraFrameCallback']/method[@name='onError']" name="managedName">OnError</attr>
+  
+  <!-- Back Camera Callback Interface -->
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/interface[@name='BackCameraFrameCallback']" name="visibility">public</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/interface[@name='BackCameraFrameCallback']/method[@name='onFrameAvailable']" name="managedName">OnFrameAvailable</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/interface[@name='BackCameraFrameCallback']/method[@name='onError']" name="managedName">OnError</attr>
+  
+  <!-- CameraFrameCaptureService class -->
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']" name="visibility">public</attr>
+  
+  <!-- Map main service methods -->
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']/method[@name='hasPermission']" name="visibility">public</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']/method[@name='getAvailableCameras']" name="visibility">public</attr>
+  
+  <!-- Front Camera Methods -->
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']/method[@name='setFrontCameraCallback']" name="visibility">public</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']/method[@name='getFrontCameraFrameQueue']" name="visibility">public</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']/method[@name='startFrontCameraCapture']" name="visibility">public</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']/method[@name='stopFrontCameraCapture']" name="visibility">public</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']/method[@name='isFrontCameraCapturing']" name="visibility">public</attr>
+  
+  <!-- Back Camera Methods -->
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']/method[@name='setBackCameraCallback']" name="visibility">public</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']/method[@name='getBackCameraFrameQueue']" name="visibility">public</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']/method[@name='startBackCameraCapture']" name="visibility">public</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']/method[@name='stopBackCameraCapture']" name="visibility">public</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']/method[@name='isBackCameraCapturing']" name="visibility">public</attr>
+  
+  <!-- Both Cameras Methods -->
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']/method[@name='startBothCameras']" name="visibility">public</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']/method[@name='stopBothCameras']" name="visibility">public</attr>
+  
+  <!-- Handle Kotlin companion objects -->
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService.Companion']" name="visibility">public</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService.Companion']" name="managedName">Companion</attr>
+  
+  <!-- Fix the FrameConverter - it's an object in Kotlin, not a class -->
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='FrameConverter']" name="visibility">public</attr>
+  <!-- Remove getInstance if it exists to avoid confusion -->
+  <remove-node path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='FrameConverter']/method[@name='getInstance']" />
+  <!-- Make the methods static since it's a Kotlin object -->
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='FrameConverter']/method[@name='nv21ToRgb888']" name="static">true</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='FrameConverter']/method[@name='nv21ToArgb8888']" name="static">true</attr>
+  
+  <!-- Remove any INSTANCE field from FrameConverter if it gets exposed -->
+  <remove-node path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='FrameConverter']/field[@name='INSTANCE']" />
+  
+  <!-- Handle Pair return type for startBothCameras -->
+  <!-- This might need adjustment based on how Kotlin Pair is exposed -->
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']/method[@name='startBothCameras' and count(parameter)=2]" name="managedReturn">System.ValueTuple&lt;bool, bool&gt;</attr>
+  
+  <!-- Ensure LinkedBlockingQueue methods return proper type -->
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']/method[@name='getFrontCameraFrameQueue']" name="managedReturn">Java.Util.Concurrent.IBlockingQueue</attr>
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']/method[@name='getBackCameraFrameQueue']" name="managedReturn">Java.Util.Concurrent.IBlockingQueue</attr>
+  
+  <!-- Transform the method that returns (bool, bool) to return a custom class instead -->
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']/method[@name='startBothCameras']" name="managedReturn">Java.Lang.Object</attr>
+
+  <attr path="/api/package[@name='com.balumedia.camerastreamer']/class[@name='CameraFrameCaptureService']/method[returns='kotlin.Pair']" name="managedReturn">Java.Lang.Object</attr>
+
+</metadata>
