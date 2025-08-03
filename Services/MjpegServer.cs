@@ -14,8 +14,8 @@ public class MjpegServer
     {
         Port = port;
         _listener = new HttpListener();
-        _listener.Prefixes.Add($"http://localhost:{Port}/Back");
-        _listener.Prefixes.Add($"http://localhost:{Port}/Front");
+        _listener.Prefixes.Add($"http://localhost:{Port}/Back/");
+        _listener.Prefixes.Add($"http://localhost:{Port}/Front/");
         Server.OnNewBackFrame += OnBackFrameAvailable;
         Server.OnNewFrontFrame += OnFrontFrameAvailable;
     }

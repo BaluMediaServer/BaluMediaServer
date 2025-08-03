@@ -17,13 +17,12 @@ using BaluMediaServer.Repositories;
 
 namespace BaluMediaServer.Services;
 
-public class Server : Service, IDisposable
+public class Server : IDisposable
 {
     private FrontCameraService _frontService = new();
     private BackCameraService _backService = new();
     private MjpegServer _mjpegServerFront = new(8090), _mjpegServerBack = new();
     private bool RequireAuthentication { get; set; } = true;
-    public override IBinder OnBind(Intent? intent) => default!;
     private Socket _socket = default!;
     private int _port = 7778, _maxClients = 100;
     private readonly object _portLock = new();
@@ -51,7 +50,6 @@ public class Server : Service, IDisposable
     };
     public Server(int Port = 7778, int MaxClients = 100, string Address = "0.0.0.0", Dictionary<string, string>? Users = null)
     {
-        base.OnCreate();
         EventBuss.Command += OnCommandSend;
         _enabled = true;
         _port = Port;

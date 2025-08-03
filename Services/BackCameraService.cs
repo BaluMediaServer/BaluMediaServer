@@ -18,6 +18,7 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
     private readonly TimeSpan _minFrameInterval = TimeSpan.FromMilliseconds(22); // +- 45 fps 
     public event EventHandler<FrameEventArgs>? FrameReceived;
     public event EventHandler<string>? ErrorOccurred;
+    private bool _threadRunning = false;
     public BackCameraService()
     {
         _context = Platform.CurrentActivity ?? global::Android.App.Application.Context;
@@ -29,6 +30,8 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
         try
         {
             _cameraCapture?.StartBackCameraCapture(width, height);
+            _threadRunning = true;
+            Task.Run(ProcessFrames, _cts.Token);
         }
         catch (Exception ex)
         {
@@ -39,7 +42,8 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
     {
         try
         {
-            
+            _cameraCapture?.StopBackCameraCapture();
+            _threadRunning = false;
         }
         catch (Exception ex)
         {
@@ -79,7 +83,7 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
     }
     public void ProcessFrames()
     {
-        while (!_cts.IsCancellationRequested)
+        while (!_cts.IsCancellationRequested && _threadRunning)
         {
             try
             {
@@ -120,6 +124,7 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
         if (disposing)
         {
             _cameraCapture?.StopBackCameraCapture();
+            _threadRunning = false;
             _cts?.Cancel();
             if (_thread != null)
             {
