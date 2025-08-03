@@ -659,6 +659,15 @@ Server.OnClientsChange += (clients) => {
 // In FFmpeg:
 // Use the -rtsp_transport tcp flag
 ```
+## Images
+
+### Streaming back camera (ffplay)
+![Mobile App](Docs/RTSP_STREAM.png)
+### Streaming front camera (ffplay)
+![Mobile App](Docs/FRONT_RTSP_STREAM.png)
+### Mobile App Interface
+![Mobile App](Docs/DEMO.jpeg)
+
 
 ## ⚠️ Current Limitations
 
@@ -669,6 +678,9 @@ Server.OnClientsChange += (clients) => {
 - **H.264 Stability**: H.264 codec may have stability issues on some non-MediaTek devices
 - **Transport Protocol**: **UDP transport has known issues** - TCP transport is recommended for reliable streaming
 - **iOS Support**: Not available (long-term roadmap item)
+- **Image orientation**: Some devices can experiment image rotation
+- **Image blazor preview**: Some devices can experiment some issues displaying the images fetched from the MJPEG Server, this can depend if the devices allow access to LoopBack or not (Not fixable at all)
+
 
 ## 🛣️ Roadmap
 
@@ -676,6 +688,7 @@ Server.OnClientsChange += (clients) => {
 - ⬜ Fix H.264 stream stutter issues
 - ⬜ Add support for multiple profiles/routes (`/live/front`, `/live/back`)
 - ⬜ Add user/password control panel
+- ⬜ Fix image rotation
 - ⬜ Add bitrate/resolution configuration
 - ⬜ **Fix UDP transport reliability issues** (currently TCP is recommended)
 
