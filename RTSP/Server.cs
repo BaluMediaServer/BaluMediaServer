@@ -17,31 +17,27 @@ using BaluMediaServer.Repositories;
 
 namespace BaluMediaServer.Services;
 
-public class Server : Service, IDisposable
+public class Server : IDisposable
 {
     private FrontCameraService _frontService = new();
     private BackCameraService _backService = new();
     private MjpegServer _mjpegServerFront = new(8090), _mjpegServerBack = new();
     private bool RequireAuthentication { get; set; } = true;
-    public override IBinder OnBind(Intent? intent) => default!;
     private Socket _socket = default!;
-    private int _port = 7778, _maxClients = 100;
+    private int _port = 7778, _maxClients = 100, _nextRtpPort = 5000;
     private readonly object _portLock = new();
-    private int _nextRtpPort = 5000; // Starting port for RTP
     private readonly HashSet<int> _usedPorts = new();
     private readonly CancellationTokenSource _cts = new();
     private ConcurrentBag<Client> _clients = new();
     private string _uri = string.Empty;
-    private bool _isStreaming = false, _isCapturingFront = false, _isCapturingBack = false, _mjpegFrontServerEnabled = false, _mjpegBackServerEnabled = false;
+    private bool _isStreaming = false, _enabled = false, _isCapturingFront = false, _isCapturingBack = false, _mjpegFrontServerEnabled = false, _mjpegBackServerEnabled = false;
     private FrameEventArgs? _latestFrontFrame, _latestBackFrame;
     private readonly ConcurrentDictionary<string, string> _nonceCache = new();
     private readonly TimeSpan _nonceExpiry = TimeSpan.FromMinutes(5);
     private readonly object _frameFrontLock = new(), _frameBackLock = new(), _h264FrontLock = new(), _h264BackLock = new();
     private MediaTekH264Encoder? _h264FrontEncoder, _h264BackEncoder;
     private H264FrameEventArgs? _latestH264FrameFront, _latestH264FrameBack;
-    private readonly Dictionary<string, byte[]?> _clientSpsCache = new();
-    private readonly Dictionary<string, byte[]?> _clientPpsCache = new();
-    private bool _enabled = false;
+    private readonly Dictionary<string, byte[]?> _clientSpsCache = new(), _clientPpsCache = new();
     public static event Action<List<Client>>? OnClientsChange;
     public static event EventHandler<bool>? OnStreaming;
     public static event EventHandler<FrameEventArgs>? OnNewFrontFrame, OnNewBackFrame;
@@ -51,7 +47,6 @@ public class Server : Service, IDisposable
     };
     public Server(int Port = 7778, int MaxClients = 100, string Address = "0.0.0.0", Dictionary<string, string>? Users = null)
     {
-        base.OnCreate();
         EventBuss.Command += OnCommandSend;
         _enabled = true;
         _port = Port;
@@ -266,8 +261,10 @@ public class Server : Service, IDisposable
             await Task.Delay(1000, _cts.Token);
         }
     }
-    public new void Dispose()
+    public void Dispose()
     {
+        _mjpegServerBack?.Dispose();
+        _mjpegServerFront?.Dispose();
         _cts?.Cancel();
         _socket?.Dispose();
     }
@@ -458,6 +455,16 @@ public class Server : Service, IDisposable
             await SendRtspResponse(writer, 404, "Not Found", request.CSeq);
             return;
         }
+
+        if (uri.AbsolutePath.Contains("/mjpeg"))
+        {
+            client.Codec = CodecType.MJPEG;
+        }
+        else
+        {
+            client.Codec = CodecType.H264;
+        }
+
         if (uri.AbsolutePath.Contains("/live/front"))
         {
             client.CameraId = 1; // FRONT CAMERA

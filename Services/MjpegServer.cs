@@ -3,7 +3,7 @@ using System.Text;
 using BaluMediaServer.Models;
 using BaluMediaServer.Repositories;
 namespace BaluMediaServer.Services;
-public class MjpegServer
+public class MjpegServer : IDisposable
 {
     private readonly HttpListener _listener;
     private readonly List<HttpListenerResponse> _clientsFront = new(), _clientsBack = new();
@@ -14,10 +14,16 @@ public class MjpegServer
     {
         Port = port;
         _listener = new HttpListener();
-        _listener.Prefixes.Add($"http://localhost:{Port}/Back");
-        _listener.Prefixes.Add($"http://localhost:{Port}/Front");
+        _listener.Prefixes.Add($"http://+:{Port}/Back/");
+        _listener.Prefixes.Add($"http://+:{Port}/Front/");
         Server.OnNewBackFrame += OnBackFrameAvailable;
         Server.OnNewFrontFrame += OnFrontFrameAvailable;
+    }
+    public void Dispose()
+    {
+        Server.OnNewBackFrame -= OnBackFrameAvailable;
+        Server.OnNewFrontFrame -= OnFrontFrameAvailable;
+        _listener?.Close();
     }
     private void OnBackFrameAvailable(object? sender, FrameEventArgs arg)
     {

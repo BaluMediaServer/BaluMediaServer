@@ -20,6 +20,7 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
     private readonly TimeSpan _minFrameInterval = TimeSpan.FromMilliseconds(22); // +- 45 fps 
     public event EventHandler<FrameEventArgs>? FrameReceived;
     public event EventHandler<string>? ErrorOccurred;
+    public bool _threadRunning = false;
     public FrontCameraService()
     {
         _context = Platform.CurrentActivity ?? global::Android.App.Application.Context;
@@ -31,6 +32,8 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
         try
         {
             _cameraCapture?.StartFrontCameraCapture(width, height);
+            _threadRunning = true;
+            Task.Run(ProcessFrames, _cts.Token);
         }
         catch (Exception ex)
         {
@@ -41,7 +44,8 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
     {
         try
         {
-            
+            _cameraCapture?.StopFrontCameraCapture();
+            _threadRunning = false;
         }
         catch (Exception ex)
         {
@@ -80,7 +84,7 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
     }
     public void ProcessFrames()
     {
-        while (!_cts.IsCancellationRequested)
+        while (!_cts.IsCancellationRequested && _threadRunning)
         {
             try
             {
