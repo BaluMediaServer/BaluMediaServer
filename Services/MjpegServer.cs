@@ -1,13 +1,15 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Text;
 using BaluMediaServer.Models;
 using BaluMediaServer.Repositories;
 namespace BaluMediaServer.Services;
+
 public class MjpegServer : IDisposable
 {
     private readonly HttpListener _listener;
-    private readonly List<HttpListenerResponse> _clientsFront = new(), _clientsBack = new();
-    private readonly object _lock = new();
+    private readonly ConcurrentDictionary<HttpListenerResponse, string> _clientsFront = new(), _clientsBack = new();
+    private readonly object _lockFront = new(), _lockBack = new();
     public int Port { get; }
 
     public MjpegServer(int port = 8089)
@@ -29,14 +31,14 @@ public class MjpegServer : IDisposable
     {
         if (arg != null && arg.Data != null && arg.Data.Length > 0)
         {
-            this.PushFrame(Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height, Android.Graphics.ImageFormatType.Nv21));
+            this.PushBackFrame(Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height, Android.Graphics.ImageFormatType.Nv21));
         }
     }
     private void OnFrontFrameAvailable(object? sender, FrameEventArgs arg)
     {
         if (arg != null && arg.Data != null && arg.Data.Length > 0)
         {
-            this.PushFrame(Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height, Android.Graphics.ImageFormatType.Nv21));
+            this.PushFrontFrame(Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height, Android.Graphics.ImageFormatType.Nv21));
         }
     }
     public void Start()
@@ -76,17 +78,13 @@ public class MjpegServer : IDisposable
         response.ContentType = "multipart/x-mixed-replace; boundary=--frame";
         response.StatusCode = 200;
         response.SendChunked = true;
-
-        lock (_lock)
+        if (context.Request.Url.ToString().Contains("Back"))
         {
-            if (context.Request.Url.ToString().Contains("Back"))
-            {
-                _clientsBack.Add(response);
-            }
-            else
-            {
-                _clientsFront.Add(response);
-            }
+            _clientsBack.TryAdd(response, Guid.NewGuid().ToString());
+        }
+        else
+        {
+            _clientsFront.TryAdd(response, Guid.NewGuid().ToString());
         }
 
         try
@@ -104,11 +102,11 @@ public class MjpegServer : IDisposable
         {
             if (context.Request.Url.ToString().Contains("Back"))
             {
-                _clientsBack.Remove(response);
+                _clientsBack.TryRemove(response, out var _);
             }
             else
             {
-                _clientsFront.Remove(response);
+                _clientsFront.TryRemove(response, out var _);
             }
 
             response.OutputStream.Close();
@@ -116,43 +114,50 @@ public class MjpegServer : IDisposable
         }
     }
 
-    public void PushFrame(byte[] jpegBytes, bool front = false)
+    public void PushBackFrame(byte[] jpegBytes, bool front = false)
     {
         var header = Encoding.ASCII.GetBytes(
             "\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + jpegBytes.Length + "\r\n\r\n");
 
-        lock (_lock)
+        lock (_lockBack)
         {
-            if (front)
-                foreach (var client in _clientsFront.ToList())
+            foreach (var client in _clientsBack.Keys.ToList())
+            {
+                try
                 {
-                    try
-                    {
-                        client.OutputStream.Write(header, 0, header.Length);
-                        client.OutputStream.Write(jpegBytes, 0, jpegBytes.Length);
-                        client.OutputStream.Flush();
-                    }
-                    catch
-                    {
-                        _clientsFront.Remove(client);
-                        try { client.OutputStream.Close(); client.Close(); } catch { }
-                    }
+                    client.OutputStream.Write(header, 0, header.Length);
+                    client.OutputStream.Write(jpegBytes, 0, jpegBytes.Length);
+                    client.OutputStream.Flush();
                 }
-            else
-                foreach (var client in _clientsBack.ToList())
+                catch
                 {
-                    try
-                    {
-                        client.OutputStream.Write(header, 0, header.Length);
-                        client.OutputStream.Write(jpegBytes, 0, jpegBytes.Length);
-                        client.OutputStream.Flush();
-                    }
-                    catch
-                    {
-                        _clientsBack.Remove(client);
-                        try { client.OutputStream.Close(); client.Close(); } catch { }
-                    }
+                    _clientsBack.TryRemove(client, out var _);
+                    try { client.OutputStream.Close(); client.Close(); } catch { }
                 }
+            }
+        }
+    }
+    public void PushFrontFrame(byte[] jpegBytes, bool front = false)
+    {
+        var header = Encoding.ASCII.GetBytes(
+            "\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + jpegBytes.Length + "\r\n\r\n");
+
+        lock (_lockFront)
+        {
+            foreach (var client in _clientsFront.Keys.ToList())
+            {
+                try
+                {
+                    client.OutputStream.Write(header, 0, header.Length);
+                    client.OutputStream.Write(jpegBytes, 0, jpegBytes.Length);
+                    client.OutputStream.Flush();
+                }
+                catch
+                {
+                    _clientsFront.TryRemove(client, out var _);
+                    try { client.OutputStream.Close(); client.Close(); } catch { }
+                }
+            }
         }
     }
 }
