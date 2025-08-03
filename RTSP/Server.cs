@@ -455,6 +455,16 @@ public class Server : IDisposable
             await SendRtspResponse(writer, 404, "Not Found", request.CSeq);
             return;
         }
+
+        if (uri.AbsolutePath.Contains("/mjpeg"))
+        {
+            client.Codec = CodecType.MJPEG;
+        }
+        else
+        {
+            client.Codec = CodecType.H264;
+        }
+
         if (uri.AbsolutePath.Contains("/live/front"))
         {
             client.CameraId = 1; // FRONT CAMERA

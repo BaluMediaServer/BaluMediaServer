@@ -16,6 +16,8 @@ public class MjpegServer : IDisposable
         _listener = new HttpListener();
         _listener.Prefixes.Add($"http://localhost:{Port}/Back/");
         _listener.Prefixes.Add($"http://localhost:{Port}/Front/");
+        _listener.Prefixes.Add($"http://+:{Port}/Back/");
+        _listener.Prefixes.Add($"http://+:{Port}/Front/");
         Server.OnNewBackFrame += OnBackFrameAvailable;
         Server.OnNewFrontFrame += OnFrontFrameAvailable;
     }
