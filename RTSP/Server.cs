@@ -21,7 +21,7 @@ public class Server : IDisposable
 {
     private FrontCameraService _frontService = new();
     private BackCameraService _backService = new();
-    private MjpegServer _mjpegServerFront = new(8090), _mjpegServerBack = new();
+    private MjpegServer _mjpegServer = new();
     private bool RequireAuthentication { get; set; } = true;
     private Socket _socket = default!;
     private int _port = 7778, _maxClients = 100, _nextRtpPort = 5000;
@@ -30,7 +30,7 @@ public class Server : IDisposable
     private readonly CancellationTokenSource _cts = new();
     private ConcurrentBag<Client> _clients = new();
     private string _uri = string.Empty;
-    private bool _isStreaming = false, _enabled = false, _isCapturingFront = false, _isCapturingBack = false, _mjpegFrontServerEnabled = false, _mjpegBackServerEnabled = false;
+    private bool _isStreaming = false, _enabled = false, _isCapturingFront = false, _isCapturingBack = false, _mjpegServerEnabled = false, _frontCameraEnabled, _backCameraEnabled;
     private FrameEventArgs? _latestFrontFrame, _latestBackFrame;
     private readonly ConcurrentDictionary<string, string> _nonceCache = new();
     private readonly TimeSpan _nonceExpiry = TimeSpan.FromMinutes(5);
@@ -45,13 +45,16 @@ public class Server : IDisposable
     {
         { "admin", "password123" }
     };
-    public Server(int Port = 7778, int MaxClients = 100, string Address = "0.0.0.0", Dictionary<string, string>? Users = null)
+    public Server(int Port = 7778, int MaxClients = 100, string Address = "0.0.0.0", Dictionary<string, string>? Users = null, bool BackCameraEnabled = true, bool FrontCameraEnabled = true)
     {
         EventBuss.Command += OnCommandSend;
         _enabled = true;
         _port = Port;
         _maxClients = MaxClients;
         _users = Users == null ? _users : Users;
+        _mjpegServer = new();
+        _frontCameraEnabled = FrontCameraEnabled;
+        _backCameraEnabled = BackCameraEnabled;
         IPEndPoint endpoint = new(IPAddress.Parse(Address), _port);
         _socket = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
@@ -66,7 +69,7 @@ public class Server : IDisposable
         switch (command)
         {
             case BussCommand.START_CAMERA_FRONT:
-                if (!_isCapturingFront)
+                if (!_isCapturingFront && _frontCameraEnabled)
                 {
                     _frontService.StartCapture();
                     _isCapturingFront = true;
@@ -80,7 +83,7 @@ public class Server : IDisposable
                 }
                 break;
             case BussCommand.START_CAMERA_BACK:
-                if (!_isCapturingBack)
+                if (!_isCapturingBack && _backCameraEnabled)
                 {
                     _backService.StartCapture();
                     _isCapturingBack = true;
@@ -94,23 +97,15 @@ public class Server : IDisposable
                 }
                 break;
             case BussCommand.START_MJPEG_SERVER:
-                if (!_mjpegBackServerEnabled)
+                if (!_mjpegServerEnabled)
                 {
-                    _mjpegServerBack.Start();
-                }
-                if (!_mjpegFrontServerEnabled)
-                {
-                    _mjpegServerFront.Start();
+                    _mjpegServer.Start();
                 }
                 break;
             case BussCommand.STOP_MJPEG_SERVER:
-                if (_mjpegBackServerEnabled)
+                if (_mjpegServerEnabled)
                 {
-                    _mjpegServerBack.Stop();
-                }
-                if (_mjpegFrontServerEnabled)
-                {
-                    _mjpegServerFront.Stop();
+                    _mjpegServer.Stop();
                 }
                 break;
             default:
@@ -240,10 +235,13 @@ public class Server : IDisposable
                 var connected = _clients.Count(p => p.Socket?.Connected ?? false);
                 if (connected == 0 && _isStreaming)
                 {
-                    if(!_mjpegFrontServerEnabled && !_isCapturingFront)
-                        _frontService.StopCapture();
-                    if(!_mjpegBackServerEnabled && !_isCapturingBack)
-                        _backService.StopCapture();
+                    if (!_mjpegServerEnabled)
+                    {
+                        if (!_isCapturingBack)
+                            _backService.StopCapture();
+                        if (!_isCapturingFront)
+                            _frontService.StopCapture();
+                    }
                     StopH264EncoderBack();
                     StopH264EncoderFront();
                     lock (_clients)
@@ -263,8 +261,7 @@ public class Server : IDisposable
     }
     public void Dispose()
     {
-        _mjpegServerBack?.Dispose();
-        _mjpegServerFront?.Dispose();
+        _mjpegServer?.Dispose();
         _cts?.Cancel();
         _socket?.Dispose();
     }
