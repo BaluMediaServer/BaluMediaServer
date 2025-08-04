@@ -747,7 +747,8 @@ There are few (if any) options to integrate RTSP servers with Android using C# a
 
 - v1.1.2: Adding at Server CTOR two new variables to handle if the front or back camera should be enabled, this avoid the problem that only one camera start on devices that can not handle both cameras at same time. 
 
-
+- v1.1.3: Adding handling for auto-quality adjust based on rtcp control for MJPEG codec, allowing to increase or decrease the image quality to guarantee video stability over this codec.
+-- Adding a preview (WIP) for video profiles allowing to create custom paths for this new profiles, will allow to set a custom resolution, bitrate and more.
 ---
 
 **Thanks for checking out Balu Media Server!** 
