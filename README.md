@@ -743,6 +743,11 @@ There are few (if any) options to integrate RTSP servers with Android using C# a
 3. **Create an Issue**: Provide detailed information about your problem
 4. **Community**: Join discussions with other developers
 
+## Patch Notes
+
+- v1.1.2: Adding at Server CTOR two new variables to handle if the front or back camera should be enabled, this avoid the problem that only one camera start on devices that can not handle both cameras at same time. 
+
+
 ---
 
 **Thanks for checking out Balu Media Server!** 
