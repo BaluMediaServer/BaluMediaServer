@@ -33,14 +33,17 @@ public class Server : IDisposable
     private bool _isStreaming = false, _enabled = false, _isCapturingFront = false, _isCapturingBack = false, _mjpegServerEnabled = false, _frontCameraEnabled, _backCameraEnabled;
     private FrameEventArgs? _latestFrontFrame, _latestBackFrame;
     private readonly ConcurrentDictionary<string, string> _nonceCache = new();
+    private readonly string _address = string.Empty;
     private readonly TimeSpan _nonceExpiry = TimeSpan.FromMinutes(5);
     private readonly object _frameFrontLock = new(), _frameBackLock = new(), _h264FrontLock = new(), _h264BackLock = new();
     private MediaTekH264Encoder? _h264FrontEncoder, _h264BackEncoder;
     private H264FrameEventArgs? _latestH264FrameFront, _latestH264FrameBack;
+    private List<VideoProfile> _videoProfiles = new();
     private readonly Dictionary<string, byte[]?> _clientSpsCache = new(), _clientPpsCache = new();
     public static event Action<List<Client>>? OnClientsChange;
     public static event EventHandler<bool>? OnStreaming;
     public static event EventHandler<FrameEventArgs>? OnNewFrontFrame, OnNewBackFrame;
+    
     private Dictionary<string, string> _users = new()
     {
         { "admin", "password123" }
@@ -55,7 +58,12 @@ public class Server : IDisposable
         _mjpegServer = new();
         _frontCameraEnabled = FrontCameraEnabled;
         _backCameraEnabled = BackCameraEnabled;
-        IPEndPoint endpoint = new(IPAddress.Parse(Address), _port);
+        _address = Address;
+        ConfigureSocket();
+    }
+    private void ConfigureSocket()
+    {
+        IPEndPoint endpoint = new(IPAddress.Parse(_address), _port);
         _socket = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         _socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true); // Disable Nagle's
@@ -64,6 +72,7 @@ public class Server : IDisposable
         _socket.Bind(endpoint);
         _socket.Listen(_maxClients);
     }
+    public void SetVideoProfile(VideoProfile profile) => _videoProfiles.Add(profile);
     private void OnCommandSend(BussCommand command)
     {
         switch (command)
@@ -79,7 +88,7 @@ public class Server : IDisposable
                 if (!_isStreaming && _isCapturingFront)
                 {
                     _frontService.StopCapture();
-                    _isCapturingFront = false;   
+                    _isCapturingFront = false;
                 }
                 break;
             case BussCommand.START_CAMERA_BACK:
@@ -93,7 +102,7 @@ public class Server : IDisposable
                 if (!_isStreaming && _isCapturingBack)
                 {
                     _backService.StopCapture();
-                    _isCapturingBack = false;   
+                    _isCapturingBack = false;
                 }
                 break;
             case BussCommand.START_MJPEG_SERVER:
@@ -106,6 +115,22 @@ public class Server : IDisposable
                 if (_mjpegServerEnabled)
                 {
                     _mjpegServer.Stop();
+                }
+                break;
+            case BussCommand.SWITCH_CAMERA:
+                _mjpegServer?.Dispose();
+                _mjpegServer = new();
+                _socket?.Close();
+                ConfigureSocket();
+                if (_frontCameraEnabled)
+                {
+                    _frontCameraEnabled = false;
+                    _backCameraEnabled = true;
+                }
+                else if (_backCameraEnabled)
+                {
+                    _backCameraEnabled = false;
+                    _frontCameraEnabled = true;
                 }
                 break;
             default:
@@ -437,23 +462,24 @@ public class Server : IDisposable
 
         await SendRtspResponse(writer, 200, "OK", request.CSeq, headers);
     }
-    private async Task ProcessRtspRequest(StreamWriter writer, RtspRequest request, Client client)
+    private async Task HandleUriResponses(string uri, StreamWriter writer, RtspRequest request, Client client)
     {
-        if (!IsAuthenticated(request))
-        {
-            await SendAuthenticationRequired(writer, request.CSeq);
-            return;
-        }
-
-        
-        var uri = new Uri(request.Uri);
-        if (!uri.AbsolutePath.Contains("/live"))
+        if (!uri.Contains("/live"))
         {
             await SendRtspResponse(writer, 404, "Not Found", request.CSeq);
             return;
         }
 
-        if (uri.AbsolutePath.Contains("/mjpeg"))
+        if (uri.Contains("/live/front") && !_frontCameraEnabled)
+        {
+            await SendRtspResponse(writer, 400, "Front Camera not enabled", request.CSeq);
+        }
+        else if ((uri.Contains("/live/back") || uri.Contains("/live")) && !_backCameraEnabled)
+        {
+            await SendRtspResponse(writer, 400, "Back Camera not enabled", request.CSeq);
+        }
+
+        if (uri.Contains("/mjpeg"))
         {
             client.Codec = CodecType.MJPEG;
         }
@@ -462,7 +488,7 @@ public class Server : IDisposable
             client.Codec = CodecType.H264;
         }
 
-        if (uri.AbsolutePath.Contains("/live/front"))
+        if (uri.Contains("/live/front"))
         {
             client.CameraId = 1; // FRONT CAMERA
         }
@@ -470,6 +496,18 @@ public class Server : IDisposable
         {
             client.CameraId = 0; // BACK CAMERA
         }
+    }
+    private async Task ProcessRtspRequest(StreamWriter writer, RtspRequest request, Client client)
+    {
+        if (!IsAuthenticated(request))
+        {
+            await SendAuthenticationRequired(writer, request.CSeq);
+            return;
+        }
+
+        var uri = new Uri(request.Uri);
+
+        await HandleUriResponses(uri.AbsolutePath, writer, request, client);
 
         _uri = uri.AbsolutePath;
 
@@ -831,7 +869,7 @@ public class Server : IDisposable
         {
             try
             {
-                var jpegData = EncodeToJpeg(frame.Data, frame.Width, frame.Height, Android.Graphics.ImageFormatType.Nv21);
+                var jpegData = EncodeToJpeg(frame.Data, frame.Width, frame.Height, Android.Graphics.ImageFormatType.Nv21, client.VideoProfile.Quality);
 
                 if (jpegData != null && jpegData.Length > 0)
                 {
@@ -1319,8 +1357,8 @@ public class Server : IDisposable
     }
     private void AdjustBitrate(Client client, byte fractionLost, uint jitter)
     {
-        const int MIN_BITRATE = 500000;  // 500 kbps
-        const int MAX_BITRATE = 4000000; // 4 Mbps
+        int MIN_BITRATE = client.VideoProfile.MinBitrate;  // 500 kbps
+        int MAX_BITRATE = client.VideoProfile.MaxBitrate; // 4 Mbps
 
         lock (client)
         {
@@ -1328,10 +1366,12 @@ public class Server : IDisposable
             if (fractionLost > 10) // More than 4% loss
             {
                 client.CurrentBitrate = Math.Max(MIN_BITRATE, (int)(client.CurrentBitrate * 0.6));
+                client.VideoProfile.Quality = Math.Max(10, (int)(client.VideoProfile.Quality * 0.6));
             }
             else if (fractionLost > 5 && fractionLost <= 10)
             {
                 client.CurrentBitrate = Math.Max(MIN_BITRATE, (int)(client.CurrentBitrate * 0.9));
+                client.VideoProfile.Quality = Math.Max(10, (int)(client.VideoProfile.Quality * 0.9));
             }
             else if (fractionLost < 2 && jitter < 100) // Good conditions
             {
@@ -1339,9 +1379,10 @@ public class Server : IDisposable
                 if (now - client.LastCodecUpdate > TimeSpan.FromSeconds(10))
                 {
                     client.CurrentBitrate = Math.Min(MAX_BITRATE, (int)(client.CurrentBitrate * 1.1));
+                    client.VideoProfile.Quality = Math.Min(100, (int)(client.VideoProfile.Quality * 0.6));
                 }
             }
-            if (client.CurrentBitrate != previousBitrate)
+            if (client.CurrentBitrate != previousBitrate && client.Codec == CodecType.H264)
             {
                 client.LastCodecUpdate = DateTime.UtcNow;
                 if (client.CameraId == 0)
@@ -1352,7 +1393,6 @@ public class Server : IDisposable
                 {
                     _h264FrontEncoder?.UpdateBitrate(client.CurrentBitrate);
                 }
-                
             }
         }
     }
@@ -1443,7 +1483,7 @@ public class Server : IDisposable
 
         return sdp.ToString();
     }
-    public static byte[] EncodeToJpeg(byte[] rawImageData, int width, int height, Android.Graphics.ImageFormatType format)
+    public static byte[] EncodeToJpeg(byte[] rawImageData, int width, int height, Android.Graphics.ImageFormatType format, int quality = 80 )
     {
         try
         {
@@ -1452,14 +1492,14 @@ public class Server : IDisposable
             {
                 var yuvImage = new Android.Graphics.YuvImage(rawImageData, Android.Graphics.ImageFormatType.Nv21, width, height, null);
                 var rect = new Android.Graphics.Rect(0, 0, width, height);
-                yuvImage.CompressToJpeg(rect, 80, outputStream);
+                yuvImage.CompressToJpeg(rect, quality, outputStream);
             }
             else
             {
                 var bitmap = Android.Graphics.BitmapFactory.DecodeByteArray(rawImageData, 0, rawImageData.Length);
                 if (bitmap != null)
                 {
-                    bitmap.Compress(Android.Graphics.Bitmap.CompressFormat.Jpeg!, 80, outputStream);
+                    bitmap.Compress(Android.Graphics.Bitmap.CompressFormat.Jpeg!, quality, outputStream);
                     bitmap.Dispose();
                 }
                 else

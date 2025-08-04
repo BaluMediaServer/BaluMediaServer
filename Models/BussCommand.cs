@@ -8,4 +8,5 @@ public enum BussCommand : int
     STOP_CAMERA_BACK,
     START_MJPEG_SERVER,
     STOP_MJPEG_SERVER,
+    SWITCH_CAMERA,
 }

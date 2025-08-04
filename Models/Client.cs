@@ -29,6 +29,7 @@ public class Client : IDisposable
     public int CurrentBitrate { get; set; } = 2000000;
     public Socket? RtcpSocket { get; set; }
     public int CameraId { get; set; } = 0;
+    public VideoProfile VideoProfile { get; set; } = new();
     public void Dispose()
     {
         this.Socket?.Close();
