@@ -112,12 +112,14 @@ public class Server : IDisposable
                 if (!_mjpegServerEnabled)
                 {
                     _mjpegServer.Start();
+                    _mjpegServerEnabled = true;
                 }
                 break;
             case BussCommand.STOP_MJPEG_SERVER:
                 if (_mjpegServerEnabled)
                 {
                     _mjpegServer.Stop();
+                    _mjpegServerEnabled = false;
                 }
                 break;
             case BussCommand.SWITCH_CAMERA:

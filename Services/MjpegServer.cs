@@ -22,12 +22,27 @@ public class MjpegServer : IDisposable
         _quality = quality;
         Server.OnNewBackFrame += OnBackFrameAvailable;
         Server.OnNewFrontFrame += OnFrontFrameAvailable;
+        // Needs verification with Server to avoid reduplicate instances and overload the CPU
+        //EventBuss.Command += OnCommandSend;
     }
     public void Dispose()
     {
         Server.OnNewBackFrame -= OnBackFrameAvailable;
         Server.OnNewFrontFrame -= OnFrontFrameAvailable;
+        EventBuss.Command -= OnCommandSend;
         _listener?.Close();
+    }
+    private void OnCommandSend(BussCommand command)
+    {
+        switch (command)
+        {
+            case BussCommand.START_MJPEG_SERVER:
+                Start();
+                break;
+            case BussCommand.STOP_MJPEG_SERVER:
+                Stop();
+                break;
+        }
     }
     private void OnBackFrameAvailable(object? sender, FrameEventArgs arg)
     {
@@ -45,10 +60,18 @@ public class MjpegServer : IDisposable
     }
     public void Start()
     {
-        _listener.Start();
-        EventBuss.SendCommand(BussCommand.START_CAMERA_FRONT);
-        EventBuss.SendCommand(BussCommand.START_CAMERA_BACK);
-        _ = Task.Run(ListenLoop);
+        try
+        {
+            _listener.Start();
+            EventBuss.SendCommand(BussCommand.START_CAMERA_FRONT);
+            EventBuss.SendCommand(BussCommand.START_CAMERA_BACK);
+            _ = Task.Run(ListenLoop);
+        }
+        catch (Exception ex)
+        {
+            // Assuming that is already started
+        }
+        
     }
 
     public void Stop()
