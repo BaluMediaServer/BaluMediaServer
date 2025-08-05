@@ -67,9 +67,9 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 - Visual Studio 2022 with MAUI workload
 - Android device or emulator
 
-### NuGet Package (Coming Soon)
+### NuGet Package
 ```xml
-<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.0.0" />
+<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.1.5" />
 ```
 
 ### Manual Installation
@@ -288,7 +288,11 @@ public Server(
     int Port = 7778,                           // RTSP server port
     int MaxClients = 100,                      // Maximum concurrent clients
     string Address = "0.0.0.0",               // Bind address
-    Dictionary<string, string> Users           // Authentication users (required)
+    Dictionary<string, string> Users,           // Authentication users (required)
+    bool BackCameraEnabled = true,              // Enable or disable back camera
+    bool FrontCameraEnabled = true,             // Enable or disable front camera
+    bool AuthRequired = true,                   // Disable full auth ignoring if a Users dict was passed (recommended just for testing)
+    int MjpegServerQuality = 80                 // Sets a default Mjpeg Image compression quality by default, ideal if the image to display is small, avoiding using too much CPU
 )
 ```
 
@@ -325,7 +329,7 @@ HTTP server for MJPEG streaming, perfect for web browser integration.
 
 #### Constructor
 ```csharp
-public MjpegServer(int port = 8089)
+public MjpegServer(int port = 8089, int quality = 80)
 ```
 
 #### Methods
@@ -335,9 +339,6 @@ public void Start()
 
 // Stop the server
 public void Stop()
-
-// Push a frame to all connected clients
-public void PushFrame(byte[] jpegBytes, bool front = false)
 ```
 
 #### Endpoints
@@ -376,7 +377,8 @@ public enum BussCommand
     START_CAMERA_BACK,
     STOP_CAMERA_BACK,
     START_MJPEG_SERVER,
-    STOP_MJPEG_SERVER
+    STOP_MJPEG_SERVER,
+    SWTICH_CAMERA       // New command implemented, but without specific functions at the moment
 }
 
 // Send command
@@ -686,7 +688,7 @@ Server.OnClientsChange += (clients) => {
 
 ### Short Term (v1.1)
 - ⬜ Fix H.264 stream stutter issues
-- ⬜ Add support for multiple profiles/routes (`/live/front`, `/live/back`)
+- ✅ Add support for multiple profiles/routes (`/live/front`, `/live/back`)
 - ⬜ Add user/password control panel
 - ⬜ Fix image rotation
 - ⬜ Add bitrate/resolution configuration

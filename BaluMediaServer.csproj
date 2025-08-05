@@ -9,7 +9,7 @@
 		<!-- NuGet Package Properties -->
 		<GeneratePackageOnBuild>false</GeneratePackageOnBuild>
 		<PackageId>BaluMediaServer.CameraStreamer</PackageId>
-		<PackageVersion>1.1.2</PackageVersion>
+		<PackageVersion>1.1.5</PackageVersion>
 		<Authors>Nakano Miku 13</Authors>
 		<Company>Balu Media Server</Company>
 		<Product>Balu Media Camera Streamer</Product>
@@ -20,7 +20,6 @@
 		<RepositoryUrl>https://github.com/BaluMediaServer/BaluMediaServer</RepositoryUrl>
 		<RepositoryType>git</RepositoryType>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
-		<PackageReadmeFile>README.md</PackageReadmeFile>
 		<PackageReleaseNotes>Initial release with dual camera support</PackageReleaseNotes>
 		
 		<!-- Include symbols for debugging -->
