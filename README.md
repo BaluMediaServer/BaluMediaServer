@@ -749,6 +749,8 @@ There are few (if any) options to integrate RTSP servers with Android using C# a
 
 - v1.1.3: Adding handling for auto-quality adjust based on rtcp control for MJPEG codec, allowing to increase or decrease the image quality to guarantee video stability over this codec.
 -- Adding a preview (WIP) for video profiles allowing to create custom paths for this new profiles, will allow to set a custom resolution, bitrate and more.
+
+- v1.1.4: Adding auth option into CTOR of Server class, to enable or disable auth on stream rtsp, adding feature to determina video quality into mjpeg server
 ---
 
 **Thanks for checking out Balu Media Server!** 

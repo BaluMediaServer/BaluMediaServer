@@ -24,13 +24,14 @@ public class Server : IDisposable
     private MjpegServer _mjpegServer = new();
     private bool RequireAuthentication { get; set; } = true;
     private Socket _socket = default!;
-    private int _port = 7778, _maxClients = 100, _nextRtpPort = 5000;
+    private int _port = 7778, _maxClients = 100, _nextRtpPort = 5000, _mjpegServerQuality = 80;
     private readonly object _portLock = new();
     private readonly HashSet<int> _usedPorts = new();
     private readonly CancellationTokenSource _cts = new();
     private ConcurrentBag<Client> _clients = new();
     private string _uri = string.Empty;
-    private bool _isStreaming = false, _enabled = false, _isCapturingFront = false, _isCapturingBack = false, _mjpegServerEnabled = false, _frontCameraEnabled, _backCameraEnabled;
+    private bool _isStreaming = false, _enabled = false, _isCapturingFront = false, _isCapturingBack = false,
+    _mjpegServerEnabled = false, _frontCameraEnabled = true, _backCameraEnabled = true, _authRequired = true;
     private FrameEventArgs? _latestFrontFrame, _latestBackFrame;
     private readonly ConcurrentDictionary<string, string> _nonceCache = new();
     private readonly string _address = string.Empty;
@@ -48,14 +49,16 @@ public class Server : IDisposable
     {
         { "admin", "password123" }
     };
-    public Server(int Port = 7778, int MaxClients = 100, string Address = "0.0.0.0", Dictionary<string, string>? Users = null, bool BackCameraEnabled = true, bool FrontCameraEnabled = true)
+    public Server(int Port = 7778, int MaxClients = 100, string Address = "0.0.0.0", Dictionary<string, string>? Users = null, bool BackCameraEnabled = true, bool FrontCameraEnabled = true, bool AuthRequired = true, int MjpegServerQuality = 80)
     {
         EventBuss.Command += OnCommandSend;
         _enabled = true;
         _port = Port;
         _maxClients = MaxClients;
         _users = Users == null ? _users : Users;
-        _mjpegServer = new();
+        _mjpegServerQuality = MjpegServerQuality;
+        _mjpegServer = new(quality: _mjpegServerQuality);
+        _authRequired = AuthRequired;
         _frontCameraEnabled = FrontCameraEnabled;
         _backCameraEnabled = BackCameraEnabled;
         _address = Address;
@@ -119,7 +122,7 @@ public class Server : IDisposable
                 break;
             case BussCommand.SWITCH_CAMERA:
                 _mjpegServer?.Dispose();
-                _mjpegServer = new();
+                _mjpegServer = new(quality: _mjpegServerQuality);
                 _socket?.Close();
                 ConfigureSocket();
                 if (_frontCameraEnabled)
@@ -499,7 +502,7 @@ public class Server : IDisposable
     }
     private async Task ProcessRtspRequest(StreamWriter writer, RtspRequest request, Client client)
     {
-        if (!IsAuthenticated(request))
+        if (!IsAuthenticated(request) && _authRequired)
         {
             await SendAuthenticationRequired(writer, request.CSeq);
             return;

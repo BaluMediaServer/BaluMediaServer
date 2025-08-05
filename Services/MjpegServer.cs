@@ -10,14 +10,16 @@ public class MjpegServer : IDisposable
     private readonly HttpListener _listener;
     private readonly ConcurrentDictionary<HttpListenerResponse, string> _clientsFront = new(), _clientsBack = new();
     private readonly object _lockFront = new(), _lockBack = new();
+    private int _quality = 80;
     public int Port { get; }
 
-    public MjpegServer(int port = 8089)
+    public MjpegServer(int port = 8089, int quality = 80)
     {
         Port = port;
         _listener = new HttpListener();
         _listener.Prefixes.Add($"http://+:{Port}/Back/");
         _listener.Prefixes.Add($"http://+:{Port}/Front/");
+        _quality = quality;
         Server.OnNewBackFrame += OnBackFrameAvailable;
         Server.OnNewFrontFrame += OnFrontFrameAvailable;
     }
@@ -31,14 +33,14 @@ public class MjpegServer : IDisposable
     {
         if (arg != null && arg.Data != null && arg.Data.Length > 0)
         {
-            this.PushBackFrame(Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height, Android.Graphics.ImageFormatType.Nv21));
+            this.PushBackFrame(Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height, Android.Graphics.ImageFormatType.Nv21, _quality));
         }
     }
     private void OnFrontFrameAvailable(object? sender, FrameEventArgs arg)
     {
         if (arg != null && arg.Data != null && arg.Data.Length > 0)
         {
-            this.PushFrontFrame(Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height, Android.Graphics.ImageFormatType.Nv21));
+            this.PushFrontFrame(Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height, Android.Graphics.ImageFormatType.Nv21, _quality));
         }
     }
     public void Start()
