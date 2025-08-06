@@ -92,7 +92,7 @@ public class Server : IDisposable
                 }
                 break;
             case BussCommand.STOP_CAMERA_FRONT:
-                if (!_isStreaming && _isCapturingFront)
+                if (!_isStreaming && _isCapturingFront && !_mjpegServerEnabled)
                 {
                     _frontService.StopCapture();
                     _isCapturingFront = false;
@@ -106,7 +106,7 @@ public class Server : IDisposable
                 }
                 break;
             case BussCommand.STOP_CAMERA_BACK:
-                if (!_isStreaming && _isCapturingBack)
+                if (!_isStreaming && _isCapturingBack && !_mjpegServerEnabled)
                 {
                     _backService.StopCapture();
                     _isCapturingBack = false;
@@ -115,15 +115,15 @@ public class Server : IDisposable
             case BussCommand.START_MJPEG_SERVER:
                 if (!_mjpegServerEnabled)
                 {
-                    _mjpegServer.Start();
                     _mjpegServerEnabled = true;
+                    _mjpegServer.Start();
                 }
                 break;
             case BussCommand.STOP_MJPEG_SERVER:
                 if (_mjpegServerEnabled)
                 {
-                    _mjpegServer.Stop();
                     _mjpegServerEnabled = false;
+                    _mjpegServer.Stop();
                 }
                 break;
             case BussCommand.SWITCH_CAMERA:
