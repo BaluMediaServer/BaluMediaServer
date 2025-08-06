@@ -249,7 +249,7 @@ public class Server : IDisposable
     public void Stop() => Dispose();
     public bool Start()
     {
-        GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
+        //GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
         if (_enabled)
         {
             _backService.FrameReceived += OnBackFrameAvailable;
