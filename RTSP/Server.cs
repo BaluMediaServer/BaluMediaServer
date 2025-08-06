@@ -1077,7 +1077,9 @@ public class Server : IDisposable
             await SendInterleavedData(client.Socket, client.RtpChannel, data).ConfigureAwait(false);
         }
     }
-    // OPTIMIZED WITH ARRAY POOL
+    // Under verification
+    
+    // Possible error, is releasing the payload before sending it
     private async Task SendH264NalAsRtp(Client client, byte[] nalUnit)
     {
         const int maxPayloadSize = 1400;
@@ -1133,8 +1135,8 @@ public class Server : IDisposable
                 int fragmentSize = Math.Min(maxPayloadSize - 2, remainingData);
                 bool isLastFragment = fragmentSize == remainingData;
 
-                //var payload = new byte[fragmentSize + 2];
-                var payload = _arrayPool.Rent(fragmentSize + 2);
+                var payload = new byte[fragmentSize + 2];
+                //var payload = _arrayPool.Rent(fragmentSize + 2);
                 payload[0] = (byte)(nalNri | 28); // FU-A
                 payload[1] = nalType;
                 if (isFirstFragment) payload[1] |= 0x80; // Start bit
@@ -1143,8 +1145,6 @@ public class Server : IDisposable
                 Buffer.BlockCopy(nalUnit, dataOffset, payload, 2, fragmentSize);
 
                 var rtpPacket = CreateRtpPacket(client, payload, nalTimestamp, isLastFragment, 96);
-
-                //FillRtpPacket(client, payload, nalTimestamp, isLastFragment, 96); NOT FULLY IMPLEMENTED NOW
 
                 // Send via appropriate transport
                 await SendData(client, rtpPacket).ConfigureAwait(false);
@@ -1157,7 +1157,7 @@ public class Server : IDisposable
                 dataOffset += fragmentSize;
                 remainingData -= fragmentSize;
                 isFirstFragment = false;
-                _arrayPool.Return(payload);
+                //_arrayPool.Return(payload);
             }
         }
     }
@@ -1216,10 +1216,11 @@ public class Server : IDisposable
         Buffer.BlockCopy(payload, 0, packet, 12, payload.Length);
         return packet;
     }
-    // OPTIMIZED WITH ARRAY POOL
+    // Main problem
     private byte[] CreateRtpPacket(Client client, byte[] payload, uint timestamp, bool marker, byte payloadType)
     {
-        var packet = _arrayPool.Rent(12 + payload.Length);
+        //var packet = _arrayPool.Rent(12 + payload.Length);
+        var packet = new byte[12 + payload.Length];
         packet[0] = 0x80;
         packet[1] = (byte)(marker ? 0x80 | payloadType : payloadType);
 
@@ -1247,33 +1248,11 @@ public class Server : IDisposable
         Buffer.BlockCopy(payload, 0, packet, 12, payload.Length);
         return packet;
     }
-    private void FillRtpPacket(Client client, byte[] payload, uint timestamp, bool marker, byte payloadType)
-    {
-        lock (client)
-        {
-            client.RtpBuffer[0] = 0x80;
-            client.RtpBuffer[1] = (byte)(marker ? 0x80 | payloadType : payloadType);
-            client.RtpBuffer[2] = (byte)(client.SequenceNumber >> 8);
-            client.RtpBuffer[3] = (byte)(client.SequenceNumber & 0xFF);
-
-            // Use the provided timestamp for all fragments
-            client.RtpBuffer[4] = (byte)(timestamp >> 24);
-            client.RtpBuffer[5] = (byte)(timestamp >> 16);
-            client.RtpBuffer[6] = (byte)(timestamp >> 8);
-            client.RtpBuffer[7] = (byte)(timestamp & 0xFF);
-
-            // SSRC
-            client.RtpBuffer[8] = (byte)(client.SsrcId >> 24);
-            client.RtpBuffer[9] = (byte)(client.SsrcId >> 16);
-            client.RtpBuffer[10] = (byte)(client.SsrcId >> 8);
-            client.RtpBuffer[11] = (byte)(client.SsrcId & 0xFF);
-            Buffer.BlockCopy(payload, 0, client.RtpBuffer, 12, payload.Length);
-        }
-    }
-    // Optimized with ArrayPool
+    // Verificated
     private async Task SendInterleavedData(Socket socket, byte channel, byte[] rtpPacket)
     {
         var frame = _arrayPool.Rent(4 + rtpPacket.Length);
+        //var frame = new byte[4 + rtpPacket.Length];
         frame[0] = 0x24; // $ magic byte
         frame[1] = channel;
         frame[2] = (byte)(rtpPacket.Length >> 8);
@@ -1328,8 +1307,6 @@ public class Server : IDisposable
         }
         finally
         {
-            // Returning array rented in CreateRtpPacket method
-            _arrayPool.Return(rtpPacket);
             _arrayPool.Return(frame);
         }
     }
@@ -1492,7 +1469,6 @@ public class Server : IDisposable
             }
         }
     }
-    // Verified
     private async Task SendUdpData(Client client, byte[] rtpPacket, bool isRtcp)
     {
         try
@@ -1512,11 +1488,6 @@ public class Server : IDisposable
             {
                 client.IsPlaying = false;
             }
-        }
-        finally
-        {
-            // Freeing up the array rented at CreateRtpPacket method
-            _arrayPool.Return(rtpPacket);
         }
     }
     private Dictionary<string, string> ParseTransport(string transport)
