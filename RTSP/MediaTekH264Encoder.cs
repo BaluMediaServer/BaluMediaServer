@@ -69,6 +69,9 @@ public class MediaTekH264Encoder : IDisposable
 #pragma warning restore CA1416 // Validate platform compatibility
                 format.SetInteger(MediaFormat.KeyPriority, 0); // Real-time priority
                 format.SetInteger("vendor.mtk-ext-enc-low-latency.enable", 1);
+                //format.SetInteger(MediaFormat.KeyMaxBFrames, 0); // Disable B-frames
+                format.SetInteger(MediaFormat.KeyRepeatPreviousFrameAfter, 33333); // Handle drops
+                format.SetInteger("vendor.mtk-ext-enc-nonrefp.enable", 1); // MediaTek optimization
                 if (Build.VERSION.SdkInt >= BuildVersionCodes.M)
                 {
                     format.SetInteger(MediaFormat.KeyOperatingRate, short.MaxValue); // Max operating rate

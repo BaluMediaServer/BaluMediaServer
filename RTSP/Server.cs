@@ -11,9 +11,11 @@ using Android.OS;
 using Android.Runtime;
 using Android.Util;
 using AndroidX.Core.App;
+using System.Buffers;
 using BaluMediaServer.Models;
 using BaluMediaServer.Platforms.Android.Services;
 using BaluMediaServer.Repositories;
+using System.Runtime;
 
 namespace BaluMediaServer.Services;
 
@@ -35,6 +37,7 @@ public class Server : IDisposable
     private FrameEventArgs? _latestFrontFrame, _latestBackFrame;
     private readonly ConcurrentDictionary<string, string> _nonceCache = new();
     private readonly string _address = string.Empty;
+    private const int _maxPayloadSize = 1400;
     private readonly TimeSpan _nonceExpiry = TimeSpan.FromMinutes(5);
     private readonly object _frameFrontLock = new(), _frameBackLock = new(), _h264FrontLock = new(), _h264BackLock = new();
     private MediaTekH264Encoder? _h264FrontEncoder, _h264BackEncoder;
@@ -44,7 +47,8 @@ public class Server : IDisposable
     public static event Action<List<Client>>? OnClientsChange;
     public static event EventHandler<bool>? OnStreaming;
     public static event EventHandler<FrameEventArgs>? OnNewFrontFrame, OnNewBackFrame;
-    
+    private static readonly byte[] StandardQuantizationTables = GetStandardQuantizationTables();
+    private readonly ArrayPool<byte> _arrayPool = ArrayPool<byte>.Shared;
     private Dictionary<string, string> _users = new()
     {
         { "admin", "password123" }
@@ -70,8 +74,8 @@ public class Server : IDisposable
         _socket = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         _socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true); // Disable Nagle's
-        _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendBuffer, 65536); // Increase send buffer
-        _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 65536);
+        _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendBuffer, 262144); // 256KB
+        _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 262144); // 256KB
         _socket.Bind(endpoint);
         _socket.Listen(_maxClients);
     }
@@ -245,6 +249,7 @@ public class Server : IDisposable
     public void Stop() => Dispose();
     public bool Start()
     {
+        GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
         if (_enabled)
         {
             _backService.FrameReceived += OnBackFrameAvailable;
@@ -286,7 +291,7 @@ public class Server : IDisposable
 
             }
             OnStreaming?.Invoke(this, _isStreaming);
-            await Task.Delay(1000, _cts.Token);
+            await Task.Delay(1000, _cts.Token).ConfigureAwait(false);
         }
     }
     public void Dispose()
@@ -299,7 +304,7 @@ public class Server : IDisposable
     {
         while (!_cts.IsCancellationRequested)
         {
-            var client = await _socket.AcceptAsync(_cts.Token);
+            var client = await _socket.AcceptAsync(_cts.Token).ConfigureAwait(false);
             _ = Task.Run(() => HandleClient(client), _cts.Token);
         }
     }
@@ -320,12 +325,12 @@ public class Server : IDisposable
 
             while (client.Connected && !_cts.IsCancellationRequested)
             {
-                var requestLine = await reader.ReadLineAsync() ?? string.Empty;
+                var requestLine = await reader.ReadLineAsync().ConfigureAwait(false) ?? string.Empty;
                 if (string.IsNullOrEmpty(requestLine)) continue;
                 Log.Debug("[RTSP Server]", requestLine);
-                var request = await ParseRtspRequest(reader, requestLine);
+                var request = await ParseRtspRequest(reader, requestLine).ConfigureAwait(false);
                 if (request == null) continue;
-                await ProcessRtspRequest(writer, request, clientSession);
+                await ProcessRtspRequest(writer, request, clientSession).ConfigureAwait(false);
             }
         }
         finally
@@ -344,7 +349,7 @@ public class Server : IDisposable
             Version = parts[2]
         };
         string? line;
-        while (!string.IsNullOrEmpty(line = await reader.ReadLineAsync(_cts.Token)))
+        while (!string.IsNullOrEmpty(line = await reader.ReadLineAsync(_cts.Token).ConfigureAwait(false)))
         {
             var colonIndex = line.IndexOf(':');
             if (colonIndex > 0)
@@ -362,7 +367,7 @@ public class Server : IDisposable
             int.TryParse(lengthStr, out var length) && length > 0)
         {
             var buffer = new char[length];
-            await reader.ReadAsync(buffer, 0, length);
+            await reader.ReadAsync(buffer, 0, length).ConfigureAwait(false);
             request.Body = new string(buffer);
         }
         return request;
@@ -434,28 +439,28 @@ public class Server : IDisposable
     private async Task SendRtspResponse(StreamWriter writer, int statusCode, string statusText,
         int cseq, Dictionary<string, string>? headers = null, string? body = null)
     {
-        await writer.WriteLineAsync($"RTSP/1.0 {statusCode} {statusText}");
-        await writer.WriteLineAsync($"CSeq: {cseq}");
+        await writer.WriteLineAsync($"RTSP/1.0 {statusCode} {statusText}").ConfigureAwait(false);
+        await writer.WriteLineAsync($"CSeq: {cseq}").ConfigureAwait(false);
 
         if (headers != null)
         {
             foreach (var header in headers)
             {
-                await writer.WriteLineAsync($"{header.Key}: {header.Value}");
+                await writer.WriteLineAsync($"{header.Key}: {header.Value}").ConfigureAwait(false);
             }
         }
 
         if (!string.IsNullOrEmpty(body))
         {
-            await writer.WriteLineAsync($"Content-Length: {body.Length}");
-            await writer.WriteLineAsync($"Content-Type: application/sdp");
+            await writer.WriteLineAsync($"Content-Length: {body.Length}").ConfigureAwait(false);
+            await writer.WriteLineAsync($"Content-Type: application/sdp").ConfigureAwait(false);
         }
 
-        await writer.WriteLineAsync();
+        await writer.WriteLineAsync().ConfigureAwait(false);
 
         if (!string.IsNullOrEmpty(body))
         {
-            await writer.WriteAsync(body);
+            await writer.WriteAsync(body).ConfigureAwait(false);
         }
     }
     private async Task HandleOptions(StreamWriter writer, RtspRequest request)
@@ -465,23 +470,23 @@ public class Server : IDisposable
             ["Public"] = "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN"
         };
 
-        await SendRtspResponse(writer, 200, "OK", request.CSeq, headers);
+        await SendRtspResponse(writer, 200, "OK", request.CSeq, headers).ConfigureAwait(false);
     }
     private async Task HandleUriResponses(string uri, StreamWriter writer, RtspRequest request, Client client)
     {
         if (!uri.Contains("/live"))
         {
-            await SendRtspResponse(writer, 404, "Not Found", request.CSeq);
+            await SendRtspResponse(writer, 404, "Not Found", request.CSeq).ConfigureAwait(false);
             return;
         }
 
         if (uri.Contains("/live/front") && !_frontCameraEnabled)
         {
-            await SendRtspResponse(writer, 400, "Front Camera not enabled", request.CSeq);
+            await SendRtspResponse(writer, 400, "Front Camera not enabled", request.CSeq).ConfigureAwait(false);
         }
         else if ((uri.Contains("/live/back") || uri.Contains("/live")) && !_backCameraEnabled)
         {
-            await SendRtspResponse(writer, 400, "Back Camera not enabled", request.CSeq);
+            await SendRtspResponse(writer, 400, "Back Camera not enabled", request.CSeq).ConfigureAwait(false);
         }
 
         if (uri.Contains("/mjpeg"))
@@ -506,35 +511,35 @@ public class Server : IDisposable
     {
         if (!IsAuthenticated(request) && _authRequired)
         {
-            await SendAuthenticationRequired(writer, request.CSeq);
+            await SendAuthenticationRequired(writer, request.CSeq).ConfigureAwait(false);
             return;
         }
 
         var uri = new Uri(request.Uri);
 
-        await HandleUriResponses(uri.AbsolutePath, writer, request, client);
+        await HandleUriResponses(uri.AbsolutePath, writer, request, client).ConfigureAwait(false);
 
         _uri = uri.AbsolutePath;
 
         switch (request.Method.ToUpper())
         {
             case "OPTIONS":
-                await HandleOptions(writer, request);
+                await HandleOptions(writer, request).ConfigureAwait(false);
                 break;
             case "DESCRIBE":
-                await HandleDescribe(writer, request, client);
+                await HandleDescribe(writer, request, client).ConfigureAwait(false);
                 break;
             case "SETUP":
-                await HandleSetup(writer, request, client);
+                await HandleSetup(writer, request, client).ConfigureAwait(false);
                 break;
             case "PLAY":
-                await HandlePlay(writer, request, client);
+                await HandlePlay(writer, request, client).ConfigureAwait(false);
                 break;
             case "TEARDOWN":
-                await HandleTeardown(writer, request, client);
+                await HandleTeardown(writer, request, client).ConfigureAwait(false);
                 break;
             default:
-                await SendRtspResponse(writer, 405, "Method Not Allowed", request.CSeq);
+                await SendRtspResponse(writer, 405, "Method Not Allowed", request.CSeq).ConfigureAwait(false);
                 break;
         }
     }
@@ -576,11 +581,9 @@ public class Server : IDisposable
         var headers = new Dictionary<string, string>
         {
             ["WWW-Authenticate"] = $"Digest realm=\"RTSP Server\", nonce=\"{nonce}\", algorithm=MD5"
-            
-            
         };
 
-        await SendRtspResponse(writer, 401, "Unauthorized", cseq, headers);
+        await SendRtspResponse(writer, 401, "Unauthorized", cseq, headers).ConfigureAwait(false);
     }
     private string GenerateNonce()
     {
@@ -610,7 +613,6 @@ public class Server : IDisposable
 
             return DateTimeOffset.UtcNow < expiry;
         }
-
         return false;
     }
     private void CleanExpiredNonces()
@@ -721,13 +723,13 @@ public class Server : IDisposable
             ["Content-Base"] = request.Uri
         };
 
-        await SendRtspResponse(writer, 200, "OK", request.CSeq, headers, sdp);
+        await SendRtspResponse(writer, 200, "OK", request.CSeq, headers, sdp).ConfigureAwait(false);
     }
     private async Task HandleTeardown(StreamWriter writer, RtspRequest request, Client client)
     {
         if (string.IsNullOrEmpty(client.SessionId))
         {
-            await SendRtspResponse(writer, 454, "Session Not Found", request.CSeq);
+            await SendRtspResponse(writer, 454, "Session Not Found", request.CSeq).ConfigureAwait(false);
             return;
         }
         lock (client)
@@ -739,13 +741,13 @@ public class Server : IDisposable
             ["Session"] = client.SessionId
         };
         
-        await SendRtspResponse(writer, 200, "OK", request.CSeq, responseHeaders);
+        await SendRtspResponse(writer, 200, "OK", request.CSeq, responseHeaders).ConfigureAwait(false);
     }
     private async Task HandlePlay(StreamWriter writer, RtspRequest request, Client client)
     {
         if (string.IsNullOrEmpty(client.SessionId))
         {
-            await SendRtspResponse(writer, 454, "Session Not Found", request.CSeq);
+            await SendRtspResponse(writer, 454, "Session Not Found", request.CSeq).ConfigureAwait(false);
             return;
         }
 
@@ -755,7 +757,7 @@ public class Server : IDisposable
             ["RTP-Info"] = $"url={request.Uri}/track0;seq=0;rtptime=0"
         };
 
-        await SendRtspResponse(writer, 200, "OK", request.CSeq, responseHeaders);
+        await SendRtspResponse(writer, 200, "OK", request.CSeq, responseHeaders).ConfigureAwait(false);
         lock (client)
         {
             client.IsPlaying = true;    
@@ -783,12 +785,12 @@ public class Server : IDisposable
             {
                 if (client.CameraId == 0)
                 {
-                    while (_latestBackFrame == null) await Task.Delay(50, _cts.Token);
+                    while (_latestBackFrame == null) await Task.Delay(50, _cts.Token).ConfigureAwait(false);
                     StartH264EncoderBack(_latestBackFrame.Width, _latestBackFrame.Height);
                 }
                 else
                 {
-                    while (_latestFrontFrame == null) await Task.Delay(50, _cts.Token);
+                    while (_latestFrontFrame == null) await Task.Delay(50, _cts.Token).ConfigureAwait(false);
                     StartH264EncoderFront(_latestFrontFrame.Width, _latestFrontFrame.Height);
                 }
             }
@@ -807,7 +809,7 @@ public class Server : IDisposable
         }
         
         
-        const int frameIntervalMs = 40; // 25fps = 40ms per frame
+        const int frameIntervalMs = 22; // +- 45fps = 22ms per frame
         
         try
         {
@@ -817,11 +819,11 @@ public class Server : IDisposable
 
                 if (client.Codec == CodecType.H264)
                 {
-                    await StreamH264ToClient(client);
+                    await StreamH264ToClient(client).ConfigureAwait(false);
                 }
                 else
                 {
-                    await StreamMjpegToClient(client);
+                    await StreamMjpegToClient(client).ConfigureAwait(false);
                 }
                 // Calculate actual time elapsed since last frame
                 var elapsed = (DateTime.UtcNow - frameStart).TotalMilliseconds;
@@ -829,7 +831,7 @@ public class Server : IDisposable
 
                 if (waitTime > 0)
                 {
-                    await Task.Delay(waitTime);
+                    await Task.Delay(waitTime, _cts.Token).ConfigureAwait(false);
                 }
 
                 // Update RTP timestamp based on actual time elapsed
@@ -878,7 +880,7 @@ public class Server : IDisposable
 
                 if (jpegData != null && jpegData.Length > 0)
                 {
-                    await SendJpegAsRtp(client, jpegData);
+                    await SendJpegAsRtp(client, jpegData).ConfigureAwait(false);
                 }
             }
             catch (Exception ex)
@@ -927,8 +929,8 @@ public class Server : IDisposable
 
                     if (needsSpsPps && h264Frame.Sps != null && h264Frame.Pps != null)
                     {
-                        await SendH264NalAsRtp(client, h264Frame.Sps);
-                        await SendH264NalAsRtp(client, h264Frame.Pps);
+                        await SendH264NalAsRtp(client, h264Frame.Sps).ConfigureAwait(false);
+                        await SendH264NalAsRtp(client, h264Frame.Pps).ConfigureAwait(false);
 
                         _clientSpsCache[client.Id] = h264Frame.Sps;
                         _clientPpsCache[client.Id] = h264Frame.Pps;
@@ -936,7 +938,7 @@ public class Server : IDisposable
 
                     // Send all NAL units
                     foreach (var nalUnit in h264Frame.NalUnits)
-                        await SendH264NalAsRtp(client, nalUnit);
+                        await SendH264NalAsRtp(client, nalUnit).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -986,18 +988,21 @@ public class Server : IDisposable
             }
         }
     }
+    
+    // Optimized with Array Pool
     private async Task SendJpegAsRtp(Client client, byte[] jpegData)
     {
-        const int maxPayloadSize = 1400;
+
         int offset = 0;
-        
+
         while (offset < jpegData.Length && !_cts.IsCancellationRequested)
         {
             int fragmentOffset = offset;
-            int payloadSize = Math.Min(maxPayloadSize - 8, jpegData.Length - offset);
+            int payloadSize = Math.Min(_maxPayloadSize - 8, jpegData.Length - offset);
             bool isLastFragment = (offset + payloadSize) >= jpegData.Length;
-            
-            var payload = new byte[8 + payloadSize];
+
+            //var payload = new byte[8 + payloadSize];
+            var payload = _arrayPool.Rent(8 + payloadSize);
             // Type-specific header (8 bytes)
             payload[0] = 0; // Type-specific
             payload[1] = (byte)((fragmentOffset >> 16) & 0xFF);
@@ -1005,64 +1010,74 @@ public class Server : IDisposable
             payload[3] = (byte)(fragmentOffset & 0xFF);
             payload[4] = 1; // Type (1 for standard quantization tables)
             payload[5] = 255; // Q value (255 = dynamic tables)
-            
+
             // Width and height must be in 8-pixel units (not divided by 8)
             // But the RTP JPEG header expects values in 8-pixel blocks
             // So if width=1280, we send 160 (1280/8)
             var widthInBlocks = (byte)(client.Width / 8);
             var heightInBlocks = (byte)(client.Height / 8);
-            
+
             // Ensure we don't send 0 dimensions
             if (widthInBlocks == 0) widthInBlocks = 160; // Default 1280/8
             if (heightInBlocks == 0) heightInBlocks = 90;  // Default 720/8
-            
+
             payload[6] = widthInBlocks;
             payload[7] = heightInBlocks;
-            
+
             if (offset == 0)
             {
-                var qtHeader = new byte[4];
-                qtHeader[0] = 0;
-                qtHeader[1] = 0;
-                qtHeader[2] = 0;
-                qtHeader[3] = 128;
-                
-                var newPayload = new byte[8 + 4 + 128 + payloadSize];
-                Buffer.BlockCopy(payload, 0, newPayload, 0, 8);
-                Buffer.BlockCopy(qtHeader, 0, newPayload, 8, 4);
-                var qtData = GetStandardQuantizationTables();
-                Buffer.BlockCopy(qtData, 0, newPayload, 12, 128);
-                Buffer.BlockCopy(jpegData, offset, newPayload, 140, payloadSize);
-                payload = newPayload;
-                payload[4] = 0;
+                _arrayPool.Return(payload);
+                payload = _arrayPool.Rent(140 + payloadSize);
+
+                payload[0] = 0; // Type-specific
+                payload[1] = (byte)((fragmentOffset >> 16) & 0xFF);
+                payload[2] = (byte)((fragmentOffset >> 8) & 0xFF);
+                payload[3] = (byte)(fragmentOffset & 0xFF);
+                payload[4] = 0; // Type (1 for standard quantization tables)
+                payload[5] = 255; // Q value (255 = dynamic tables)
+                payload[6] = widthInBlocks;
+                payload[7] = heightInBlocks;
+
+                payload[8] = 0;
+                payload[9] = 0;
+                payload[10] = 0;
+                payload[11] = 128;
+
+                //var newPayload = new byte[8 + 4 + 128 + payloadSize];
+                //Buffer.BlockCopy(payload, 0, newPayload, 0, 8);
+                //Buffer.BlockCopy(qtHeader, 0, payload, 8, 4);
+                Buffer.BlockCopy(StandardQuantizationTables, 0, payload, 12, 128);
+                Buffer.BlockCopy(jpegData, offset, payload, 140, payloadSize);
             }
             else
             {
                 Buffer.BlockCopy(jpegData, offset, payload, 8, payloadSize);
             }
-            
+
             var rtpPacket = CreateRtpPacketOld(client, payload, isLastFragment, 26);
 
             // Send via appropriate transport
-            await SendData(client, rtpPacket);
+            await SendData(client, rtpPacket).ConfigureAwait(false);
             lock (client)
             {
                 client.SequenceNumber++;
             }
             offset += payloadSize;
+            _arrayPool.Return(payload);
         }
     }
     private async Task SendData(Client client, byte[] data)
     {
         if (client.Transport == TransportMode.UDP)
         {
-            await SendUdpData(client, data, false);
+            await SendUdpData(client, data, false).ConfigureAwait(false);
         }
         else if (client.Transport == TransportMode.TCPInterleaved)
         {
-            await SendInterleavedData(client.Socket, client.RtpChannel, data);
+            await SendInterleavedData(client.Socket, client.RtpChannel, data).ConfigureAwait(false);
         }
     }
+    // OPTIMIZED WITH ARRAY POOL
     private async Task SendH264NalAsRtp(Client client, byte[] nalUnit)
     {
         const int maxPayloadSize = 1400;
@@ -1080,18 +1095,19 @@ public class Server : IDisposable
         {
             nalStart = 3;
         }
-        
+
         int nalLength = nalUnit.Length - nalStart;
 
         if (nalLength <= maxPayloadSize)
         {
-            var payload = new byte[nalLength];
+            //var payload = new byte[nalLength];
+            var payload = _arrayPool.Rent(nalLength);
             Buffer.BlockCopy(nalUnit, nalStart, payload, 0, nalLength);
 
             var rtpPacket = CreateRtpPacket(client, payload, nalTimestamp, true, 96);
 
             // Send via appropriate transport
-            await SendData(client, rtpPacket);
+            await SendData(client, rtpPacket).ConfigureAwait(false);
 
             lock (client)
             {
@@ -1099,6 +1115,7 @@ public class Server : IDisposable
                 if (client.SequenceNumber > 65535)
                     client.SequenceNumber = 0;
             }
+            _arrayPool.Return(payload);
         }
         else
         {
@@ -1116,7 +1133,8 @@ public class Server : IDisposable
                 int fragmentSize = Math.Min(maxPayloadSize - 2, remainingData);
                 bool isLastFragment = fragmentSize == remainingData;
 
-                var payload = new byte[fragmentSize + 2];
+                //var payload = new byte[fragmentSize + 2];
+                var payload = _arrayPool.Rent(fragmentSize + 2);
                 payload[0] = (byte)(nalNri | 28); // FU-A
                 payload[1] = nalType;
                 if (isFirstFragment) payload[1] |= 0x80; // Start bit
@@ -1126,8 +1144,10 @@ public class Server : IDisposable
 
                 var rtpPacket = CreateRtpPacket(client, payload, nalTimestamp, isLastFragment, 96);
 
+                //FillRtpPacket(client, payload, nalTimestamp, isLastFragment, 96); NOT FULLY IMPLEMENTED NOW
+
                 // Send via appropriate transport
-                await SendData(client, rtpPacket);
+                await SendData(client, rtpPacket).ConfigureAwait(false);
                 lock (client)
                 {
                     client.SequenceNumber++;
@@ -1137,11 +1157,11 @@ public class Server : IDisposable
                 dataOffset += fragmentSize;
                 remainingData -= fragmentSize;
                 isFirstFragment = false;
+                _arrayPool.Return(payload);
             }
         }
-        
     }
-    private byte[] GetStandardQuantizationTables()
+    public static byte[] GetStandardQuantizationTables()
     {
         byte[] tables = new byte[128];
         byte[] luma = {
@@ -1168,9 +1188,10 @@ public class Server : IDisposable
         Buffer.BlockCopy(chroma, 0, tables, 64, 64);
         return tables;
     }
+    // OPTIMIZED WITH ARRAY POOL
     private byte[] CreateRtpPacketOld(Client client, byte[] payload, bool marker, byte payloadType)
     {
-        var packet = new byte[12 + payload.Length];
+        var packet = _arrayPool.Rent(12 + payload.Length);
         packet[0] = 0x80; // V=2, P=0, X=0, CC=0
         packet[1] = (byte)(marker ? 0x80 | payloadType : payloadType);
 
@@ -1178,13 +1199,13 @@ public class Server : IDisposable
         {
             packet[2] = (byte)(client.SequenceNumber >> 8);
             packet[3] = (byte)(client.SequenceNumber & 0xFF);
-            
+
             // Timestamp (client-specific)
             packet[4] = (byte)(client.RtpTimestamp >> 24);
             packet[5] = (byte)(client.RtpTimestamp >> 16);
             packet[6] = (byte)(client.RtpTimestamp >> 8);
             packet[7] = (byte)(client.RtpTimestamp & 0xFF);
-            
+
             // SSRC (client-specific)
             packet[8] = (byte)(client.SsrcId >> 24);
             packet[9] = (byte)(client.SsrcId >> 16);
@@ -1195,9 +1216,10 @@ public class Server : IDisposable
         Buffer.BlockCopy(payload, 0, packet, 12, payload.Length);
         return packet;
     }
+    // OPTIMIZED WITH ARRAY POOL
     private byte[] CreateRtpPacket(Client client, byte[] payload, uint timestamp, bool marker, byte payloadType)
     {
-        var packet = new byte[12 + payload.Length];
+        var packet = _arrayPool.Rent(12 + payload.Length);
         packet[0] = 0x80;
         packet[1] = (byte)(marker ? 0x80 | payloadType : payloadType);
 
@@ -1225,25 +1247,92 @@ public class Server : IDisposable
         Buffer.BlockCopy(payload, 0, packet, 12, payload.Length);
         return packet;
     }
+    private void FillRtpPacket(Client client, byte[] payload, uint timestamp, bool marker, byte payloadType)
+    {
+        lock (client)
+        {
+            client.RtpBuffer[0] = 0x80;
+            client.RtpBuffer[1] = (byte)(marker ? 0x80 | payloadType : payloadType);
+            client.RtpBuffer[2] = (byte)(client.SequenceNumber >> 8);
+            client.RtpBuffer[3] = (byte)(client.SequenceNumber & 0xFF);
+
+            // Use the provided timestamp for all fragments
+            client.RtpBuffer[4] = (byte)(timestamp >> 24);
+            client.RtpBuffer[5] = (byte)(timestamp >> 16);
+            client.RtpBuffer[6] = (byte)(timestamp >> 8);
+            client.RtpBuffer[7] = (byte)(timestamp & 0xFF);
+
+            // SSRC
+            client.RtpBuffer[8] = (byte)(client.SsrcId >> 24);
+            client.RtpBuffer[9] = (byte)(client.SsrcId >> 16);
+            client.RtpBuffer[10] = (byte)(client.SsrcId >> 8);
+            client.RtpBuffer[11] = (byte)(client.SsrcId & 0xFF);
+            Buffer.BlockCopy(payload, 0, client.RtpBuffer, 12, payload.Length);
+        }
+    }
+    // Optimized with ArrayPool
     private async Task SendInterleavedData(Socket socket, byte channel, byte[] rtpPacket)
     {
-        var frame = new byte[4 + rtpPacket.Length];
+        var frame = _arrayPool.Rent(4 + rtpPacket.Length);
         frame[0] = 0x24; // $ magic byte
         frame[1] = channel;
         frame[2] = (byte)(rtpPacket.Length >> 8);
         frame[3] = (byte)(rtpPacket.Length & 0xFF);
         Buffer.BlockCopy(rtpPacket, 0, frame, 4, rtpPacket.Length);
-        
+
         try
         {
-            if(socket?.Connected ?? false)
-                await socket.SendAsync(frame, SocketFlags.None, _cts.Token);
+            if (socket?.Connected ?? false)
+            {
+                /* Theorical Nagel Algorithm but it fails 
+                bool isRtcp = (channel % 2 == 1);
+
+                if (isRtcp)
+                {
+                    var client = _clients.FirstOrDefault(c => c.Socket == socket);
+                    if (client != null)
+                    {
+                        client.RtcpBuffer.Add(frame);
+                        if (client.RtcpBuffer.Count >= 3 ||
+                            (DateTime.UtcNow - client.LastRtcpFlush).TotalMilliseconds > 200)
+                        {
+                            // Send all buffered RTCP packets at once
+                            var totalSize = client.RtcpBuffer.Sum(p => p.Length);
+                            var combinedBuffer = new byte[totalSize];
+                            int offset = 0;
+
+                            foreach (var packet in client.RtcpBuffer)
+                            {
+                                Buffer.BlockCopy(packet, 0, combinedBuffer, offset, packet.Length);
+                                offset += packet.Length;
+                            }
+
+                            await socket.SendAsync(combinedBuffer, SocketFlags.None, _cts.Token);
+
+                            client.RtcpBuffer.Clear();
+                            client.LastRtcpFlush = DateTime.UtcNow;
+                        }
+                    }
+                }
+                else
+                {
+                    await socket.SendAsync(frame, SocketFlags.None, _cts.Token);    
+                }*/
+                await socket.SendAsync(frame, SocketFlags.None, _cts.Token).ConfigureAwait(false);
+            }
+
         }
         catch (Exception ex)
         {
             Log.Error("[RTSP Server]", $"TCP send error: {ex.Message}");
         }
-}
+        finally
+        {
+            // Returning array rented in CreateRtpPacket method
+            _arrayPool.Return(rtpPacket);
+            _arrayPool.Return(frame);
+        }
+    }
     private async Task HandleSetup(StreamWriter writer, RtspRequest request, Client client)
     {
         if (string.IsNullOrEmpty(client.SessionId))
@@ -1252,7 +1341,7 @@ public class Server : IDisposable
         }
         if (!request.Headers.TryGetValue("Transport", out var transport))
         {
-            await SendRtspResponse(writer, 400, "Bad Request", request.CSeq);
+            await SendRtspResponse(writer, 400, "Bad Request", request.CSeq).ConfigureAwait(false);
             return;
         }
         Log.Debug("[RTSP Server]", $"Transport: {transport}");
@@ -1293,11 +1382,13 @@ public class Server : IDisposable
             // Create UDP socket for this client
             client.UdpSocket = new(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
             client.UdpSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            client.UdpSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendBuffer, 262144);
+            client.UdpSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 262144);
 
             var serverRtpPort = GetAvailablePort();
             var serverRtcpPort = serverRtpPort + 1;
             client.RtcpSocket = new (AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-            client.UdpSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            
             IPEndPoint endPoint = new(IPAddress.Any, serverRtcpPort);
             client.RtcpSocket.Bind(endPoint);
             _ = Task.Run(() => ListenRtcpPort(client), _cts.Token);
@@ -1305,23 +1396,23 @@ public class Server : IDisposable
         }
         else
         {
-            await SendRtspResponse(writer, 461, "Unsupported Transport", request.CSeq);
+            await SendRtspResponse(writer, 461, "Unsupported Transport", request.CSeq).ConfigureAwait(false);
             return;
         }
 
-        await SendRtspResponse(writer, 200, "OK", request.CSeq, responseHeaders);
+        await SendRtspResponse(writer, 200, "OK", request.CSeq, responseHeaders).ConfigureAwait(false);;
     }
     private async Task ListenRtcpPort(Client client)
     {
         byte[] buffer = new byte[1024];
 
-        while (!client.IsPlaying && !_cts.IsCancellationRequested) await Task.Delay(100, _cts.Token);
+        while (!client.IsPlaying && !_cts.IsCancellationRequested) await Task.Delay(100, _cts.Token).ConfigureAwait(false);
         while (!_cts.IsCancellationRequested && client.RtcpSocket != null)
         {
             var timeout = Task.Delay(TimeSpan.FromSeconds(60), _cts.Token); // 1 minute timeout
             EndPoint remoteEndpoint = new IPEndPoint(IPAddress.Any, 0);
             var task = client.RtcpSocket.ReceiveFromAsync(buffer, SocketFlags.None, remoteEndpoint, _cts.Token).AsTask();
-            var result = await Task.WhenAny(task, timeout);
+            var result = await Task.WhenAny(task, timeout).ConfigureAwait(false);
             if (result == timeout)
             {
                 CleanupClient(client);
@@ -1401,6 +1492,7 @@ public class Server : IDisposable
             }
         }
     }
+    // Verified
     private async Task SendUdpData(Client client, byte[] rtpPacket, bool isRtcp)
     {
         try
@@ -1408,7 +1500,7 @@ public class Server : IDisposable
             var endpoint = isRtcp ? client.RtcpEndPoint : client.RtpEndPoint;
             if (client.UdpSocket != null && endpoint != null)
             {
-                await client.UdpSocket.SendToAsync(rtpPacket, SocketFlags.None, endpoint);
+                await client.UdpSocket.SendToAsync(rtpPacket, SocketFlags.None, endpoint).ConfigureAwait(false);
             }
         }
         catch (SocketException ex)
@@ -1420,6 +1512,11 @@ public class Server : IDisposable
             {
                 client.IsPlaying = false;
             }
+        }
+        finally
+        {
+            // Freeing up the array rented at CreateRtpPacket method
+            _arrayPool.Return(rtpPacket);
         }
     }
     private Dictionary<string, string> ParseTransport(string transport)
