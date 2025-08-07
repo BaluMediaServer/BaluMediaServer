@@ -1,15 +1,18 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Text;
+using System.Threading.Tasks;
 using BaluMediaServer.Models;
 using BaluMediaServer.Repositories;
+using Java.Lang;
 using JetBrains.Annotations;
 namespace BaluMediaServer.Services;
 
 public class MjpegServer : IDisposable
 {
     private readonly HttpListener _listener;
-    private Task? _thread;
+    private Task? _thread, _watchdog;
+    private DateTime _lastFrame = DateTime.UtcNow;
     private readonly CancellationTokenSource _cts = new();
     private readonly ConcurrentDictionary<HttpListenerResponse, string> _clientsFront = new(), _clientsBack = new();
     private int _quality = 80;
@@ -24,6 +27,7 @@ public class MjpegServer : IDisposable
         _quality = quality;
         Server.OnNewBackFrame += OnBackFrameAvailable;
         Server.OnNewFrontFrame += OnFrontFrameAvailable;
+        _watchdog = Task.Run(Watchdog, _cts.Token);
         // Needs verification with Server to avoid reduplicate instances and overload the CPU
         //EventBuss.Command += OnCommandSend;
     }
@@ -32,13 +36,16 @@ public class MjpegServer : IDisposable
         _cts?.Cancel();
         Server.OnNewBackFrame -= OnBackFrameAvailable;
         Server.OnNewFrontFrame -= OnFrontFrameAvailable;
+        
         //EventBuss.Command -= OnCommandSend;
         _listener?.Close();
         _cts?.Dispose();
         try
         {
             _thread?.Dispose();
-        }catch{}
+            _watchdog?.Dispose();
+        }
+        catch { }
         
     }
     private void OnCommandSend(BussCommand command)
@@ -53,11 +60,25 @@ public class MjpegServer : IDisposable
                 break;
         }
     }
+    private async Task Watchdog()
+    {
+        while (!_cts.IsCancellationRequested)
+        {
+            if ((DateTime.UtcNow - _lastFrame).Seconds > 5 && _listener.IsListening)
+            {
+                EventBuss.SendCommand(BussCommand.START_CAMERA_FRONT);
+                EventBuss.SendCommand(BussCommand.START_CAMERA_BACK);
+                await Task.Delay(5000, _cts.Token);
+            }else
+                await Task.Delay(1000, _cts.Token);
+        }
+    }
     private void OnBackFrameAvailable(object? sender, FrameEventArgs arg)
     {
         if (arg != null && arg.Data != null && arg.Data.Length > 0)
         {
-          _ = this.PushBackFrameAsync(Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height, Android.Graphics.ImageFormatType.Nv21, _quality));
+            _ = this.PushBackFrameAsync(Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height, Android.Graphics.ImageFormatType.Nv21, _quality));
+            _lastFrame = DateTime.UtcNow;
         }
     }
     private void OnFrontFrameAvailable(object? sender, FrameEventArgs arg)
@@ -65,6 +86,7 @@ public class MjpegServer : IDisposable
         if (arg != null && arg.Data != null && arg.Data.Length > 0)
         {
             _ = this.PushFrontFrameAsync(Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height, Android.Graphics.ImageFormatType.Nv21, _quality));
+            _lastFrame = DateTime.UtcNow;
         }
     }
     public void Start()
@@ -76,7 +98,7 @@ public class MjpegServer : IDisposable
             EventBuss.SendCommand(BussCommand.START_CAMERA_BACK);
             _thread = Task.Run(ListenLoop, _cts.Token);
         }
-        catch (Exception ex)
+        catch (System.Exception ex)
         {
             // Assuming that is already started
         }
@@ -115,7 +137,7 @@ public class MjpegServer : IDisposable
         response.StatusCode = 200;
         response.SendChunked = true;
         var uri = context.Request.Url?.ToString() ?? string.Empty;
-        if (String.IsNullOrEmpty(uri)) return;
+        if (System.String.IsNullOrEmpty(uri)) return;
         if (uri.Contains("Back"))
         {
             _clientsBack.TryAdd(response, Guid.NewGuid().ToString());

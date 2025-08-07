@@ -66,7 +66,20 @@ public class Server : IDisposable
         _frontCameraEnabled = FrontCameraEnabled;
         _backCameraEnabled = BackCameraEnabled;
         _address = Address;
+        _backService.ErrorOccurred += LogError;
+        _frontService.ErrorOccurred += LogError;
         ConfigureSocket();
+    }
+    private void LogError(object? sender, string error)
+    {
+        if (sender is FrontCameraService)
+        {
+            Log.Error("FRONT CAMERA SERVICE ERROR", error);
+        }
+        else
+        {
+            Log.Error("BACK CAMERA SERVICE ERROR", error);
+        }
     }
     private void ConfigureSocket()
     {
@@ -92,7 +105,7 @@ public class Server : IDisposable
                 }
                 break;
             case BussCommand.STOP_CAMERA_FRONT:
-                if (!_isStreaming && _isCapturingFront)
+                if (!_isStreaming && _isCapturingFront && _frontCameraEnabled)
                 {
                     _frontService.StopCapture();
                     _isCapturingFront = false;
@@ -106,7 +119,7 @@ public class Server : IDisposable
                 }
                 break;
             case BussCommand.STOP_CAMERA_BACK:
-                if (!_isStreaming && _isCapturingBack)
+                if (!_isStreaming && _isCapturingBack && _backCameraEnabled)
                 {
                     _backService.StopCapture();
                     _isCapturingBack = false;
@@ -116,6 +129,7 @@ public class Server : IDisposable
                 if (!_mjpegServerEnabled)
                 {
                     _mjpegServerEnabled = true;
+                    _mjpegServer = new(quality: _mjpegServerQuality);
                     _mjpegServer.Start();
                 }
                 break;
@@ -124,9 +138,11 @@ public class Server : IDisposable
                 {
                     _mjpegServerEnabled = false;
                     _mjpegServer.Stop();
+                    _mjpegServer?.Dispose();
                 }
                 break;
             case BussCommand.SWITCH_CAMERA:
+                _mjpegServer.Stop();
                 _mjpegServer?.Dispose();
                 _mjpegServer = new(quality: _mjpegServerQuality);
                 _socket?.Close();
