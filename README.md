@@ -762,6 +762,8 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
 
 - v1.1.7: Fixing MJPEG Codec bugs avoiding crashes, fixing Watchdog that close prematurly some connections, fixing some issues with the preview.
 
+- v1.1.8: Fixing issues related with Camera Services, making that on camera or service closure do not allow to restart them.
+
 ---
 
 **Thanks for checking out Balu Media Server!** 

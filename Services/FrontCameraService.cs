@@ -15,13 +15,7 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
     private CameraFrameCaptureService? _cameraCapture;
     private readonly Context _context;
     private readonly CancellationTokenSource _cts = new();
-    private readonly Channel<VideoFrame> _videoFrames = Channel.CreateBounded<VideoFrame>(
-        new BoundedChannelOptions(25)
-        {
-            FullMode = BoundedChannelFullMode.Wait,
-            SingleReader = true,
-            SingleWriter = false
-        });
+    private Channel<VideoFrame> _videoFrames;
     private Task? _thread;
     private DateTime _lastFrameTime;
     private readonly TimeSpan _minFrameInterval = TimeSpan.FromMilliseconds(22); // +- 45 fps 
@@ -39,6 +33,13 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
         try
         {
             _cameraCapture?.StartFrontCameraCapture(width, height);
+            _videoFrames = Channel.CreateBounded<VideoFrame>(
+                    new BoundedChannelOptions(25)
+                    {
+                        FullMode = BoundedChannelFullMode.Wait,
+                        SingleReader = true,
+                        SingleWriter = false
+                    });
             _threadRunning = true;
             _thread = Task.Run(ProcessFramesAsync, _cts.Token);
         }
@@ -53,6 +54,7 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
         {
             _cameraCapture?.StopFrontCameraCapture();
             _threadRunning = false;
+            _videoFrames?.Writer.TryComplete();
         }
         catch (Exception ex)
         {
