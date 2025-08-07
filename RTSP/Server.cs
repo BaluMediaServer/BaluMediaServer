@@ -49,17 +49,20 @@ public class Server : IDisposable
     public static event EventHandler<FrameEventArgs>? OnNewFrontFrame, OnNewBackFrame;
     private static readonly byte[] StandardQuantizationTables = GetStandardQuantizationTables();
     private readonly ArrayPool<byte> _arrayPool = ArrayPool<byte>.Shared;
-    private Dictionary<string, string> _users = new()
-    {
-        { "admin", "password123" }
-    };
+    private ConcurrentDictionary<string, string> _users = new();
     public Server(int Port = 7778, int MaxClients = 100, string Address = "0.0.0.0", Dictionary<string, string>? Users = null, bool BackCameraEnabled = true, bool FrontCameraEnabled = true, bool AuthRequired = true, int MjpegServerQuality = 80)
     {
         EventBuss.Command += OnCommandSend;
         _enabled = true;
         _port = Port;
         _maxClients = MaxClients;
-        _users = Users == null ? _users : Users;
+        AddUser("admin", "password123");
+        if (Users != null)
+            foreach (var item in Users)
+                if(_users.ContainsKey(item.Key))
+                    UpdateUser(item.Key, item.Value);
+                else
+                    AddUser(item.Key, item.Value);
         _mjpegServerQuality = MjpegServerQuality;
         _mjpegServer = new(quality: _mjpegServerQuality);
         _authRequired = AuthRequired;
@@ -70,6 +73,9 @@ public class Server : IDisposable
         _frontService.ErrorOccurred += LogError;
         ConfigureSocket();
     }
+    public bool AddUser(string user, string password) => _users.TryAdd(user, password);
+    public bool UpdateUser(string user, string password) => RemoveUser(user) ? AddUser(user, password) : false;
+    public bool RemoveUser(string user) => _users.TryRemove(user, out _);
     private void LogError(object? sender, string error)
     {
         if (sender is FrontCameraService)
