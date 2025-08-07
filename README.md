@@ -69,7 +69,7 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 
 ### NuGet Package
 ```xml
-<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.1.5" />
+<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.1.9" />
 ```
 
 ### Manual Installation
@@ -304,6 +304,15 @@ public bool Start()
 // Stop the server and cleanup resources
 public void Stop()
 
+// Add new user to the "database" *NO REBOOT REQUIRED
+public bool AddUser(string username, string password)
+
+// Remove user from the "database" *NO REBOOT REQUIRED
+public bool RemoveUser(string username)
+
+// Update user from the "database" *NO REBOOT REQUIRED
+public bool UpdateUser(string username, string password)
+
 // Static method to encode YUV data to JPEG
 public static byte[] EncodeToJpeg(byte[] rawImageData, int width, int height, Android.Graphics.ImageFormatType format)
 ```
@@ -378,7 +387,7 @@ public enum BussCommand
     STOP_CAMERA_BACK,
     START_MJPEG_SERVER,
     STOP_MJPEG_SERVER,
-    SWTICH_CAMERA       // New command implemented, but without specific functions at the moment
+    SWITCH_CAMERA       // New command implemented, but without specific functions at the moment
 }
 
 // Send command
@@ -689,7 +698,7 @@ Server.OnClientsChange += (clients) => {
 ### Short Term (v1.1)
 - ✅ Fix H.264 stream stutter issues
 - ✅ Add support for multiple profiles/routes (`/live/front`, `/live/back`)
-- ⬜ Add user/password control panel
+- ✅ Add user/password control panel
 - ⬜ Fix image rotation
 - ⬜ Add bitrate/resolution configuration
 - ✅ **Fix UDP transport reliability issues** (currently TCP is recommended)
@@ -763,6 +772,8 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
 - v1.1.7: Fixing MJPEG Codec bugs avoiding crashes, fixing Watchdog that close prematurly some connections, fixing some issues with the preview.
 
 - v1.1.8: Fixing issues related with Camera Services, making that on camera or service closure do not allow to restart them.
+
+- v1.1.9: Adding user/password handling options.
 
 ---
 

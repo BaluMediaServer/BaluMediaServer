@@ -9,7 +9,7 @@
 		<!-- NuGet Package Properties -->
 		<GeneratePackageOnBuild>false</GeneratePackageOnBuild>
 		<PackageId>BaluMediaServer.CameraStreamer</PackageId>
-		<PackageVersion>1.1.7</PackageVersion>
+		<PackageVersion>1.1.9</PackageVersion>
 		<Authors>Nakano Miku 13</Authors>
 		<Company>Balu Media Server</Company>
 		<Product>Balu Media Camera Streamer</Product>
