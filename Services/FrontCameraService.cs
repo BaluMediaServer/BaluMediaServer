@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Threading.Channels;
 using Android.Content;
 using Android.Runtime;
 using Android.Util;
@@ -14,7 +15,13 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
     private CameraFrameCaptureService? _cameraCapture;
     private readonly Context _context;
     private readonly CancellationTokenSource _cts = new();
-    private readonly BlockingCollection<VideoFrame> _videoFrames = new(25);
+    private readonly Channel<VideoFrame> _videoFrames = Channel.CreateBounded<VideoFrame>(
+        new BoundedChannelOptions(25)
+        {
+            FullMode = BoundedChannelFullMode.Wait,
+            SingleReader = true,
+            SingleWriter = false
+        });
     private Task? _thread;
     private DateTime _lastFrameTime;
     private readonly TimeSpan _minFrameInterval = TimeSpan.FromMilliseconds(22); // +- 45 fps 
@@ -33,7 +40,7 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
         {
             _cameraCapture?.StartFrontCameraCapture(width, height);
             _threadRunning = true;
-            Task.Run(ProcessFrames, _cts.Token);
+            _thread = Task.Run(ProcessFramesAsync, _cts.Token);
         }
         catch (Exception ex)
         {
@@ -57,10 +64,16 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
     {
         try
         {
-            // Direct processing - no queue, no thread
-            if (!_videoFrames.TryAdd(frame))
+            var now = DateTime.UtcNow;
+            if (now - _lastFrameTime < _minFrameInterval)
             {
-                frame?.Dispose(); // drop safely
+                frame?.Dispose();
+                return; // Drop immediately
+            }
+            _lastFrameTime = DateTime.UtcNow;
+            if (!_videoFrames.Writer.TryWrite(frame))
+            {
+                frame?.Dispose();
             }
         }
         catch (Exception ex)
@@ -82,35 +95,28 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
         };
         FrameReceived?.Invoke(this, args);
     }
-    public void ProcessFrames()
+    public async Task ProcessFramesAsync()
     {
         while (!_cts.IsCancellationRequested && _threadRunning)
         {
             try
             {
-                var frame = _videoFrames.Take(_cts.Token);
-                if (frame != null)
+                // Use async read - this is blocking the thread currently
+                var frame = await _videoFrames.Reader.ReadAsync(_cts.Token).ConfigureAwait(false);
+                try
                 {
-                    //await _sem.WaitAsync(_cts.Token);
-                    try
-                    {
-                        var now = DateTime.UtcNow;
-                        if (now - _lastFrameTime < _minFrameInterval)
-                        {
-                            frame?.Dispose();
-                            continue;
-                        }
-                        _lastFrameTime = now;
-                        ProcessFrame(frame);
-                    }
-                    finally
-                    {
-                        //_sem.Release();
-                        frame?.Dispose();
-                    }
+                    ProcessFrame(frame);
+                }
+                finally
+                {
+                    frame?.Dispose();
                 }
             }
-            catch(Exception ex)
+            catch (OperationCanceledException)
+            {
+                break; // Normal cancellation
+            }
+            catch (Exception ex)
             {
                 OnError(ex.Message);
             }
@@ -124,15 +130,16 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
     {
         if (disposing)
         {
-            _cameraCapture?.StopBackCameraCapture();
+            _cameraCapture?.StopFrontCameraCapture();
             _cts?.Cancel();
+            _videoFrames.Writer.TryComplete();
             if (_thread != null)
             {
                 try
                 {
                     _thread.Wait(TimeSpan.FromSeconds(5));
                 }
-                catch {}
+                catch { }
                 _thread.Dispose();
             }
             _cameraCapture?.Dispose();

@@ -67,9 +67,9 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 - Visual Studio 2022 with MAUI workload
 - Android device or emulator
 
-### NuGet Package (Coming Soon)
+### NuGet Package
 ```xml
-<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.0.0" />
+<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.1.5" />
 ```
 
 ### Manual Installation
@@ -288,7 +288,11 @@ public Server(
     int Port = 7778,                           // RTSP server port
     int MaxClients = 100,                      // Maximum concurrent clients
     string Address = "0.0.0.0",               // Bind address
-    Dictionary<string, string> Users           // Authentication users (required)
+    Dictionary<string, string> Users,           // Authentication users (required)
+    bool BackCameraEnabled = true,              // Enable or disable back camera
+    bool FrontCameraEnabled = true,             // Enable or disable front camera
+    bool AuthRequired = true,                   // Disable full auth ignoring if a Users dict was passed (recommended just for testing)
+    int MjpegServerQuality = 80                 // Sets a default Mjpeg Image compression quality by default, ideal if the image to display is small, avoiding using too much CPU
 )
 ```
 
@@ -325,7 +329,7 @@ HTTP server for MJPEG streaming, perfect for web browser integration.
 
 #### Constructor
 ```csharp
-public MjpegServer(int port = 8089)
+public MjpegServer(int port = 8089, int quality = 80)
 ```
 
 #### Methods
@@ -335,9 +339,6 @@ public void Start()
 
 // Stop the server
 public void Stop()
-
-// Push a frame to all connected clients
-public void PushFrame(byte[] jpegBytes, bool front = false)
 ```
 
 #### Endpoints
@@ -376,7 +377,8 @@ public enum BussCommand
     START_CAMERA_BACK,
     STOP_CAMERA_BACK,
     START_MJPEG_SERVER,
-    STOP_MJPEG_SERVER
+    STOP_MJPEG_SERVER,
+    SWTICH_CAMERA       // New command implemented, but without specific functions at the moment
 }
 
 // Send command
@@ -685,12 +687,12 @@ Server.OnClientsChange += (clients) => {
 ## 🛣️ Roadmap
 
 ### Short Term (v1.1)
-- ⬜ Fix H.264 stream stutter issues
-- ⬜ Add support for multiple profiles/routes (`/live/front`, `/live/back`)
+- ✅ Fix H.264 stream stutter issues
+- ✅ Add support for multiple profiles/routes (`/live/front`, `/live/back`)
 - ⬜ Add user/password control panel
 - ⬜ Fix image rotation
 - ⬜ Add bitrate/resolution configuration
-- ⬜ **Fix UDP transport reliability issues** (currently TCP is recommended)
+- ✅ **Fix UDP transport reliability issues** (currently TCP is recommended)
 
 ### Medium Term (v1.2-1.3)
 - ⬜ Add H.265 (HEVC) codec support
@@ -754,6 +756,11 @@ There are few (if any) options to integrate RTSP servers with Android using C# a
 
 - v1.1.5: Fixing EventBuss command on Server class, if the server was started do not raise the flag into it, and sometimes make the app crash due to "Port already in use" or even using excesive CPU on multiple MJPEG servers.
 Adding to MJPEGServer preview of EventBuss to handle it by there, but needs sync with main server to avoid duplicate instances or commands.
+
+- v1.1.6: Adding ArrayPool to avoid ovearhead at GC with multiple byte[] creations like in RTP Packets.
+Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, theorical from 100ms to 100 us, increase performance on fewer CPU resources devices.
+
+- v1.1.7: Fixing MJPEG Codec bugs avoiding crashes, fixing Watchdog that close prematurly some connections, fixing some issues with the preview.
 
 ---
 

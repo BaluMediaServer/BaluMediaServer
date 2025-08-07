@@ -30,6 +30,10 @@ public class Client : IDisposable
     public Socket? RtcpSocket { get; set; }
     public int CameraId { get; set; } = 0;
     public VideoProfile VideoProfile { get; set; } = new();
+    public List<byte[]> RtcpBuffer = new();
+    public byte[] RtpBuffer { get; set; } = new byte[1500]; // MTU Size
+    public DateTime LastRtcpFlush = DateTime.UtcNow;
+    public readonly object RtcpLock = new();
     public void Dispose()
     {
         this.Socket?.Close();
