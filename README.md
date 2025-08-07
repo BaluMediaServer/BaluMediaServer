@@ -687,12 +687,12 @@ Server.OnClientsChange += (clients) => {
 ## 🛣️ Roadmap
 
 ### Short Term (v1.1)
-- ⬜ Fix H.264 stream stutter issues
+- ✅ Fix H.264 stream stutter issues
 - ✅ Add support for multiple profiles/routes (`/live/front`, `/live/back`)
 - ⬜ Add user/password control panel
 - ⬜ Fix image rotation
 - ⬜ Add bitrate/resolution configuration
-- ⬜ **Fix UDP transport reliability issues** (currently TCP is recommended)
+- ✅ **Fix UDP transport reliability issues** (currently TCP is recommended)
 
 ### Medium Term (v1.2-1.3)
 - ⬜ Add H.265 (HEVC) codec support
@@ -759,6 +759,8 @@ Adding to MJPEGServer preview of EventBuss to handle it by there, but needs sync
 
 - v1.1.6: Adding ArrayPool to avoid ovearhead at GC with multiple byte[] creations like in RTP Packets.
 Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, theorical from 100ms to 100 us, increase performance on fewer CPU resources devices.
+
+- v1.1.7: Fixing MJPEG Codec bugs avoiding crashes, fixing Watchdog that close prematurly some connections, fixing some issues with the preview.
 
 ---
 

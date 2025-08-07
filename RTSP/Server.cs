@@ -92,7 +92,7 @@ public class Server : IDisposable
                 }
                 break;
             case BussCommand.STOP_CAMERA_FRONT:
-                if (!_isStreaming && _isCapturingFront && !_mjpegServerEnabled)
+                if (!_isStreaming && _isCapturingFront)
                 {
                     _frontService.StopCapture();
                     _isCapturingFront = false;
@@ -106,7 +106,7 @@ public class Server : IDisposable
                 }
                 break;
             case BussCommand.STOP_CAMERA_BACK:
-                if (!_isStreaming && _isCapturingBack && !_mjpegServerEnabled)
+                if (!_isStreaming && _isCapturingBack)
                 {
                     _backService.StopCapture();
                     _isCapturingBack = false;
@@ -267,7 +267,9 @@ public class Server : IDisposable
             try
             {
                 OnClientsChange?.Invoke(_clients.ToList());
-                var connected = _clients.Count(p => p.Socket?.Connected ?? false);
+                var connected = _clients.Count(p =>
+                    p.Socket?.Connected ?? false
+                );
                 if (connected == 0 && _isStreaming)
                 {
                     if (!_mjpegServerEnabled)
@@ -291,7 +293,7 @@ public class Server : IDisposable
 
             }
             OnStreaming?.Invoke(this, _isStreaming);
-            await Task.Delay(1000, _cts.Token).ConfigureAwait(false);
+            await Task.Delay(60000, _cts.Token).ConfigureAwait(false);
         }
     }
     public void Dispose()
@@ -992,28 +994,25 @@ public class Server : IDisposable
     // Optimized with Array Pool
     private async Task SendJpegAsRtp(Client client, byte[] jpegData)
     {
-
         int offset = 0;
 
         while (offset < jpegData.Length && !_cts.IsCancellationRequested)
         {
-            int fragmentOffset = offset;
-            int payloadSize = Math.Min(_maxPayloadSize - 8, jpegData.Length - offset);
-            bool isLastFragment = (offset + payloadSize) >= jpegData.Length;
+            // Determine header size based on whether this is the first fragment
+            int headerSize = (offset == 0) ? 140 : 8; // 8 + 4 + 128 for first fragment
+            
+            // Calculate how much JPEG data we can fit in this packet
+            int jpegDataSize = Math.Min(_maxPayloadSize - headerSize, jpegData.Length - offset);
+            
+            // Total payload size is header + jpeg data
+            int totalPayloadSize = headerSize + jpegDataSize;
+            
+            bool isLastFragment = (offset + jpegDataSize) >= jpegData.Length;
+            
+            // Create buffer for the exact payload size needed
+            var payload = new byte[totalPayloadSize];
 
-            //var payload = new byte[8 + payloadSize];
-            var payload = _arrayPool.Rent(8 + payloadSize);
-            // Type-specific header (8 bytes)
-            payload[0] = 0; // Type-specific
-            payload[1] = (byte)((fragmentOffset >> 16) & 0xFF);
-            payload[2] = (byte)((fragmentOffset >> 8) & 0xFF);
-            payload[3] = (byte)(fragmentOffset & 0xFF);
-            payload[4] = 1; // Type (1 for standard quantization tables)
-            payload[5] = 255; // Q value (255 = dynamic tables)
-
-            // Width and height must be in 8-pixel units (not divided by 8)
-            // But the RTP JPEG header expects values in 8-pixel blocks
-            // So if width=1280, we send 160 (1280/8)
+            // Width and height in 8-pixel blocks
             var widthInBlocks = (byte)(client.Width / 8);
             var heightInBlocks = (byte)(client.Height / 8);
 
@@ -1021,49 +1020,57 @@ public class Server : IDisposable
             if (widthInBlocks == 0) widthInBlocks = 160; // Default 1280/8
             if (heightInBlocks == 0) heightInBlocks = 90;  // Default 720/8
 
-            payload[6] = widthInBlocks;
-            payload[7] = heightInBlocks;
-
+            // Type-specific header (first 8 bytes) - common for all fragments
+            payload[0] = 0; // Type-specific
+            payload[1] = (byte)((offset >> 16) & 0xFF);
+            payload[2] = (byte)((offset >> 8) & 0xFF);
+            payload[3] = (byte)(offset & 0xFF);
+            
             if (offset == 0)
             {
-                _arrayPool.Return(payload);
-                payload = _arrayPool.Rent(140 + payloadSize);
-
-                payload[0] = 0; // Type-specific
-                payload[1] = (byte)((fragmentOffset >> 16) & 0xFF);
-                payload[2] = (byte)((fragmentOffset >> 8) & 0xFF);
-                payload[3] = (byte)(fragmentOffset & 0xFF);
-                payload[4] = 0; // Type (1 for standard quantization tables)
+                // First fragment - includes quantization tables
+                payload[4] = 0;   // Type (0 = includes quantization tables)
                 payload[5] = 255; // Q value (255 = dynamic tables)
                 payload[6] = widthInBlocks;
                 payload[7] = heightInBlocks;
 
-                payload[8] = 0;
-                payload[9] = 0;
-                payload[10] = 0;
-                payload[11] = 128;
+                // Quantization table header (4 bytes)
+                payload[8] = 0;   // MBZ
+                payload[9] = 0;   // Precision
+                payload[10] = 0;  // Length MSB
+                payload[11] = 128; // Length LSB (128 bytes of quant tables)
 
-                //var newPayload = new byte[8 + 4 + 128 + payloadSize];
-                //Buffer.BlockCopy(payload, 0, newPayload, 0, 8);
-                //Buffer.BlockCopy(qtHeader, 0, payload, 8, 4);
+                // Copy quantization tables (128 bytes)
                 Buffer.BlockCopy(StandardQuantizationTables, 0, payload, 12, 128);
-                Buffer.BlockCopy(jpegData, offset, payload, 140, payloadSize);
+                
+                // Copy JPEG data after the quantization tables
+                Buffer.BlockCopy(jpegData, offset, payload, 140, jpegDataSize);
             }
             else
             {
-                Buffer.BlockCopy(jpegData, offset, payload, 8, payloadSize);
+                // Subsequent fragments - no quantization tables
+                payload[4] = 1;   // Type (1 = no quantization tables)
+                payload[5] = 255; // Q value
+                payload[6] = widthInBlocks;
+                payload[7] = heightInBlocks;
+
+                // Copy JPEG data directly after the 8-byte header
+                Buffer.BlockCopy(jpegData, offset, payload, 8, jpegDataSize);
             }
 
+            // Create RTP packet
             var rtpPacket = CreateRtpPacketOld(client, payload, isLastFragment, 26);
 
             // Send via appropriate transport
             await SendData(client, rtpPacket).ConfigureAwait(false);
+            
             lock (client)
             {
                 client.SequenceNumber++;
             }
-            offset += payloadSize;
-            _arrayPool.Return(payload);
+            
+            // Move offset by the amount of JPEG data we just sent
+            offset += jpegDataSize;
         }
     }
     private async Task SendData(Client client, byte[] data)
@@ -1191,7 +1198,8 @@ public class Server : IDisposable
     // OPTIMIZED WITH ARRAY POOL
     private byte[] CreateRtpPacketOld(Client client, byte[] payload, bool marker, byte payloadType)
     {
-        var packet = _arrayPool.Rent(12 + payload.Length);
+        //var packet = _arrayPool.Rent(12 + payload.Length);
+        var packet = new byte[12 + payload.Length];
         packet[0] = 0x80; // V=2, P=0, X=0, CC=0
         packet[1] = (byte)(marker ? 0x80 | payloadType : payloadType);
 
