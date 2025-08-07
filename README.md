@@ -69,7 +69,7 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 
 ### NuGet Package
 ```xml
-<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.1.5" />
+<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.1.9" />
 ```
 
 ### Manual Installation
