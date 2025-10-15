@@ -73,6 +73,27 @@ public class Server : IDisposable
         _frontService.ErrorOccurred += LogError;
         ConfigureSocket();
     }
+    public Server(ServerConfiguration configuration)
+    {
+        _port = configuration.Port;
+        _maxClients = configuration.MaxClients;
+        AddUser("admin", "password123");
+        if (configuration.Users != null)
+            foreach (var item in configuration.Users)
+                if(_users.ContainsKey(item.Key))
+                    UpdateUser(item.Key, item.Value);
+                else
+                    AddUser(item.Key, item.Value);
+        _mjpegServerQuality = configuration.MjpegServerQuality;
+        _mjpegServer = new(quality: _mjpegServerQuality);
+        _authRequired = configuration.AuthRequired;
+        _frontCameraEnabled = configuration.FrontCameraEnabled;
+        _backCameraEnabled = configuration.BackCameraEnabled;
+        _address = configuration.BaseAddress;
+        _backService.ErrorOccurred += LogError;
+        _frontService.ErrorOccurred += LogError;
+        ConfigureSocket();
+    }
     public bool AddUser(string user, string password) => _users.TryAdd(user, password);
     public bool UpdateUser(string user, string password) => RemoveUser(user) ? AddUser(user, password) : false;
     public bool RemoveUser(string user) => _users.TryRemove(user, out _);
@@ -135,7 +156,8 @@ public class Server : IDisposable
                 if (!_mjpegServerEnabled)
                 {
                     _mjpegServerEnabled = true;
-                    _mjpegServer = new(quality: _mjpegServerQuality);
+                    if(_mjpegServer == null)
+                        _mjpegServer = new(quality: _mjpegServerQuality);
                     _mjpegServer.Start();
                 }
                 break;
@@ -145,6 +167,7 @@ public class Server : IDisposable
                     _mjpegServerEnabled = false;
                     _mjpegServer.Stop();
                     _mjpegServer?.Dispose();
+                    _mjpegServer = null!;
                 }
                 break;
             case BussCommand.SWITCH_CAMERA:

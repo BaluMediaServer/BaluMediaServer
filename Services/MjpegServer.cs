@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Text;
+using System.Threading.Channels;
 using System.Threading.Tasks;
+using Android.Util;
 using BaluMediaServer.Models;
 using BaluMediaServer.Repositories;
 using Java.Lang;
@@ -12,14 +14,17 @@ public class MjpegServer : IDisposable
 {
     private readonly HttpListener _listener;
     private Task? _thread, _watchdog;
-    private DateTime _lastFrame = DateTime.UtcNow;
+    private DateTime _lastFrame = DateTime.UtcNow, _lastBackFrameSent = DateTime.UtcNow, _lastFrontFrameSent = DateTime.UtcNow;
+    private readonly double _frameIntervalMs;
     private readonly CancellationTokenSource _cts = new();
     private readonly ConcurrentDictionary<HttpListenerResponse, string> _clientsFront = new(), _clientsBack = new();
+    private ConcurrentDictionary<string, DateTime> _clientLastFrameTime = new();
     private int _quality = 80;
     private int _port;
 
-    public MjpegServer(int port = 8089, int quality = 80)
+    public MjpegServer(int port = 8089, int quality = 30)
     {
+        _frameIntervalMs = 1000 / 30;
         _port = port;
         _listener = new();
         _listener.Prefixes.Add($"http://127.0.0.1:{_port}/Back/");
@@ -28,8 +33,6 @@ public class MjpegServer : IDisposable
         Server.OnNewBackFrame += OnBackFrameAvailable;
         Server.OnNewFrontFrame += OnFrontFrameAvailable;
         _watchdog = Task.Run(Watchdog, _cts.Token);
-        // Needs verification with Server to avoid reduplicate instances and overload the CPU
-        //EventBuss.Command += OnCommandSend;
     }
     public void Dispose()
     {
@@ -39,14 +42,14 @@ public class MjpegServer : IDisposable
         
         //EventBuss.Command -= OnCommandSend;
         _listener?.Close();
-        _cts?.Dispose();
+        
         try
         {
             _thread?.Dispose();
             _watchdog?.Dispose();
         }
         catch { }
-        
+        _cts?.Dispose();
     }
     private void OnCommandSend(BussCommand command)
     {
@@ -77,16 +80,26 @@ public class MjpegServer : IDisposable
     {
         if (arg != null && arg.Data != null && arg.Data.Length > 0)
         {
-            _ = this.PushBackFrameAsync(Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height, Android.Graphics.ImageFormatType.Nv21, _quality));
-            _lastFrame = DateTime.UtcNow;
+            var now = DateTime.UtcNow;
+            if ((now - _lastBackFrameSent).TotalMilliseconds < _frameIntervalMs)
+                return;
+            
+            _lastBackFrameSent = now;
+            var jpegData = Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height, Android.Graphics.ImageFormatType.Nv21, _quality);
+            Task.Run(async () => await PushBackFrameAsync(jpegData), _cts.Token);
         }
     }
     private void OnFrontFrameAvailable(object? sender, FrameEventArgs arg)
     {
         if (arg != null && arg.Data != null && arg.Data.Length > 0)
         {
-            _ = this.PushFrontFrameAsync(Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height, Android.Graphics.ImageFormatType.Nv21, _quality));
-            _lastFrame = DateTime.UtcNow;
+            var now = DateTime.UtcNow;
+            if ((now - _lastFrontFrameSent).TotalMilliseconds < _frameIntervalMs)
+                return;
+
+            _lastFrontFrameSent = now;
+            var jpegData = Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height, Android.Graphics.ImageFormatType.Nv21, _quality);
+            Task.Run(async () => await PushFrontFrameAsync(jpegData), _cts.Token);
         }
     }
     public void Start()
@@ -94,9 +107,11 @@ public class MjpegServer : IDisposable
         try
         {
             _listener.Start();
+            Log.Debug("MJPEG SERVER", "STARTING SERVER");
             EventBuss.SendCommand(BussCommand.START_CAMERA_FRONT);
             EventBuss.SendCommand(BussCommand.START_CAMERA_BACK);
             _thread = Task.Run(ListenLoop, _cts.Token);
+            Log.Debug("MJPEG SERVER", "STARTED SERVER");
         }
         catch (System.Exception ex)
         {
@@ -120,6 +135,7 @@ public class MjpegServer : IDisposable
         {
             try
             {
+                Log.Debug("MJPEG SERVER", "WAITING CLIENT");
                 var ctx = await _listener.GetContextAsync();
                 _ = Task.Run(() => HandleClient(ctx), _cts.Token);
             }
@@ -132,6 +148,7 @@ public class MjpegServer : IDisposable
 
     private async Task HandleClient(HttpListenerContext context)
     {
+        Log.Debug("MJPEG SERVER", "CLIENT RECEIVED");
         var response = context.Response;
         response.ContentType = "multipart/x-mixed-replace; boundary=--frame";
         response.StatusCode = 200;
@@ -146,14 +163,14 @@ public class MjpegServer : IDisposable
         {
             _clientsFront.TryAdd(response, Guid.NewGuid().ToString());
         }
-
+        Log.Debug("MJPEG SERVER", "SERVING FRAMES");
         try
         {
             while (response.OutputStream.CanWrite) await Task.Delay(100, _cts.Token);
         }
-        catch
+        catch(System.Exception ex)
         {
-            // Client disconnected
+            Log.Debug("MJPEG SERVER", $"ERROR: {ex.Message}");
         }
         finally
         {
@@ -174,11 +191,26 @@ public class MjpegServer : IDisposable
     {
         try
         {
+            if (_clientsBack.TryGetValue(client, out var clientId))
+            {
+                var now = DateTime.UtcNow;
+                
+                if (!_clientLastFrameTime.TryGetValue(clientId, out var lastTime))
+                {
+                    _clientLastFrameTime[clientId] = now;
+                }
+                else if ((now - lastTime).TotalMilliseconds < _frameIntervalMs)
+                {
+                    return;
+                }
+                
+                _clientLastFrameTime[clientId] = now;
+            }
             var header = Encoding.ASCII.GetBytes(
                 "\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + jpegBytes.Length + "\r\n\r\n");
             await client.OutputStream.WriteAsync(header, 0, header.Length, _cts.Token).ConfigureAwait(false);
             await client.OutputStream.WriteAsync(jpegBytes, 0, jpegBytes.Length, _cts.Token).ConfigureAwait(false);
-            client.OutputStream.Flush();
+            await client.OutputStream.FlushAsync(_cts.Token);
         }
         catch
         {
@@ -188,12 +220,14 @@ public class MjpegServer : IDisposable
     }
     public async Task PushBackFrameAsync(byte[] jpegBytes)
     {
+        Log.Debug("MJPEG SERVER", "SENDING BACK FRAME");
         var tasks = _clientsBack.Keys.Select(async p => await WriteDataAsync(p, jpegBytes));
         await Task.WhenAll(tasks);
     }
     public async Task PushFrontFrameAsync(byte[] jpegBytes)
     {
-        var tasks = _clientsBack.Keys.Select(async p => await WriteDataAsync(p, jpegBytes));
+        Log.Debug("MJPEG SERVER", "SENDING FRONT FRAME");
+        var tasks = _clientsFront.Keys.Select(async p => await WriteDataAsync(p, jpegBytes));
         await Task.WhenAll(tasks);
     }
 }

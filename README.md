@@ -294,6 +294,10 @@ public Server(
     bool AuthRequired = true,                   // Disable full auth ignoring if a Users dict was passed (recommended just for testing)
     int MjpegServerQuality = 80                 // Sets a default Mjpeg Image compression quality by default, ideal if the image to display is small, avoiding using too much CPU
 )
+
+public Server(
+    ServerConfiguration config // Simple class to configure the server
+)
 ```
 
 #### Methods
@@ -700,7 +704,7 @@ Server.OnClientsChange += (clients) => {
 - ✅ Add support for multiple profiles/routes (`/live/front`, `/live/back`)
 - ✅ Add user/password control panel
 - ⬜ Fix image rotation
-- ⬜ Add bitrate/resolution configuration
+- ✅ Add bitrate/resolution configuration
 - ✅ **Fix UDP transport reliability issues** (currently TCP is recommended)
 
 ### Medium Term (v1.2-1.3)
@@ -775,6 +779,9 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
 
 - v1.1.9: Adding user/password handling options.
 
+- v1.1.10: Adding a custom class 'ServerConfiguration' to handle more easily all the server configurations.
+
+- v1.1.11: Fixing Server to allow Configuration Class, fixing MjpegServer disposal on Server class, fixing MjpegServer to set a fixed bitrate to 30 fps and fixing CPU leaks.
 ---
 
 **Thanks for checking out Balu Media Server!** 
