@@ -782,6 +782,8 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
 - v1.1.10: Adding a custom class 'ServerConfiguration' to handle more easily all the server configurations.
 
 - v1.1.11: Fixing Server to allow Configuration Class, fixing MjpegServer disposal on Server class, fixing MjpegServer to set a fixed bitrate to 30 fps and fixing CPU leaks.
+
+- v1.2.0: Adding new global encoder for compatiblity with multiple devices not only Mediatek and fixing some features from the server to handle clients.
 ---
 
 **Thanks for checking out Balu Media Server!** 

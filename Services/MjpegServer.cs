@@ -220,13 +220,11 @@ public class MjpegServer : IDisposable
     }
     public async Task PushBackFrameAsync(byte[] jpegBytes)
     {
-        Log.Debug("MJPEG SERVER", "SENDING BACK FRAME");
         var tasks = _clientsBack.Keys.Select(async p => await WriteDataAsync(p, jpegBytes));
         await Task.WhenAll(tasks);
     }
     public async Task PushFrontFrameAsync(byte[] jpegBytes)
     {
-        Log.Debug("MJPEG SERVER", "SENDING FRONT FRAME");
         var tasks = _clientsFront.Keys.Select(async p => await WriteDataAsync(p, jpegBytes));
         await Task.WhenAll(tasks);
     }

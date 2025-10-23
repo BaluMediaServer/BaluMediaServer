@@ -47,7 +47,8 @@ public class H264Encoder : IDisposable
         _bitrate = bitrate;
         _frameRate = frameRate;
         var codecList = new MediaCodecList(new());
-        var codecInfos =  codecList.GetCodecInfos();
+        var codecInfos = codecList.GetCodecInfos();
+
         _bestEncoder = SelectBestEncoder(codecInfos!);
     }
     private static readonly Dictionary<string, int> EncoderPriority = new Dictionary<string, int>
@@ -55,7 +56,6 @@ public class H264Encoder : IDisposable
         // Hardware encoders (highest priority)
         { "OMX.qcom.video.encoder.avc", 100 },      // Qualcomm
         { "OMX.Exynos.avc.enc", 95 },               // Samsung Exynos
-        { "OMX.MTK.VIDEO.ENCODER.AVC", 90 },        // MediaTek
         { "OMX.hisi.video.encoder.avc", 85 },       // HiSilicon (Huawei)
         { "OMX.Intel.hw_ve.h264", 80 },             // Intel
         { "OMX.IMG.TOPAZ.VIDEO.ENCODER", 75 },      // PowerVR
@@ -65,7 +65,6 @@ public class H264Encoder : IDisposable
         { "c2.android.avc.encoder", 60 },           // Android Codec 2.0
         { "c2.mtk.avc.encoder", 50 },               // MediaTek hardware
         { "OMX.MTK.VIDEO.ENCODER.AVC", 45 },        // MediaTek OMX
-        { "c2.android.avc.encoder", 40 },           // Android hardware
         { "OMX.google.h264.encoder", 30 },          // Software fallback
         
         // Software encoders (lowest priority)
@@ -87,7 +86,7 @@ public class H264Encoder : IDisposable
         foreach (var info in codecInfos)
         {
             var types = info.GetSupportedTypes();
-            if (info.IsEncoder && types.Contains(MediaFormat.MimetypeVideoAvc))
+            if (info.IsEncoder && types!.Contains(MediaFormat.MimetypeVideoAvc))
             {
                 var encoderInfo = EvaluateEncoder(info);
                 if (encoderInfo != null)
@@ -103,12 +102,13 @@ public class H264Encoder : IDisposable
 
         // Log the ranking
         Log.Debug("EncoderSelector", "Encoder ranking:");
+        
         foreach (var encoder in encoders)
         {
             Log.Debug("EncoderSelector", $"  {encoder.Name}: {encoder.Score} points");
         }
 
-        return encoders.FirstOrDefault();
+        return encoders.FirstOrDefault()!;
     }
     private static bool IsHardwareEncoder(string encoderName)
     {
@@ -253,18 +253,10 @@ public class H264Encoder : IDisposable
 
                 // Use the best color format from the selected encoder
                 int colorFormat = COLOR_FormatYUV420SemiPlanar; // Default
-                if (_bestEncoder.ColorFormats != null && _bestEncoder.ColorFormats.Count > 0)
-                {
-                    // Prefer Surface if available, otherwise use first supported format
-                    if (_bestEncoder.ColorFormats.Contains((int)MediaCodecCapabilities.Formatsurface))
-                    {
-                        colorFormat = (int)MediaCodecCapabilities.Formatsurface;
-                    }
-                    else
-                    {
-                        colorFormat = _bestEncoder.ColorFormats[0];
-                    }
-                }
+                if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420SemiPlanar))
+                    colorFormat = COLOR_FormatYUV420SemiPlanar; // NV12
+                else if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420Flexible))
+                    colorFormat = COLOR_FormatYUV420Flexible;
 
                 format.SetInteger(MediaFormat.KeyColorFormat, colorFormat);
                 format.SetInteger(MediaFormat.KeyBitRate, _bitrate);
@@ -273,7 +265,7 @@ public class H264Encoder : IDisposable
                 
                 // Set profile and level for better compatibility
                 format.SetInteger(MediaFormat.KeyProfile, (int)MediaCodecProfileType.Avcprofilebaseline);
-                format.SetInteger(MediaFormat.KeyLevel, (int)MediaCodecProfileType.Avcprofileextended);
+                format.SetInteger(MediaFormat.KeyLevel, 0x100);
 
                 // Low latency configuration
                 if (Build.VERSION.SdkInt >= BuildVersionCodes.R) // API 30+
@@ -391,6 +383,13 @@ public class H264Encoder : IDisposable
     {
         if (!_isRunning) return;
         
+        int expectedSize = (_width * _height * 3) / 2;
+
+        if (frameData.Length != expectedSize)
+        {
+            Log.Error("H264", $"Invalid frame size: {frameData.Length}, expected: {expectedSize}");
+            return;
+        }
         // Use actual time for timestamps to prevent stuttering
         if (!_stopwatch.IsRunning)
         {
@@ -400,11 +399,11 @@ public class H264Encoder : IDisposable
         var timestamp = _stopwatch.ElapsedTicks * 1000000L / Stopwatch.Frequency;
         
         // Drop frames if queue is backing up (keep only 2 frames max)
-        while (_frameQueue.Count > 0)
+        while (_frameQueue.Count > 2)
         {
             if (_frameQueue.TryDequeue(out _))
             {
-                Log.Debug("H264MTK", "Dropped old frame to prevent latency");
+                Log.Debug("H264", "Dropped old frame to prevent latency");
             }
         }
         
@@ -521,8 +520,10 @@ public class H264Encoder : IDisposable
                     }
                 }
             }
-            
-            return nv12;
+            var result = new byte[totalSize];
+            Array.Copy(nv12, 0, result, 0, totalSize);
+            _bufferPool.Return(nv12);
+            return result;
         }
         catch
         {

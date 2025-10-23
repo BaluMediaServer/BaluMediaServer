@@ -29,7 +29,7 @@ public class Server : IDisposable
     private int _port = 7778, _maxClients = 100, _nextRtpPort = 5000, _mjpegServerQuality = 80;
     private readonly object _portLock = new();
     private readonly HashSet<int> _usedPorts = new();
-    private readonly CancellationTokenSource _cts = new();
+    private CancellationTokenSource _cts = new();
     private ConcurrentBag<Client> _clients = new();
     private string _uri = string.Empty;
     private bool _isStreaming = false, _enabled = false, _isCapturingFront = false, _isCapturingBack = false,
@@ -40,16 +40,17 @@ public class Server : IDisposable
     private const int _maxPayloadSize = 1400;
     private readonly TimeSpan _nonceExpiry = TimeSpan.FromMinutes(5);
     private readonly object _frameFrontLock = new(), _frameBackLock = new(), _h264FrontLock = new(), _h264BackLock = new();
-    private MediaTekH264Encoder? _h264FrontEncoder, _h264BackEncoder;
+    private H264Encoder? _h264FrontEncoder, _h264BackEncoder;
     private H264FrameEventArgs? _latestH264FrameFront, _latestH264FrameBack;
     private List<VideoProfile> _videoProfiles = new();
     private readonly Dictionary<string, byte[]?> _clientSpsCache = new(), _clientPpsCache = new();
-    public static event Action<List<Client>>? OnClientsChange;
-    public static event EventHandler<bool>? OnStreaming;
-    public static event EventHandler<FrameEventArgs>? OnNewFrontFrame, OnNewBackFrame;
     private static readonly byte[] StandardQuantizationTables = GetStandardQuantizationTables();
     private readonly ArrayPool<byte> _arrayPool = ArrayPool<byte>.Shared;
     private ConcurrentDictionary<string, string> _users = new();
+    public static event Action<List<Client>>? OnClientsChange;
+    public static event EventHandler<bool>? OnStreaming;
+    public static event EventHandler<FrameEventArgs>? OnNewFrontFrame, OnNewBackFrame;
+    public bool IsRunning { get; private set; } = false;
     public Server(int Port = 7778, int MaxClients = 100, string Address = "0.0.0.0", Dictionary<string, string>? Users = null, bool BackCameraEnabled = true, bool FrontCameraEnabled = true, bool AuthRequired = true, int MjpegServerQuality = 80)
     {
         EventBuss.Command += OnCommandSend;
@@ -75,6 +76,7 @@ public class Server : IDisposable
     }
     public Server(ServerConfiguration configuration)
     {
+        EventBuss.Command += OnCommandSend;
         _port = configuration.Port;
         _maxClients = configuration.MaxClients;
         AddUser("admin", "password123");
@@ -108,17 +110,38 @@ public class Server : IDisposable
             Log.Error("BACK CAMERA SERVICE ERROR", error);
         }
     }
+    private Socket CreateConfiguredSocket()
+    {
+        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true);
+        socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendBuffer, 262144);
+        socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 262144);
+        return socket;
+    }
+
     private void ConfigureSocket()
     {
         IPEndPoint endpoint = new(IPAddress.Parse(_address), _port);
-        _socket = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-        _socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true); // Disable Nagle's
-        _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendBuffer, 262144); // 256KB
-        _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 262144); // 256KB
-        _socket.Bind(endpoint);
-        _socket.Listen(_maxClients);
+
+        try
+        {
+            _socket?.Close();
+            _socket?.Dispose();
+            _socket = CreateConfiguredSocket();
+            _socket.Bind(endpoint);
+            _socket.Listen(_maxClients);
+        }
+        catch(Exception ex)
+        {
+            _socket?.Close();
+            _socket?.Dispose();
+            _socket = CreateConfiguredSocket();
+            _socket.Bind(endpoint);
+            _socket.Listen(_maxClients);
+        }
     }
+
     public void SetVideoProfile(VideoProfile profile) => _videoProfiles.Add(profile);
     private void OnCommandSend(BussCommand command)
     {
@@ -127,6 +150,10 @@ public class Server : IDisposable
             case BussCommand.START_CAMERA_FRONT:
                 if (!_isCapturingFront && _frontCameraEnabled)
                 {
+                    if (!IsRunning)
+                    {
+                        _frontService.FrameReceived += OnFrontFrameAvailable;    
+                    }
                     _frontService.StartCapture();
                     _isCapturingFront = true;
                 }
@@ -134,6 +161,10 @@ public class Server : IDisposable
             case BussCommand.STOP_CAMERA_FRONT:
                 if (!_isStreaming && _isCapturingFront && _frontCameraEnabled)
                 {
+                    if (!IsRunning)
+                    {
+                        _frontService.FrameReceived -= OnFrontFrameAvailable;    
+                    }
                     _frontService.StopCapture();
                     _isCapturingFront = false;
                 }
@@ -141,6 +172,10 @@ public class Server : IDisposable
             case BussCommand.START_CAMERA_BACK:
                 if (!_isCapturingBack && _backCameraEnabled)
                 {
+                    if (!IsRunning)
+                    {
+                        _backService.FrameReceived += OnBackFrameAvailable;
+                    }
                     _backService.StartCapture();
                     _isCapturingBack = true;
                 }
@@ -148,6 +183,10 @@ public class Server : IDisposable
             case BussCommand.STOP_CAMERA_BACK:
                 if (!_isStreaming && _isCapturingBack && _backCameraEnabled)
                 {
+                    if (!IsRunning)
+                    {
+                        _backService.FrameReceived -= OnFrontFrameAvailable;    
+                    }
                     _backService.StopCapture();
                     _isCapturingBack = false;
                 }
@@ -256,10 +295,17 @@ public class Server : IDisposable
         {
             if (_h264BackEncoder == null)
             {
-                _h264BackEncoder = new(width, height, bitrate: 2000000, frameRate: 25);
-                _h264BackEncoder.FrameEncoded += OnH264BackFrameEncoded;
-                _h264BackEncoder.Start();
-                Log.Debug("[RTSP Server]", "H264 encoder started");
+                try
+                {
+                    _h264BackEncoder = new(width, height, bitrate: 2000000, frameRate: 25);
+                    _h264BackEncoder.FrameEncoded += OnH264BackFrameEncoded;
+                    _h264BackEncoder.Start();
+                    Log.Debug("[RTSP Server]", "H264 encoder started");    
+                }catch(Exception ex)
+                {
+                    var t = ex;
+                }
+                
             }
         }
     }
@@ -291,12 +337,24 @@ public class Server : IDisposable
             }
         }
     }
-    public void Stop() => Dispose();
+    public void Stop()
+    {
+        IsRunning = false;
+        _cts?.Cancel();
+        _cts = new();
+        _backService.FrameReceived -= OnBackFrameAvailable;
+        _frontService.FrameReceived -= OnFrontFrameAvailable;
+        _mjpegServer.Stop();
+        _socket.Close();
+        _socket?.Dispose();
+    }
     public bool Start()
     {
         //GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
-        if (_enabled)
+        if (_enabled && !IsRunning)
         {
+            ConfigureSocket();
+            IsRunning = true;
             _backService.FrameReceived += OnBackFrameAvailable;
             _frontService.FrameReceived += OnFrontFrameAvailable;
             Task.Run(ListenAsync, _cts.Token);
@@ -343,6 +401,7 @@ public class Server : IDisposable
     }
     public void Dispose()
     {
+        IsRunning = false;
         _mjpegServer?.Dispose();
         _cts?.Cancel();
         _socket?.Dispose();
@@ -351,8 +410,16 @@ public class Server : IDisposable
     {
         while (!_cts.IsCancellationRequested)
         {
-            var client = await _socket.AcceptAsync(_cts.Token).ConfigureAwait(false);
-            _ = Task.Run(() => HandleClient(client), _cts.Token);
+            try
+            {
+                var client = await _socket.AcceptAsync(_cts.Token);
+                _ = Task.Run(() => HandleClient(client), _cts.Token);
+            }
+            catch(Exception ex)
+            {
+                
+            }
+            
         }
     }
     private async Task HandleClient(Socket client)
