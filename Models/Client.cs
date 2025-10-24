@@ -33,6 +33,8 @@ public class Client : IDisposable
     public List<byte[]> RtcpBuffer = new();
     public byte[] RtpBuffer { get; set; } = new byte[1500]; // MTU Size
     public DateTime LastRtcpFlush = DateTime.UtcNow;
+    public ulong BaseEncoderTimestamp { get; set; } = 0;
+    public uint BaseRtpTimestamp { get; set; } = 0;
     public readonly object RtcpLock = new();
     public void Dispose()
     {

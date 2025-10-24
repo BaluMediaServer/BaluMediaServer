@@ -829,7 +829,7 @@ public class Server : IDisposable
     {
         lock (client)
         {
-            client.Codec = request.Uri.Contains("mjpeg") ? CodecType.MJPEG : CodecType.H264;    
+            client.Codec = request.Uri.Contains("mjpeg") ? CodecType.MJPEG : CodecType.H264;
         }
         var sdp = GenerateSDP(client.Codec);
         var headers = new Dictionary<string, string>
@@ -839,6 +839,23 @@ public class Server : IDisposable
 
         await SendRtspResponse(writer, 200, "OK", request.CSeq, headers, sdp).ConfigureAwait(false);
     }
+    private uint EncoderTimestampToRtp(ulong encoderTimestamp, ref Client client)
+    {
+        lock (client)
+        {
+            if (client.BaseEncoderTimestamp == 0)
+            {
+                client.BaseEncoderTimestamp = encoderTimestamp;
+                client.BaseRtpTimestamp = (uint)Random.Shared.Next(0, int.MaxValue);
+                return client.BaseRtpTimestamp;
+            }
+            ulong delta_ns = encoderTimestamp - client.BaseEncoderTimestamp;            
+            double seconds = delta_ns / 1_000_000_000.0; 
+            ulong rtpAdd = (ulong)(seconds * 90000.0 + 0.5);
+            return (uint)(client.BaseRtpTimestamp + rtpAdd);
+        }
+    }
+
     private async Task HandleTeardown(StreamWriter writer, RtspRequest request, Client client)
     {
         if (string.IsNullOrEmpty(client.SessionId))
@@ -930,7 +947,7 @@ public class Server : IDisposable
             while (client.IsPlaying && client.Socket.Connected && !_cts.IsCancellationRequested)
             {
                 var frameStart = DateTime.UtcNow;
-
+            
                 if (client.Codec == CodecType.H264)
                 {
                     await StreamH264ToClient(client).ConfigureAwait(false);
@@ -947,15 +964,6 @@ public class Server : IDisposable
                 {
                     await Task.Delay(waitTime, _cts.Token).ConfigureAwait(false);
                 }
-
-                // Update RTP timestamp based on actual time elapsed
-                var rtpElapsed = (DateTime.UtcNow - client.LastRtpTime).TotalMilliseconds;
-                lock (client)
-                {
-                    client.RtpTimestamp += (uint)(rtpElapsed * 90); // 90kHz clock
-                    client.LastRtpTime = DateTime.UtcNow;    
-                }
-                
             }
         }
         catch (Exception ex)
@@ -1024,9 +1032,13 @@ public class Server : IDisposable
         
         if (h264Frame != null && h264Frame.NalUnits.Count > 0)
         {
+            
+
             // Check if this is a new frame
             if (h264Frame.Timestamp > client.LastH264FrameTimestamp)
             {
+                uint frameRtpTimestamp = EncoderTimestampToRtp((ulong)h264Frame.Timestamp, ref client);
+
                 lock (client)
                 {
                     client.LastH264FrameTimestamp = h264Frame.Timestamp;
@@ -1043,16 +1055,22 @@ public class Server : IDisposable
 
                     if (needsSpsPps && h264Frame.Sps != null && h264Frame.Pps != null)
                     {
-                        await SendH264NalAsRtp(client, h264Frame.Sps).ConfigureAwait(false);
-                        await SendH264NalAsRtp(client, h264Frame.Pps).ConfigureAwait(false);
+                        await SendH264NalAsRtp(client, h264Frame.Sps, frameRtpTimestamp, false).ConfigureAwait(false);
+                        await SendH264NalAsRtp(client, h264Frame.Pps, frameRtpTimestamp, false).ConfigureAwait(false);
 
                         _clientSpsCache[client.Id] = h264Frame.Sps;
                         _clientPpsCache[client.Id] = h264Frame.Pps;
                     }
 
                     // Send all NAL units
-                    foreach (var nalUnit in h264Frame.NalUnits)
-                        await SendH264NalAsRtp(client, nalUnit).ConfigureAwait(false);
+                    int nalCount = h264Frame.NalUnits.Count;
+                    for (int i = 0; i < nalCount; i++)
+                    {
+                        var nalUnit = h264Frame.NalUnits[i];
+                        // The marker bit is ONLY set on the last NAL unit of the frame
+                        bool isLastNalOfFrame = i == nalCount - 1;
+                        await SendH264NalAsRtp(client, nalUnit, frameRtpTimestamp, isLastNalOfFrame).ConfigureAwait(false);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -1196,17 +1214,9 @@ public class Server : IDisposable
             await SendInterleavedData(client.Socket, client.RtpChannel, data).ConfigureAwait(false);
         }
     }
-    // Under verification
-    
-    // Possible error, is releasing the payload before sending it
-    private async Task SendH264NalAsRtp(Client client, byte[] nalUnit)
+    private async Task SendH264NalAsRtp(Client client, byte[] nalUnit, uint nalTimestamp, bool lastFrame = false)
     {
         const int maxPayloadSize = 1400;
-        uint nalTimestamp;
-        lock (client)
-        {
-            nalTimestamp = client.RtpTimestamp;
-        }
         int nalStart = 0;
         if (nalUnit.Length >= 4 && nalUnit[0] == 0 && nalUnit[1] == 0 && nalUnit[2] == 0 && nalUnit[3] == 1)
         {
@@ -1218,14 +1228,15 @@ public class Server : IDisposable
         }
 
         int nalLength = nalUnit.Length - nalStart;
+        if (nalLength <= 0) return;
 
         if (nalLength <= maxPayloadSize)
         {
-            //var payload = new byte[nalLength];
-            var payload = _arrayPool.Rent(nalLength);
+            var payload = new byte[nalLength];
+            //var payload = _arrayPool.Rent(nalLength);
             Buffer.BlockCopy(nalUnit, nalStart, payload, 0, nalLength);
-
-            var rtpPacket = CreateRtpPacket(client, payload, nalTimestamp, true, 96);
+            bool marker = lastFrame;
+            var rtpPacket = CreateRtpPacket(client, payload, nalTimestamp, marker, 96);
 
             // Send via appropriate transport
             await SendData(client, rtpPacket).ConfigureAwait(false);
@@ -1236,7 +1247,7 @@ public class Server : IDisposable
                 if (client.SequenceNumber > 65535)
                     client.SequenceNumber = 0;
             }
-            _arrayPool.Return(payload);
+            //_arrayPool.Return(payload);
         }
         else
         {
@@ -1253,7 +1264,7 @@ public class Server : IDisposable
             {
                 int fragmentSize = Math.Min(maxPayloadSize - 2, remainingData);
                 bool isLastFragment = fragmentSize == remainingData;
-
+                bool marker = lastFrame && isLastFragment;
                 var payload = new byte[fragmentSize + 2];
                 //var payload = _arrayPool.Rent(fragmentSize + 2);
                 payload[0] = (byte)(nalNri | 28); // FU-A
@@ -1263,9 +1274,8 @@ public class Server : IDisposable
 
                 Buffer.BlockCopy(nalUnit, dataOffset, payload, 2, fragmentSize);
 
-                var rtpPacket = CreateRtpPacket(client, payload, nalTimestamp, isLastFragment, 96);
+                var rtpPacket = CreateRtpPacket(client, payload, nalTimestamp, marker, 96);
 
-                // Send via appropriate transport
                 await SendData(client, rtpPacket).ConfigureAwait(false);
                 lock (client)
                 {
@@ -1276,7 +1286,6 @@ public class Server : IDisposable
                 dataOffset += fragmentSize;
                 remainingData -= fragmentSize;
                 isFirstFragment = false;
-                //_arrayPool.Return(payload);
             }
         }
     }
@@ -1307,7 +1316,6 @@ public class Server : IDisposable
         Buffer.BlockCopy(chroma, 0, tables, 64, 64);
         return tables;
     }
-    // OPTIMIZED WITH ARRAY POOL
     private byte[] CreateRtpPacketOld(Client client, byte[] payload, bool marker, byte payloadType)
     {
         //var packet = _arrayPool.Rent(12 + payload.Length);
@@ -1371,8 +1379,8 @@ public class Server : IDisposable
     // Verificated
     private async Task SendInterleavedData(Socket socket, byte channel, byte[] rtpPacket)
     {
-        var frame = _arrayPool.Rent(4 + rtpPacket.Length);
-        //var frame = new byte[4 + rtpPacket.Length];
+        //var frame = _arrayPool.Rent(4 + rtpPacket.Length);
+        var frame = new byte[4 + rtpPacket.Length];
         frame[0] = 0x24; // $ magic byte
         frame[1] = channel;
         frame[2] = (byte)(rtpPacket.Length >> 8);
@@ -1427,7 +1435,7 @@ public class Server : IDisposable
         }
         finally
         {
-            _arrayPool.Return(frame);
+            //_arrayPool.Return(frame);
         }
     }
     private async Task HandleSetup(StreamWriter writer, RtspRequest request, Client client)
