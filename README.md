@@ -705,11 +705,11 @@ Server.OnClientsChange += (clients) => {
 - ✅ Add user/password control panel
 - ⬜ Fix image rotation
 - ✅ Add bitrate/resolution configuration
-- ✅ **Fix UDP transport reliability issues** (currently TCP is recommended)
+- ✅ **Fix UDP transport reliability issues** (currently TCP is recommended FIXED)
 
 ### Medium Term (v1.2-1.3)
 - ⬜ Add H.265 (HEVC) codec support
-- ⬜ Reduce streaming latency (target: <100ms)
+- ✅ Reduce streaming latency (target: <100ms)
 - ⬜ Add comprehensive code documentation
 - ⬜ NuGet package distribution
 - ⬜ Add unit tests and integration tests
@@ -784,6 +784,42 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
 - v1.1.11: Fixing Server to allow Configuration Class, fixing MjpegServer disposal on Server class, fixing MjpegServer to set a fixed bitrate to 30 fps and fixing CPU leaks.
 
 - v1.2.0: Adding new global encoder for compatiblity with multiple devices not only Mediatek and fixing some features from the server to handle clients.
+
+- v1.3.1: Major H.264 Stability and Stutter Fix This release targets and resolves a series of core issues in the H.264 streaming logic that caused stutter, frame overlapping, and "two-frame" freezes. The stream is now significantly smoother and more stable.
+
+Fixed Critical Timestamp Conversion:
+
+Problem: The server was incorrectly converting the camera encoder's timestamps. We discovered the encoder provides timestamps in nanoseconds, but the server was treating them as microseconds. This resulted in RTP timestamps being 1000x too large, causing players to think a single frame should last for 30+ seconds, leading to a "two-frame" freeze.
+
+Fix: The timestamp conversion logic in EncoderTimestampToRtp has been corrected to divide by 1,000,000,000.0 (nanoseconds) instead of 1,000,000.0 (microseconds).
+
+Corrected RTP Marker Bit Logic:
+
+Problem: The RTP "Marker Bit" (M-bit), which signals the end of a video frame, was being set incorrectly (e.g., on every small NAL unit). This confused decoders, causing them to render frames on top of each other or get stuck.
+
+Fix: The server now correctly tracks all NAL units and fragments belonging to a single frame. The M-bit is now set only on the absolute last RTP packet of the last NAL unit for that frame, as required by the H.264 spec.
+
+Removed Conflicting Stream Pacing:
+
+Problem: The streaming loop had two "pacemakers" fighting each other:
+
+A fixed Task.Delay trying to send at 45 FPS (22ms).
+
+The H.264 encoder, which was producing frames at 25 FPS (40ms).
+
+Fix: The fixed Task.Delay has been removed for H.264 streaming. The loop is now event-driven: it sends a frame as soon as the encoder provides one and loops immediately. If no new frame is ready, it waits a tiny 10ms (to prevent 100% CPU usage) and checks again. This lets the encoder, not the server loop, dictate the stream's framerate.
+
+Eliminated Network Send Latency (Nagle's Algorithm):
+
+Problem: For TCP streams, the OS was likely bundling small RTP packets together before sending them (Nagle's Algorithm). This is good for file transfers but terrible for real-time video, as it introduces small, random delays perceived as micro-stutter.
+
+Fix: Nagle's Algorithm is now explicitly disabled (NoDelay = true) on all accepted client sockets, ensuring every RTP packet is sent to the network immediately.
+
+Removed H.264 Frame Lock Contention:
+
+Problem: The encoder thread (writing a new frame) and the network thread (reading that frame) were using the same lock. This meant one thread often had to wait for the other, causing a "hiccup" in frame delivery.
+
+Fix: This lock has been completely replaced with a high-performance, lock-free Interlocked.Exchange operation. This allows the encoder and network threads to swap frame data atomically without ever blocking each other, resulting in a smoother handoff from camera to network.
 ---
 
 **Thanks for checking out Balu Media Server!** 
