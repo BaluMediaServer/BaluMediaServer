@@ -29,7 +29,7 @@ public class Server : IDisposable
     private int _port = 7778, _maxClients = 100, _nextRtpPort = 5000, _mjpegServerQuality = 80;
     private readonly object _portLock = new();
     private readonly HashSet<int> _usedPorts = new();
-    private readonly CancellationTokenSource _cts = new();
+    private CancellationTokenSource _cts = new();
     private ConcurrentBag<Client> _clients = new();
     private string _uri = string.Empty;
     private bool _isStreaming = false, _enabled = false, _isCapturingFront = false, _isCapturingBack = false,
@@ -37,19 +37,20 @@ public class Server : IDisposable
     private FrameEventArgs? _latestFrontFrame, _latestBackFrame;
     private readonly ConcurrentDictionary<string, string> _nonceCache = new();
     private readonly string _address = string.Empty;
-    private const int _maxPayloadSize = 1400;
+    private const int _maxPayloadSize = 1400, _h264PollIntervalMs = 10, _mjpegFrameIntervalMs = 40;
     private readonly TimeSpan _nonceExpiry = TimeSpan.FromMinutes(5);
     private readonly object _frameFrontLock = new(), _frameBackLock = new(), _h264FrontLock = new(), _h264BackLock = new();
-    private MediaTekH264Encoder? _h264FrontEncoder, _h264BackEncoder;
+    private H264Encoder? _h264FrontEncoder, _h264BackEncoder;
     private H264FrameEventArgs? _latestH264FrameFront, _latestH264FrameBack;
     private List<VideoProfile> _videoProfiles = new();
     private readonly Dictionary<string, byte[]?> _clientSpsCache = new(), _clientPpsCache = new();
-    public static event Action<List<Client>>? OnClientsChange;
-    public static event EventHandler<bool>? OnStreaming;
-    public static event EventHandler<FrameEventArgs>? OnNewFrontFrame, OnNewBackFrame;
     private static readonly byte[] StandardQuantizationTables = GetStandardQuantizationTables();
     private readonly ArrayPool<byte> _arrayPool = ArrayPool<byte>.Shared;
     private ConcurrentDictionary<string, string> _users = new();
+    public static event Action<List<Client>>? OnClientsChange;
+    public static event EventHandler<bool>? OnStreaming;
+    public static event EventHandler<FrameEventArgs>? OnNewFrontFrame, OnNewBackFrame;
+    public bool IsRunning { get; private set; } = false;
     public Server(int Port = 7778, int MaxClients = 100, string Address = "0.0.0.0", Dictionary<string, string>? Users = null, bool BackCameraEnabled = true, bool FrontCameraEnabled = true, bool AuthRequired = true, int MjpegServerQuality = 80)
     {
         EventBuss.Command += OnCommandSend;
@@ -73,6 +74,28 @@ public class Server : IDisposable
         _frontService.ErrorOccurred += LogError;
         ConfigureSocket();
     }
+    public Server(ServerConfiguration configuration)
+    {
+        EventBuss.Command += OnCommandSend;
+        _port = configuration.Port;
+        _maxClients = configuration.MaxClients;
+        AddUser("admin", "password123");
+        if (configuration.Users != null)
+            foreach (var item in configuration.Users)
+                if(_users.ContainsKey(item.Key))
+                    UpdateUser(item.Key, item.Value);
+                else
+                    AddUser(item.Key, item.Value);
+        _mjpegServerQuality = configuration.MjpegServerQuality;
+        _mjpegServer = new(quality: _mjpegServerQuality);
+        _authRequired = configuration.AuthRequired;
+        _frontCameraEnabled = configuration.FrontCameraEnabled;
+        _backCameraEnabled = configuration.BackCameraEnabled;
+        _address = configuration.BaseAddress;
+        _backService.ErrorOccurred += LogError;
+        _frontService.ErrorOccurred += LogError;
+        ConfigureSocket();
+    }
     public bool AddUser(string user, string password) => _users.TryAdd(user, password);
     public bool UpdateUser(string user, string password) => RemoveUser(user) ? AddUser(user, password) : false;
     public bool RemoveUser(string user) => _users.TryRemove(user, out _);
@@ -87,17 +110,38 @@ public class Server : IDisposable
             Log.Error("BACK CAMERA SERVICE ERROR", error);
         }
     }
+    private Socket CreateConfiguredSocket()
+    {
+        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+        socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true);
+        socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendBuffer, 262144);
+        socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 262144);
+        return socket;
+    }
+
     private void ConfigureSocket()
     {
         IPEndPoint endpoint = new(IPAddress.Parse(_address), _port);
-        _socket = new(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-        _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-        _socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true); // Disable Nagle's
-        _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendBuffer, 262144); // 256KB
-        _socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 262144); // 256KB
-        _socket.Bind(endpoint);
-        _socket.Listen(_maxClients);
+
+        try
+        {
+            _socket?.Close();
+            _socket?.Dispose();
+            _socket = CreateConfiguredSocket();
+            _socket.Bind(endpoint);
+            _socket.Listen(_maxClients);
+        }
+        catch(Exception ex)
+        {
+            _socket?.Close();
+            _socket?.Dispose();
+            _socket = CreateConfiguredSocket();
+            _socket.Bind(endpoint);
+            _socket.Listen(_maxClients);
+        }
     }
+
     public void SetVideoProfile(VideoProfile profile) => _videoProfiles.Add(profile);
     private void OnCommandSend(BussCommand command)
     {
@@ -106,6 +150,10 @@ public class Server : IDisposable
             case BussCommand.START_CAMERA_FRONT:
                 if (!_isCapturingFront && _frontCameraEnabled)
                 {
+                    if (!IsRunning)
+                    {
+                        _frontService.FrameReceived += OnFrontFrameAvailable;    
+                    }
                     _frontService.StartCapture();
                     _isCapturingFront = true;
                 }
@@ -113,6 +161,10 @@ public class Server : IDisposable
             case BussCommand.STOP_CAMERA_FRONT:
                 if (!_isStreaming && _isCapturingFront && _frontCameraEnabled)
                 {
+                    if (!IsRunning)
+                    {
+                        _frontService.FrameReceived -= OnFrontFrameAvailable;    
+                    }
                     _frontService.StopCapture();
                     _isCapturingFront = false;
                 }
@@ -120,6 +172,10 @@ public class Server : IDisposable
             case BussCommand.START_CAMERA_BACK:
                 if (!_isCapturingBack && _backCameraEnabled)
                 {
+                    if (!IsRunning)
+                    {
+                        _backService.FrameReceived += OnBackFrameAvailable;
+                    }
                     _backService.StartCapture();
                     _isCapturingBack = true;
                 }
@@ -127,6 +183,10 @@ public class Server : IDisposable
             case BussCommand.STOP_CAMERA_BACK:
                 if (!_isStreaming && _isCapturingBack && _backCameraEnabled)
                 {
+                    if (!IsRunning)
+                    {
+                        _backService.FrameReceived -= OnFrontFrameAvailable;    
+                    }
                     _backService.StopCapture();
                     _isCapturingBack = false;
                 }
@@ -135,7 +195,8 @@ public class Server : IDisposable
                 if (!_mjpegServerEnabled)
                 {
                     _mjpegServerEnabled = true;
-                    _mjpegServer = new(quality: _mjpegServerQuality);
+                    if(_mjpegServer == null)
+                        _mjpegServer = new(quality: _mjpegServerQuality);
                     _mjpegServer.Start();
                 }
                 break;
@@ -145,6 +206,7 @@ public class Server : IDisposable
                     _mjpegServerEnabled = false;
                     _mjpegServer.Stop();
                     _mjpegServer?.Dispose();
+                    _mjpegServer = null!;
                 }
                 break;
             case BussCommand.SWITCH_CAMERA:
@@ -202,17 +264,11 @@ public class Server : IDisposable
     }
     private void OnH264FrontFrameEncoded(object? sender, H264FrameEventArgs e)
     {
-        lock (_h264FrontLock)
-        {
-            _latestH264FrameFront = e;
-        }
+        Interlocked.Exchange(ref _latestH264FrameFront, e);
     }
     private void OnH264BackFrameEncoded(object? sender, H264FrameEventArgs e)
     {
-        lock (_h264BackLock)
-        {
-            _latestH264FrameBack = e;
-        }
+        Interlocked.Exchange(ref _latestH264FrameBack, e);
     }
     private void StartH264EncoderFront(int width, int height)
     {
@@ -233,10 +289,17 @@ public class Server : IDisposable
         {
             if (_h264BackEncoder == null)
             {
-                _h264BackEncoder = new(width, height, bitrate: 2000000, frameRate: 25);
-                _h264BackEncoder.FrameEncoded += OnH264BackFrameEncoded;
-                _h264BackEncoder.Start();
-                Log.Debug("[RTSP Server]", "H264 encoder started");
+                try
+                {
+                    _h264BackEncoder = new(width, height, bitrate: 2000000, frameRate: 25);
+                    _h264BackEncoder.FrameEncoded += OnH264BackFrameEncoded;
+                    _h264BackEncoder.Start();
+                    Log.Debug("[RTSP Server]", "H264 encoder started");    
+                }catch(Exception ex)
+                {
+                    var t = ex;
+                }
+                
             }
         }
     }
@@ -268,12 +331,24 @@ public class Server : IDisposable
             }
         }
     }
-    public void Stop() => Dispose();
+    public void Stop()
+    {
+        IsRunning = false;
+        _cts?.Cancel();
+        _cts = new();
+        _backService.FrameReceived -= OnBackFrameAvailable;
+        _frontService.FrameReceived -= OnFrontFrameAvailable;
+        _mjpegServer.Stop();
+        _socket.Close();
+        _socket?.Dispose();
+    }
     public bool Start()
     {
         //GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
-        if (_enabled)
+        if (_enabled && !IsRunning)
         {
+            ConfigureSocket();
+            IsRunning = true;
             _backService.FrameReceived += OnBackFrameAvailable;
             _frontService.FrameReceived += OnFrontFrameAvailable;
             Task.Run(ListenAsync, _cts.Token);
@@ -320,6 +395,7 @@ public class Server : IDisposable
     }
     public void Dispose()
     {
+        IsRunning = false;
         _mjpegServer?.Dispose();
         _cts?.Cancel();
         _socket?.Dispose();
@@ -328,8 +404,17 @@ public class Server : IDisposable
     {
         while (!_cts.IsCancellationRequested)
         {
-            var client = await _socket.AcceptAsync(_cts.Token).ConfigureAwait(false);
-            _ = Task.Run(() => HandleClient(client), _cts.Token);
+            try
+            {
+                var client = await _socket.AcceptAsync(_cts.Token);
+                client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true);
+                _ = Task.Run(() => HandleClient(client), _cts.Token);
+            }
+            catch(Exception ex)
+            {
+                
+            }
+            
         }
     }
     private async Task HandleClient(Socket client)
@@ -739,7 +824,7 @@ public class Server : IDisposable
     {
         lock (client)
         {
-            client.Codec = request.Uri.Contains("mjpeg") ? CodecType.MJPEG : CodecType.H264;    
+            client.Codec = request.Uri.Contains("mjpeg") ? CodecType.MJPEG : CodecType.H264;
         }
         var sdp = GenerateSDP(client.Codec);
         var headers = new Dictionary<string, string>
@@ -749,6 +834,23 @@ public class Server : IDisposable
 
         await SendRtspResponse(writer, 200, "OK", request.CSeq, headers, sdp).ConfigureAwait(false);
     }
+    private uint EncoderTimestampToRtp(ulong encoderTimestamp, ref Client client)
+    {
+        lock (client)
+        {
+            if (client.BaseEncoderTimestamp == 0)
+            {
+                client.BaseEncoderTimestamp = encoderTimestamp;
+                client.BaseRtpTimestamp = (uint)Random.Shared.Next(0, int.MaxValue);
+                return client.BaseRtpTimestamp;
+            }
+            ulong delta_ns = encoderTimestamp - client.BaseEncoderTimestamp;            
+            double seconds = delta_ns / 1_000_000_000.0; 
+            ulong rtpAdd = (ulong)(seconds * 90000.0 + 0.5);
+            return (uint)(client.BaseRtpTimestamp + rtpAdd);
+        }
+    }
+
     private async Task HandleTeardown(StreamWriter writer, RtspRequest request, Client client)
     {
         if (string.IsNullOrEmpty(client.SessionId))
@@ -840,30 +942,25 @@ public class Server : IDisposable
             while (client.IsPlaying && client.Socket.Connected && !_cts.IsCancellationRequested)
             {
                 var frameStart = DateTime.UtcNow;
-
+                bool frameSent = false;    
                 if (client.Codec == CodecType.H264)
                 {
-                    await StreamH264ToClient(client).ConfigureAwait(false);
+                    frameSent = await StreamH264ToClient(client).ConfigureAwait(false);
+                    if (!frameSent)
+                    {
+                        await Task.Delay(_h264PollIntervalMs, _cts.Token).ConfigureAwait(false);
+                    }
                 }
                 else
                 {
                     await StreamMjpegToClient(client).ConfigureAwait(false);
-                }
-                // Calculate actual time elapsed since last frame
-                var elapsed = (DateTime.UtcNow - frameStart).TotalMilliseconds;
-                var waitTime = frameIntervalMs - (int)elapsed;
+                    var elapsed = (DateTime.UtcNow - frameStart).TotalMilliseconds;
+                    var waitTime = frameIntervalMs - (int)elapsed;
 
-                if (waitTime > 0)
-                {
-                    await Task.Delay(waitTime, _cts.Token).ConfigureAwait(false);
-                }
-
-                // Update RTP timestamp based on actual time elapsed
-                var rtpElapsed = (DateTime.UtcNow - client.LastRtpTime).TotalMilliseconds;
-                lock (client)
-                {
-                    client.RtpTimestamp += (uint)(rtpElapsed * 90); // 90kHz clock
-                    client.LastRtpTime = DateTime.UtcNow;    
+                    if (waitTime > 0)
+                    {
+                        await Task.Delay(waitTime, _cts.Token).ConfigureAwait(false);
+                    }
                 }
                 
             }
@@ -913,30 +1010,28 @@ public class Server : IDisposable
             }
         }
     }
-    private async Task StreamH264ToClient(Client client)
+    private async Task<bool> StreamH264ToClient(Client client)
     {
         H264FrameEventArgs? h264Frame = null;
         
         if (client.CameraId == 0)
         {
-            lock (_h264BackLock)
-            {
-                h264Frame = _latestH264FrameBack;
-            }
+            h264Frame = Interlocked.Exchange(ref _latestH264FrameBack, null);
         }
         else
         {
-            lock (_h264FrontLock)
-            {
-                h264Frame = _latestH264FrameFront;
-            }
+            h264Frame = Interlocked.Exchange(ref _latestH264FrameFront, null);
         }
-        
+
         if (h264Frame != null && h264Frame.NalUnits.Count > 0)
         {
+
+
             // Check if this is a new frame
             if (h264Frame.Timestamp > client.LastH264FrameTimestamp)
             {
+                uint frameRtpTimestamp = EncoderTimestampToRtp((ulong)h264Frame.Timestamp, ref client);
+
                 lock (client)
                 {
                     client.LastH264FrameTimestamp = h264Frame.Timestamp;
@@ -953,23 +1048,32 @@ public class Server : IDisposable
 
                     if (needsSpsPps && h264Frame.Sps != null && h264Frame.Pps != null)
                     {
-                        await SendH264NalAsRtp(client, h264Frame.Sps).ConfigureAwait(false);
-                        await SendH264NalAsRtp(client, h264Frame.Pps).ConfigureAwait(false);
+                        await SendH264NalAsRtp(client, h264Frame.Sps, frameRtpTimestamp, false).ConfigureAwait(false);
+                        await SendH264NalAsRtp(client, h264Frame.Pps, frameRtpTimestamp, false).ConfigureAwait(false);
 
                         _clientSpsCache[client.Id] = h264Frame.Sps;
                         _clientPpsCache[client.Id] = h264Frame.Pps;
                     }
 
                     // Send all NAL units
-                    foreach (var nalUnit in h264Frame.NalUnits)
-                        await SendH264NalAsRtp(client, nalUnit).ConfigureAwait(false);
+                    int nalCount = h264Frame.NalUnits.Count;
+                    for (int i = 0; i < nalCount; i++)
+                    {
+                        var nalUnit = h264Frame.NalUnits[i];
+                        // The marker bit is ONLY set on the last NAL unit of the frame
+                        bool isLastNalOfFrame = i == nalCount - 1;
+                        await SendH264NalAsRtp(client, nalUnit, frameRtpTimestamp, isLastNalOfFrame).ConfigureAwait(false);
+                    }
+                    return true;
                 }
                 catch (Exception ex)
                 {
                     Log.Error("[RTSP Server]", $"H264 streaming error: {ex.Message}");
+                    return false;
                 }
             }
         }
+        return false;
     }
     private int GetAvailablePort()
     {
@@ -1106,17 +1210,8 @@ public class Server : IDisposable
             await SendInterleavedData(client.Socket, client.RtpChannel, data).ConfigureAwait(false);
         }
     }
-    // Under verification
-    
-    // Possible error, is releasing the payload before sending it
-    private async Task SendH264NalAsRtp(Client client, byte[] nalUnit)
+    private async Task SendH264NalAsRtp(Client client, byte[] nalUnit, uint nalTimestamp, bool lastFrame = false)
     {
-        const int maxPayloadSize = 1400;
-        uint nalTimestamp;
-        lock (client)
-        {
-            nalTimestamp = client.RtpTimestamp;
-        }
         int nalStart = 0;
         if (nalUnit.Length >= 4 && nalUnit[0] == 0 && nalUnit[1] == 0 && nalUnit[2] == 0 && nalUnit[3] == 1)
         {
@@ -1128,14 +1223,15 @@ public class Server : IDisposable
         }
 
         int nalLength = nalUnit.Length - nalStart;
+        if (nalLength <= 0) return;
 
-        if (nalLength <= maxPayloadSize)
+        if (nalLength <= _maxPayloadSize)
         {
-            //var payload = new byte[nalLength];
-            var payload = _arrayPool.Rent(nalLength);
+            var payload = new byte[nalLength];
+            //var payload = _arrayPool.Rent(nalLength);
             Buffer.BlockCopy(nalUnit, nalStart, payload, 0, nalLength);
-
-            var rtpPacket = CreateRtpPacket(client, payload, nalTimestamp, true, 96);
+            bool marker = lastFrame;
+            var rtpPacket = CreateRtpPacket(client, payload, nalTimestamp, marker, 96);
 
             // Send via appropriate transport
             await SendData(client, rtpPacket).ConfigureAwait(false);
@@ -1146,7 +1242,7 @@ public class Server : IDisposable
                 if (client.SequenceNumber > 65535)
                     client.SequenceNumber = 0;
             }
-            _arrayPool.Return(payload);
+            //_arrayPool.Return(payload);
         }
         else
         {
@@ -1161,9 +1257,9 @@ public class Server : IDisposable
 
             while (remainingData > 0 && !_cts.IsCancellationRequested)
             {
-                int fragmentSize = Math.Min(maxPayloadSize - 2, remainingData);
+                int fragmentSize = Math.Min(_maxPayloadSize - 2, remainingData);
                 bool isLastFragment = fragmentSize == remainingData;
-
+                bool marker = lastFrame && isLastFragment;
                 var payload = new byte[fragmentSize + 2];
                 //var payload = _arrayPool.Rent(fragmentSize + 2);
                 payload[0] = (byte)(nalNri | 28); // FU-A
@@ -1173,9 +1269,8 @@ public class Server : IDisposable
 
                 Buffer.BlockCopy(nalUnit, dataOffset, payload, 2, fragmentSize);
 
-                var rtpPacket = CreateRtpPacket(client, payload, nalTimestamp, isLastFragment, 96);
+                var rtpPacket = CreateRtpPacket(client, payload, nalTimestamp, marker, 96);
 
-                // Send via appropriate transport
                 await SendData(client, rtpPacket).ConfigureAwait(false);
                 lock (client)
                 {
@@ -1186,7 +1281,6 @@ public class Server : IDisposable
                 dataOffset += fragmentSize;
                 remainingData -= fragmentSize;
                 isFirstFragment = false;
-                //_arrayPool.Return(payload);
             }
         }
     }
@@ -1217,7 +1311,6 @@ public class Server : IDisposable
         Buffer.BlockCopy(chroma, 0, tables, 64, 64);
         return tables;
     }
-    // OPTIMIZED WITH ARRAY POOL
     private byte[] CreateRtpPacketOld(Client client, byte[] payload, bool marker, byte payloadType)
     {
         //var packet = _arrayPool.Rent(12 + payload.Length);
@@ -1281,8 +1374,8 @@ public class Server : IDisposable
     // Verificated
     private async Task SendInterleavedData(Socket socket, byte channel, byte[] rtpPacket)
     {
-        var frame = _arrayPool.Rent(4 + rtpPacket.Length);
-        //var frame = new byte[4 + rtpPacket.Length];
+        //var frame = _arrayPool.Rent(4 + rtpPacket.Length);
+        var frame = new byte[4 + rtpPacket.Length];
         frame[0] = 0x24; // $ magic byte
         frame[1] = channel;
         frame[2] = (byte)(rtpPacket.Length >> 8);
@@ -1337,7 +1430,7 @@ public class Server : IDisposable
         }
         finally
         {
-            _arrayPool.Return(frame);
+            //_arrayPool.Return(frame);
         }
     }
     private async Task HandleSetup(StreamWriter writer, RtspRequest request, Client client)

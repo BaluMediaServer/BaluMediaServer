@@ -294,6 +294,10 @@ public Server(
     bool AuthRequired = true,                   // Disable full auth ignoring if a Users dict was passed (recommended just for testing)
     int MjpegServerQuality = 80                 // Sets a default Mjpeg Image compression quality by default, ideal if the image to display is small, avoiding using too much CPU
 )
+
+public Server(
+    ServerConfiguration config // Simple class to configure the server
+)
 ```
 
 #### Methods
@@ -686,8 +690,6 @@ Server.OnClientsChange += (clients) => {
 - **Framework Support**: Currently tested only with .NET 9.0 (Partial support on .NET 8.0)
 - **Configuration**: Limited runtime configuration options for codec parameters
 - **Documentation**: No comprehensive API documentation yet (this README serves as primary docs)
-- **H.264 Stability**: H.264 codec may have stability issues on some non-MediaTek devices
-- **Transport Protocol**: **UDP transport has known issues** - TCP transport is recommended for reliable streaming
 - **iOS Support**: Not available (long-term roadmap item)
 - **Image orientation**: Some devices can experiment image rotation
 - **Image blazor preview**: Some devices can experiment some issues displaying the images fetched from the MJPEG Server, this can depend if the devices allow access to LoopBack or not (Not fixable at all)
@@ -700,12 +702,12 @@ Server.OnClientsChange += (clients) => {
 - ✅ Add support for multiple profiles/routes (`/live/front`, `/live/back`)
 - ✅ Add user/password control panel
 - ⬜ Fix image rotation
-- ⬜ Add bitrate/resolution configuration
-- ✅ **Fix UDP transport reliability issues** (currently TCP is recommended)
+- ✅ Add bitrate/resolution configuration
+- ✅ **Fix UDP transport reliability issues** (currently TCP is recommended FIXED)
 
 ### Medium Term (v1.2-1.3)
 - ⬜ Add H.265 (HEVC) codec support
-- ⬜ Reduce streaming latency (target: <100ms)
+- ✅ Reduce streaming latency (target: <100ms)
 - ⬜ Add comprehensive code documentation
 - ⬜ NuGet package distribution
 - ⬜ Add unit tests and integration tests
@@ -774,6 +776,48 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
 - v1.1.8: Fixing issues related with Camera Services, making that on camera or service closure do not allow to restart them.
 
 - v1.1.9: Adding user/password handling options.
+
+- v1.1.10: Adding a custom class 'ServerConfiguration' to handle more easily all the server configurations.
+
+- v1.1.11: Fixing Server to allow Configuration Class, fixing MjpegServer disposal on Server class, fixing MjpegServer to set a fixed bitrate to 30 fps and fixing CPU leaks.
+
+- v1.2.0: Adding new global encoder for compatiblity with multiple devices not only Mediatek and fixing some features from the server to handle clients.
+
+- v1.3.1: Major H.264 Stability and Stutter Fix This release targets and resolves a series of core issues in the H.264 streaming logic that caused stutter, frame overlapping, and "two-frame" freezes. The stream is now significantly smoother and more stable.
+
+  - Fixed Critical Timestamp Conversion:
+
+  - Problem: The server was incorrectly converting the camera encoder's timestamps. We discovered the encoder provides timestamps in nanoseconds, but the server was treating them as microseconds. This resulted in RTP timestamps being 1000x too large, causing players to think a single frame should last for 30+ seconds, leading to a "two-frame" freeze.
+
+  - Fix: The timestamp conversion logic in EncoderTimestampToRtp has been corrected to divide by 1,000,000,000.0 (nanoseconds) instead of 1,000,000.0 (microseconds).
+
+  - Corrected RTP Marker Bit Logic:
+
+  - Problem: The RTP "Marker Bit" (M-bit), which signals the end of a video frame, was being set incorrectly (e.g., on every small NAL unit). This confused decoders, causing them to render frames on top of each other or get stuck.
+
+  - Fix: The server now correctly tracks all NAL units and fragments belonging to a single frame. The M-bit is now set only on the absolute last RTP packet of the last NAL unit for that frame, as required by the H.264 spec.
+
+  - Removed Conflicting Stream Pacing:
+
+  - Problem: The streaming loop had two "pacemakers" fighting each other:
+
+  - A fixed Task.Delay trying to send at 45 FPS (22ms).
+
+  - The H.264 encoder, which was producing frames at 25 FPS (40ms).
+
+  - Fix: The fixed Task.Delay has been removed for H.264 streaming. The loop is now event-driven: it sends a frame as soon as the encoder provides one and loops immediately. If no new frame is ready, it waits a tiny 10ms (to prevent 100% CPU usage) and checks again. This lets the encoder, not the server loop, dictate the stream's framerate.
+
+  - Eliminated Network Send Latency (Nagle's Algorithm):
+
+  - Problem: For TCP streams, the OS was likely bundling small RTP packets together before sending them (Nagle's Algorithm). This is good for file transfers but terrible for real-time video, as it introduces small, random delays perceived as micro-stutter.
+
+  - Fix: Nagle's Algorithm is now explicitly disabled (NoDelay = true) on all accepted client sockets, ensuring every RTP packet is sent to the network immediately.
+
+  - Removed H.264 Frame Lock Contention:
+
+  - Problem: The encoder thread (writing a new frame) and the network thread (reading that frame) were using the same lock. This meant one thread often had to wait for the other, causing a "hiccup" in frame delivery.
+
+  - Fix: This lock has been completely replaced with a high-performance, lock-free Interlocked.Exchange operation. This allows the encoder and network threads to swap frame data atomically without ever blocking each other, resulting in a smoother handoff from camera to network.
 
 ---
 
