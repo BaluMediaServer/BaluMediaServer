@@ -690,8 +690,6 @@ Server.OnClientsChange += (clients) => {
 - **Framework Support**: Currently tested only with .NET 9.0 (Partial support on .NET 8.0)
 - **Configuration**: Limited runtime configuration options for codec parameters
 - **Documentation**: No comprehensive API documentation yet (this README serves as primary docs)
-- **H.264 Stability**: H.264 codec may have stability issues on some non-MediaTek devices
-- **Transport Protocol**: **UDP transport has known issues** - TCP transport is recommended for reliable streaming
 - **iOS Support**: Not available (long-term roadmap item)
 - **Image orientation**: Some devices can experiment image rotation
 - **Image blazor preview**: Some devices can experiment some issues displaying the images fetched from the MJPEG Server, this can depend if the devices allow access to LoopBack or not (Not fixable at all)
