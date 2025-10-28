@@ -145,89 +145,97 @@ public class Server : IDisposable
     public void SetVideoProfile(VideoProfile profile) => _videoProfiles.Add(profile);
     private void OnCommandSend(BussCommand command)
     {
-        switch (command)
+        try
         {
-            case BussCommand.START_CAMERA_FRONT:
-                if (!_isCapturingFront && _frontCameraEnabled)
-                {
-                    if (!IsRunning)
+            switch (command)
+            {
+                case BussCommand.START_CAMERA_FRONT:
+                    if (!_isCapturingFront && _frontCameraEnabled)
                     {
-                        _frontService.FrameReceived += OnFrontFrameAvailable;    
+                        if (!IsRunning)
+                        {
+                            _frontService = new();
+                            _frontService.FrameReceived += OnFrontFrameAvailable;    
+                        }
+                        _frontService.StartCapture();
+                        _isCapturingFront = true;
                     }
-                    _frontService.StartCapture();
-                    _isCapturingFront = true;
-                }
-                break;
-            case BussCommand.STOP_CAMERA_FRONT:
-                if (!_isStreaming && _isCapturingFront && _frontCameraEnabled)
-                {
-                    if (!IsRunning)
+                    break;
+                case BussCommand.STOP_CAMERA_FRONT:
+                    if (!_isStreaming && _isCapturingFront && _frontCameraEnabled)
                     {
-                        _frontService.FrameReceived -= OnFrontFrameAvailable;    
+                        if (!IsRunning)
+                        {
+                            _frontService.FrameReceived -= OnFrontFrameAvailable;    
+                        }
+                        _frontService.StopCapture();
+                        _isCapturingFront = false;
                     }
-                    _frontService.StopCapture();
-                    _isCapturingFront = false;
-                }
-                break;
-            case BussCommand.START_CAMERA_BACK:
-                if (!_isCapturingBack && _backCameraEnabled)
-                {
-                    if (!IsRunning)
+                    break;
+                case BussCommand.START_CAMERA_BACK:
+                    if (!_isCapturingBack && _backCameraEnabled)
                     {
-                        _backService.FrameReceived += OnBackFrameAvailable;
+                        if (!IsRunning)
+                        {
+                            _backService = new();
+                            _backService.FrameReceived += OnBackFrameAvailable;
+                        }
+                        _backService.StartCapture();
+                        _isCapturingBack = true;
                     }
-                    _backService.StartCapture();
-                    _isCapturingBack = true;
-                }
-                break;
-            case BussCommand.STOP_CAMERA_BACK:
-                if (!_isStreaming && _isCapturingBack && _backCameraEnabled)
-                {
-                    if (!IsRunning)
+                    break;
+                case BussCommand.STOP_CAMERA_BACK:
+                    if (!_isStreaming && _isCapturingBack && _backCameraEnabled)
                     {
-                        _backService.FrameReceived -= OnFrontFrameAvailable;    
+                        if (!IsRunning)
+                        {
+                            _backService.FrameReceived -= OnFrontFrameAvailable;    
+                        }
+                        _backService.StopCapture();
+                        _isCapturingBack = false;
                     }
-                    _backService.StopCapture();
-                    _isCapturingBack = false;
-                }
-                break;
-            case BussCommand.START_MJPEG_SERVER:
-                if (!_mjpegServerEnabled)
-                {
-                    _mjpegServerEnabled = true;
-                    if(_mjpegServer == null)
-                        _mjpegServer = new(quality: _mjpegServerQuality);
-                    _mjpegServer.Start();
-                }
-                break;
-            case BussCommand.STOP_MJPEG_SERVER:
-                if (_mjpegServerEnabled)
-                {
-                    _mjpegServerEnabled = false;
+                    break;
+                case BussCommand.START_MJPEG_SERVER:
+                    if (!_mjpegServerEnabled)
+                    {
+                        _mjpegServerEnabled = true;
+                        if(_mjpegServer == null)
+                            _mjpegServer = new(quality: _mjpegServerQuality);
+                        _mjpegServer.Start();
+                    }
+                    break;
+                case BussCommand.STOP_MJPEG_SERVER:
+                    if (_mjpegServerEnabled)
+                    {
+                        _mjpegServerEnabled = false;
+                        _mjpegServer.Stop();
+                        _mjpegServer?.Dispose();
+                        _mjpegServer = null!;
+                    }
+                    break;
+                case BussCommand.SWITCH_CAMERA:
                     _mjpegServer.Stop();
                     _mjpegServer?.Dispose();
-                    _mjpegServer = null!;
-                }
-                break;
-            case BussCommand.SWITCH_CAMERA:
-                _mjpegServer.Stop();
-                _mjpegServer?.Dispose();
-                _mjpegServer = new(quality: _mjpegServerQuality);
-                _socket?.Close();
-                ConfigureSocket();
-                if (_frontCameraEnabled)
-                {
-                    _frontCameraEnabled = false;
-                    _backCameraEnabled = true;
-                }
-                else if (_backCameraEnabled)
-                {
-                    _backCameraEnabled = false;
-                    _frontCameraEnabled = true;
-                }
-                break;
-            default:
-                break;
+                    _mjpegServer = new(quality: _mjpegServerQuality);
+                    _socket?.Close();
+                    ConfigureSocket();
+                    if (_frontCameraEnabled)
+                    {
+                        _frontCameraEnabled = false;
+                        _backCameraEnabled = true;
+                    }
+                    else if (_backCameraEnabled)
+                    {
+                        _backCameraEnabled = false;
+                        _frontCameraEnabled = true;
+                    }
+                    break;
+                default:
+                    break;
+            }   
+        }catch(Exception ex)
+        {
+            Log.Error("BALU MEDIA SERVER SERVER", ex.Message);
         }
     }
     private void OnBackFrameAvailable(object? sender, FrameEventArgs arg)
