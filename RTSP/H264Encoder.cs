@@ -382,7 +382,7 @@ public class H264Encoder : IDisposable
     public void QueueFrame(byte[] frameData)
     {
         if (!_isRunning) return;
-        
+
         int expectedSize = (_width * _height * 3) / 2;
 
         if (frameData.Length != expectedSize)
@@ -390,14 +390,15 @@ public class H264Encoder : IDisposable
             Log.Error("H264", $"Invalid frame size: {frameData.Length}, expected: {expectedSize}");
             return;
         }
+
         // Use actual time for timestamps to prevent stuttering
         if (!_stopwatch.IsRunning)
         {
             _stopwatch.Start();
         }
-        
+
         var timestamp = _stopwatch.ElapsedTicks * 1000000L / Stopwatch.Frequency;
-        
+
         // Drop frames if queue is backing up (keep only 2 frames max)
         while (_frameQueue.Count > 2)
         {
@@ -406,7 +407,7 @@ public class H264Encoder : IDisposable
                 Log.Debug("H264", "Dropped old frame to prevent latency");
             }
         }
-        
+
         _frameQueue.Enqueue(new() { Data = frameData, Timestamp = timestamp });
     }
     
@@ -479,12 +480,19 @@ public class H264Encoder : IDisposable
                 if (inputBuffer != null)
                 {
                     inputBuffer.Clear();
-                    
+
                     // Convert NV21 to NV12 since we're using YUV420SemiPlanar
                     var nv12Data = ConvertNV21ToNV12Pooled(frame.Data);
+
+                    // Ensure buffer can hold the entire frame
+                    if (inputBuffer.Capacity() < nv12Data.Length)
+                    {
+                        Log.Warn("H264MTK", $"Input buffer too small: {inputBuffer.Capacity()} < {nv12Data.Length}");
+                    }
+
                     var dataSize = Math.Min(nv12Data.Length, inputBuffer.Capacity());
                     inputBuffer.Put(nv12Data, 0, dataSize);
-                    
+
                     _encoder.QueueInputBuffer(inputIndex, 0, dataSize, frame.Timestamp, 0);
                     _lastTimestamp = frame.Timestamp;
                 }
@@ -562,7 +570,7 @@ public class H264Encoder : IDisposable
                     outputBuffer.Position(bufferInfo.Offset);
                     outputBuffer.Limit(bufferInfo.Offset + bufferInfo.Size);
                     outputBuffer.Get(data);
-                    
+
                     // Check if this is config data
                     if ((bufferInfo.Flags & MediaCodecBufferFlags.CodecConfig) != 0)
                     {
@@ -571,9 +579,9 @@ public class H264Encoder : IDisposable
                     }
                     else
                     {
-                        // Regular frame
+                        // Regular frame - extract all NAL units properly
                         var nalUnits = new List<byte[]>();
-                        
+
                         // MediaTek might not include start codes, so add them
                         if (!HasStartCode(data))
                         {
@@ -587,9 +595,10 @@ public class H264Encoder : IDisposable
                         }
                         else
                         {
-                            nalUnits.Add(data);
+                            // Extract all NAL units (encoder may output multiple NALs in one buffer)
+                            nalUnits = ExtractNalUnits(data);
                         }
-                        
+
                         var frameEvent = new H264FrameEventArgs
                         {
                             NalUnits = nalUnits,
@@ -598,7 +607,7 @@ public class H264Encoder : IDisposable
                             Sps = sps,
                             Pps = pps
                         };
-                        
+
                         FrameEncoded?.Invoke(this, frameEvent);
                     }
                 }
@@ -636,7 +645,7 @@ public class H264Encoder : IDisposable
         return (data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1) ||
                (data[0] == 0 && data[1] == 0 && data[2] == 1);
     }
-    
+
     private void ParseConfigFrame(byte[] data, ref byte[]? sps, ref byte[]? pps)
     {
         // Parse the config frame for SPS/PPS
@@ -651,36 +660,53 @@ public class H264Encoder : IDisposable
             }
         }
     }
-    
+
     private List<byte[]> ExtractNalUnits(byte[] data)
     {
         var nalUnits = new List<byte[]>();
+
+        if (data.Length < 4)
+        {
+            if (data.Length > 0) nalUnits.Add(data);
+            return nalUnits;
+        }
+
         int i = 0;
-        
+
+        // Find first start code
         while (i < data.Length - 3)
         {
-            if ((i + 3 < data.Length && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) ||
-                (i + 4 < data.Length && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1))
+            bool is4Byte = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1;
+            bool is3Byte = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1;
+
+            if (is4Byte || is3Byte)
             {
-                int startCodeLen = (data[i + 2] == 1) ? 3 : 4;
+                int startCodeLen = is4Byte ? 4 : 3;
                 int nalStart = i;
                 int nalEnd = data.Length;
-                
+
                 // Find next start code
-                for (int j = i + startCodeLen; j < data.Length - 3; j++)
+                for (int j = i + startCodeLen; j < data.Length - 2; j++)
                 {
-                    if ((data[j] == 0 && data[j + 1] == 0 && data[j + 2] == 1) ||
-                        (j + 3 < data.Length && data[j] == 0 && data[j + 1] == 0 && data[j + 2] == 0 && data[j + 3] == 1))
+                    bool next4Byte = (j + 3 < data.Length) &&
+                                     data[j] == 0 && data[j + 1] == 0 && data[j + 2] == 0 && data[j + 3] == 1;
+                    bool next3Byte = data[j] == 0 && data[j + 1] == 0 && data[j + 2] == 1;
+
+                    if (next4Byte || next3Byte)
                     {
                         nalEnd = j;
                         break;
                     }
                 }
-                
-                var nalUnit = new byte[nalEnd - nalStart];
-                Array.Copy(data, nalStart, nalUnit, 0, nalEnd - nalStart);
-                nalUnits.Add(nalUnit);
-                
+
+                int nalLength = nalEnd - nalStart;
+                if (nalLength > 0)
+                {
+                    var nalUnit = new byte[nalLength];
+                    System.Buffer.BlockCopy(data, nalStart, nalUnit, 0, nalLength);
+                    nalUnits.Add(nalUnit);
+                }
+
                 i = nalEnd;
             }
             else
@@ -688,13 +714,13 @@ public class H264Encoder : IDisposable
                 i++;
             }
         }
-        
-        // If no NAL units found, treat entire data as one NAL
+
+        // If no NAL units found, return the entire data as single NAL
         if (nalUnits.Count == 0 && data.Length > 0)
         {
             nalUnits.Add(data);
         }
-        
+
         return nalUnits;
     }
     
@@ -714,7 +740,7 @@ public class H264Encoder : IDisposable
                     Log.Debug("H264MTK", $"Got SPS from format: {sps.Length} bytes");
                 }
             }
-            
+
             if (format.ContainsKey("csd-1"))
             {
                 var ppsBuffer = format.GetByteBuffer("csd-1");

@@ -819,6 +819,55 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
 
   - Fix: This lock has been completely replaced with a high-performance, lock-free Interlocked.Exchange operation. This allows the encoder and network threads to swap frame data atomically without ever blocking each other, resulting in a smoother handoff from camera to network.
 
+- v1.4.0: Major H.264 Codec Overhaul and VLC Compatibility Fix. This release addresses critical issues in the H.264 implementation that caused stutter, timing problems, and complete playback failure on VLC and other strict players.
+
+  - Fixed Critical Timestamp Unit Mismatch:
+
+  - Problem: The encoder outputs timestamps in microseconds (PresentationTimeUs), but the server was treating them as nanoseconds. This resulted in RTP timestamps being 1000x smaller than expected, causing massive stutter, frame overlap, and timing desynchronization.
+
+  - Fix: The timestamp conversion in `EncoderTimestampToRtp` now correctly converts microseconds to RTP units using fixed-point arithmetic: `(deltaUs * 9 + 50) / 100` (equivalent to `deltaUs * 90000 / 1_000_000`).
+
+  - Added VLC Compatibility (sprop-parameter-sets in SDP):
+
+  - Problem: VLC and many strict players require `sprop-parameter-sets` in the SDP to initialize the H.264 decoder. Without this, VLC would fail to decode the stream entirely.
+
+  - Fix: The SDP now dynamically includes base64-encoded SPS and PPS in the `a=fmtp` line when available. The server caches these parameter sets as they're received from the encoder.
+
+  - Fixed NAL Unit Extraction (Multiple NALs per Frame):
+
+  - Problem: The encoder was treating each output buffer as a single NAL unit, even when it contained multiple NAL units (e.g., SEI + IDR, or SPS + PPS combined). This caused incomplete frames and decoder confusion.
+
+  - Fix: Added `ExtractNalUnitsFromFrame` method that properly parses start codes and extracts all NAL units from encoder output. The server now sends each NAL unit as a separate RTP packet (or FU-A fragmented if large).
+
+  - Fixed SPS/PPS Start Code Handling:
+
+  - Problem: When extracting SPS/PPS from MediaFormat's csd-0/csd-1 buffers, the code assumed specific start code formats. Some encoders provide raw NAL data without start codes, others use 3-byte or 4-byte start codes.
+
+  - Fix: Added robust `GetStartCodeLength`, `GetNalType`, and `EnsureStartCode` helper methods that handle all cases. Parameter sets are now normalized to 4-byte start codes for consistent handling.
+
+  - Fixed Multi-Client Frame Delivery:
+
+  - Problem: Using `Interlocked.Exchange` with null replacement caused frames to be consumed by one client, leaving other clients without frames.
+
+  - Fix: Changed to non-destructive frame reading where each client tracks its own last-sent timestamp. Multiple clients can now receive the same frame, and per-client timestamp tracking prevents duplicate sends.
+
+  - Improved Frame Dropping Strategy:
+
+  - Problem: The encoder was aggressively dropping frames (keeping only 2 max), which could break B-frame prediction chains and cause visible stutter.
+
+  - Fix: Frame queue limit increased to 3 with single-frame-at-a-time dropping. This provides better buffering while maintaining low latency.
+
+  - Added RTCP Sender Reports:
+
+  - Problem: VLC and other players use RTCP Sender Reports (SR) for clock synchronization and jitter buffer management. Without SR packets, players may exhibit poor sync and choppy playback.
+
+  - Fix: The server now sends RTCP Sender Reports every 5 seconds. Each SR includes NTP timestamp, RTP timestamp, packet count, and octet count as per RFC 3550.
+
+  - Enhanced Code Documentation:
+
+  - Added XML documentation comments to all major methods explaining their purpose, parameters, and behavior.
+  - Improved code readability with clear comments explaining RTP/RTCP protocol details.
+
 ---
 
 **Thanks for checking out Balu Media Server!** 

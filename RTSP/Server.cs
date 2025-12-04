@@ -47,6 +47,9 @@ public class Server : IDisposable
     private static readonly byte[] StandardQuantizationTables = GetStandardQuantizationTables();
     private readonly ArrayPool<byte> _arrayPool = ArrayPool<byte>.Shared;
     private ConcurrentDictionary<string, string> _users = new();
+    // Global SPS/PPS cache for SDP generation (updated when encoder provides them)
+    private byte[]? _currentSps, _currentPps;
+    private readonly object _spsPpsLock = new();
     public static event Action<List<Client>>? OnClientsChange;
     public static event EventHandler<bool>? OnStreaming;
     public static event EventHandler<FrameEventArgs>? OnNewFrontFrame, OnNewBackFrame;
@@ -272,11 +275,31 @@ public class Server : IDisposable
     }
     private void OnH264FrontFrameEncoded(object? sender, H264FrameEventArgs e)
     {
+        // Update global SPS/PPS cache for SDP generation
+        UpdateSpsPpsCache(e);
         Interlocked.Exchange(ref _latestH264FrameFront, e);
     }
+
     private void OnH264BackFrameEncoded(object? sender, H264FrameEventArgs e)
     {
+        // Update global SPS/PPS cache for SDP generation
+        UpdateSpsPpsCache(e);
         Interlocked.Exchange(ref _latestH264FrameBack, e);
+    }
+
+    /// <summary>
+    /// Updates the global SPS/PPS cache used for SDP generation.
+    /// </summary>
+    private void UpdateSpsPpsCache(H264FrameEventArgs e)
+    {
+        if (e.Sps != null || e.Pps != null)
+        {
+            lock (_spsPpsLock)
+            {
+                if (e.Sps != null) _currentSps = e.Sps;
+                if (e.Pps != null) _currentPps = e.Pps;
+            }
+        }
     }
     private void StartH264EncoderFront(int width, int height)
     {
@@ -852,8 +875,8 @@ public class Server : IDisposable
                 client.BaseRtpTimestamp = (uint)Random.Shared.Next(0, int.MaxValue);
                 return client.BaseRtpTimestamp;
             }
-            ulong delta_ns = encoderTimestamp - client.BaseEncoderTimestamp;            
-            double seconds = delta_ns / 1_000_000_000.0; 
+            ulong delta_ns = encoderTimestamp - client.BaseEncoderTimestamp;
+            double seconds = delta_ns / 1_000_000_000.0;
             ulong rtpAdd = (ulong)(seconds * 90000.0 + 0.5);
             return (uint)(client.BaseRtpTimestamp + rtpAdd);
         }
@@ -1021,7 +1044,7 @@ public class Server : IDisposable
     private async Task<bool> StreamH264ToClient(Client client)
     {
         H264FrameEventArgs? h264Frame = null;
-        
+
         if (client.CameraId == 0)
         {
             h264Frame = Interlocked.Exchange(ref _latestH264FrameBack, null);
@@ -1033,8 +1056,6 @@ public class Server : IDisposable
 
         if (h264Frame != null && h264Frame.NalUnits.Count > 0)
         {
-
-
             // Check if this is a new frame
             if (h264Frame.Timestamp > client.LastH264FrameTimestamp)
             {
@@ -1046,11 +1067,28 @@ public class Server : IDisposable
                     client.FrameCount++;
                 }
 
-
                 try
                 {
-                    // Send SPS/PPS if needed
-                    bool needsSpsPps = h264Frame.IsKeyFrame ||
+                    // Detect IDR frame by checking NAL type (type 5 = IDR)
+                    bool isIdrFrame = h264Frame.IsKeyFrame;
+                    if (!isIdrFrame && h264Frame.NalUnits.Count > 0)
+                    {
+                        var firstNal = h264Frame.NalUnits[0];
+                        int nalTypeOffset = 0;
+                        if (firstNal.Length >= 5 && firstNal[0] == 0 && firstNal[1] == 0 && firstNal[2] == 0 && firstNal[3] == 1)
+                            nalTypeOffset = 4;
+                        else if (firstNal.Length >= 4 && firstNal[0] == 0 && firstNal[1] == 0 && firstNal[2] == 1)
+                            nalTypeOffset = 3;
+
+                        if (nalTypeOffset > 0 && firstNal.Length > nalTypeOffset)
+                        {
+                            int nalType = firstNal[nalTypeOffset] & 0x1F;
+                            isIdrFrame = (nalType == 5); // IDR slice
+                        }
+                    }
+
+                    // Send SPS/PPS before keyframes/IDR frames, first frame, or if not cached
+                    bool needsSpsPps = isIdrFrame ||
                                     client.FrameCount == 1 ||
                                     !_clientSpsCache.ContainsKey(client.Id);
 
@@ -1063,11 +1101,30 @@ public class Server : IDisposable
                         _clientPpsCache[client.Id] = h264Frame.Pps;
                     }
 
-                    // Send all NAL units
-                    int nalCount = h264Frame.NalUnits.Count;
+                    // Send all NAL units (filter out AUD - Access Unit Delimiter, type 9)
+                    var nalUnitsToSend = new List<byte[]>();
+                    foreach (var nal in h264Frame.NalUnits)
+                    {
+                        if (nal.Length > 4)
+                        {
+                            int offset = 0;
+                            if (nal[0] == 0 && nal[1] == 0 && nal[2] == 0 && nal[3] == 1) offset = 4;
+                            else if (nal[0] == 0 && nal[1] == 0 && nal[2] == 1) offset = 3;
+
+                            if (offset > 0 && nal.Length > offset)
+                            {
+                                int nalType = nal[offset] & 0x1F;
+                                // Skip AUD (9), filler (12), and other non-essential NALs
+                                if (nalType == 9 || nalType == 12) continue;
+                            }
+                        }
+                        nalUnitsToSend.Add(nal);
+                    }
+
+                    int nalCount = nalUnitsToSend.Count;
                     for (int i = 0; i < nalCount; i++)
                     {
-                        var nalUnit = h264Frame.NalUnits[i];
+                        var nalUnit = nalUnitsToSend[i];
                         // The marker bit is ONLY set on the last NAL unit of the frame
                         bool isLastNalOfFrame = i == nalCount - 1;
                         await SendH264NalAsRtp(client, nalUnit, frameRtpTimestamp, isLastNalOfFrame).ConfigureAwait(false);
@@ -1218,6 +1275,108 @@ public class Server : IDisposable
             await SendInterleavedData(client.Socket, client.RtpChannel, data).ConfigureAwait(false);
         }
     }
+
+    /// <summary>
+    /// Sends an RTCP Sender Report (SR) packet to the client.
+    /// Sender Reports provide timing information for synchronization and statistics.
+    /// </summary>
+    private async Task SendRtcpSenderReport(Client client)
+    {
+        try
+        {
+            // RTCP SR packet structure (28 bytes minimum):
+            // - Header (8 bytes): V=2, P=0, RC=0, PT=200 (SR), Length
+            // - SSRC (4 bytes)
+            // - NTP timestamp (8 bytes)
+            // - RTP timestamp (4 bytes)
+            // - Sender's packet count (4 bytes)
+            // - Sender's octet count (4 bytes)
+
+            var srPacket = new byte[28];
+
+            // Header
+            srPacket[0] = 0x80; // V=2, P=0, RC=0
+            srPacket[1] = 200;  // PT=200 (Sender Report)
+
+            // Length in 32-bit words minus one (28/4 - 1 = 6)
+            srPacket[2] = 0;
+            srPacket[3] = 6;
+
+            // SSRC
+            lock (client)
+            {
+                srPacket[4] = (byte)(client.SsrcId >> 24);
+                srPacket[5] = (byte)(client.SsrcId >> 16);
+                srPacket[6] = (byte)(client.SsrcId >> 8);
+                srPacket[7] = (byte)(client.SsrcId & 0xFF);
+            }
+
+            // NTP timestamp (64-bit): seconds since 1900 + fractional seconds
+            var now = DateTime.UtcNow;
+            var ntpEpoch = new DateTime(1900, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            var ntpSeconds = (ulong)(now - ntpEpoch).TotalSeconds;
+            var ntpFraction = (ulong)((now - ntpEpoch).TotalSeconds % 1 * uint.MaxValue);
+
+            srPacket[8] = (byte)(ntpSeconds >> 24);
+            srPacket[9] = (byte)(ntpSeconds >> 16);
+            srPacket[10] = (byte)(ntpSeconds >> 8);
+            srPacket[11] = (byte)(ntpSeconds & 0xFF);
+            srPacket[12] = (byte)(ntpFraction >> 24);
+            srPacket[13] = (byte)(ntpFraction >> 16);
+            srPacket[14] = (byte)(ntpFraction >> 8);
+            srPacket[15] = (byte)(ntpFraction & 0xFF);
+
+            // RTP timestamp (last sent)
+            uint rtpTimestamp;
+            uint packetCount;
+            uint octetCount;
+
+            lock (client)
+            {
+                rtpTimestamp = client.LastRtpTimestampSent;
+                packetCount = client.PacketCount;
+                octetCount = client.OctetCount;
+            }
+
+            srPacket[16] = (byte)(rtpTimestamp >> 24);
+            srPacket[17] = (byte)(rtpTimestamp >> 16);
+            srPacket[18] = (byte)(rtpTimestamp >> 8);
+            srPacket[19] = (byte)(rtpTimestamp & 0xFF);
+
+            // Sender's packet count
+            srPacket[20] = (byte)(packetCount >> 24);
+            srPacket[21] = (byte)(packetCount >> 16);
+            srPacket[22] = (byte)(packetCount >> 8);
+            srPacket[23] = (byte)(packetCount & 0xFF);
+
+            // Sender's octet count
+            srPacket[24] = (byte)(octetCount >> 24);
+            srPacket[25] = (byte)(octetCount >> 16);
+            srPacket[26] = (byte)(octetCount >> 8);
+            srPacket[27] = (byte)(octetCount & 0xFF);
+
+            // Send via appropriate transport
+            if (client.Transport == TransportMode.UDP)
+            {
+                await SendUdpData(client, srPacket, true).ConfigureAwait(false);
+            }
+            else if (client.Transport == TransportMode.TCPInterleaved)
+            {
+                await SendInterleavedData(client.Socket, client.RtcpChannel, srPacket).ConfigureAwait(false);
+            }
+
+            lock (client)
+            {
+                client.LastSenderReportTime = DateTime.UtcNow;
+            }
+
+            Log.Debug("[RTSP Server]", $"Sent RTCP SR to client {client.Id}");
+        }
+        catch (Exception ex)
+        {
+            Log.Error("[RTSP Server]", $"Error sending RTCP SR: {ex.Message}");
+        }
+    }
     private async Task SendH264NalAsRtp(Client client, byte[] nalUnit, uint nalTimestamp, bool lastFrame = false)
     {
         int nalStart = 0;
@@ -1347,12 +1506,14 @@ public class Server : IDisposable
         Buffer.BlockCopy(payload, 0, packet, 12, payload.Length);
         return packet;
     }
-    // Main problem
+    /// <summary>
+    /// Creates an RTP packet with the specified payload and timestamp.
+    /// RTP header format (12 bytes): V=2, P, X, CC, M, PT, Sequence, Timestamp, SSRC
+    /// </summary>
     private byte[] CreateRtpPacket(Client client, byte[] payload, uint timestamp, bool marker, byte payloadType)
     {
-        //var packet = _arrayPool.Rent(12 + payload.Length);
         var packet = new byte[12 + payload.Length];
-        packet[0] = 0x80;
+        packet[0] = 0x80; // V=2, P=0, X=0, CC=0
         packet[1] = (byte)(marker ? 0x80 | payloadType : payloadType);
 
         // Sequence number (must be locked when reading)
@@ -1360,6 +1521,8 @@ public class Server : IDisposable
         lock (client)
         {
             seqNum = client.SequenceNumber;
+            // Track last RTP timestamp for RTCP Sender Reports
+            client.LastRtpTimestampSent = timestamp;
         }
         packet[2] = (byte)(seqNum >> 8);
         packet[3] = (byte)(seqNum & 0xFF);
@@ -1660,6 +1823,10 @@ public class Server : IDisposable
             Log.Error("[RTSP Server]", $"Error cleaning up client: {ex.Message}");
         }
     }
+    /// <summary>
+    /// Generates SDP (Session Description Protocol) for the media stream.
+    /// For H.264, includes sprop-parameter-sets if SPS/PPS are available.
+    /// </summary>
     private string GenerateSDP(CodecType codec = CodecType.H264)
     {
         var serverIp = GetLocalIpAddress();
@@ -1674,7 +1841,15 @@ public class Server : IDisposable
             sdp.AppendLine("m=video 0 RTP/AVP 96");
             sdp.AppendLine($"c=IN IP4 {serverIp}");
             sdp.AppendLine("a=rtpmap:96 H264/90000");
-            sdp.AppendLine("a=fmtp:96 profile-level-id=42e01e;packetization-mode=1");
+
+            // Build fmtp line with sprop-parameter-sets for VLC and other players
+            var fmtpParams = new StringBuilder("profile-level-id=42e01e;packetization-mode=1");
+            var spropParams = GetSpropParameterSets();
+            if (!string.IsNullOrEmpty(spropParams))
+            {
+                fmtpParams.Append($";sprop-parameter-sets={spropParams}");
+            }
+            sdp.AppendLine($"a=fmtp:96 {fmtpParams}");
             sdp.AppendLine($"a=control:rtsp://{serverIp}:{_port}/live");
         }
         else
@@ -1686,6 +1861,64 @@ public class Server : IDisposable
         }
 
         return sdp.ToString();
+    }
+
+    /// <summary>
+    /// Gets the sprop-parameter-sets value for SDP (base64-encoded SPS and PPS without start codes).
+    /// Format: base64(SPS),base64(PPS)
+    /// </summary>
+    private string GetSpropParameterSets()
+    {
+        byte[]? sps, pps;
+        lock (_spsPpsLock)
+        {
+            sps = _currentSps;
+            pps = _currentPps;
+        }
+
+        if (sps == null || pps == null)
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            // Remove start codes before base64 encoding
+            var spsWithoutStartCode = RemoveStartCode(sps);
+            var ppsWithoutStartCode = RemoveStartCode(pps);
+
+            var spsBase64 = Convert.ToBase64String(spsWithoutStartCode);
+            var ppsBase64 = Convert.ToBase64String(ppsWithoutStartCode);
+
+            return $"{spsBase64},{ppsBase64}";
+        }
+        catch (Exception ex)
+        {
+            Log.Error("[RTSP Server]", $"Error generating sprop-parameter-sets: {ex.Message}");
+            return string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Removes start code prefix from NAL unit data.
+    /// </summary>
+    private byte[] RemoveStartCode(byte[] nalUnit)
+    {
+        if (nalUnit.Length >= 4 &&
+            nalUnit[0] == 0 && nalUnit[1] == 0 && nalUnit[2] == 0 && nalUnit[3] == 1)
+        {
+            var result = new byte[nalUnit.Length - 4];
+            Array.Copy(nalUnit, 4, result, 0, result.Length);
+            return result;
+        }
+        else if (nalUnit.Length >= 3 &&
+                 nalUnit[0] == 0 && nalUnit[1] == 0 && nalUnit[2] == 1)
+        {
+            var result = new byte[nalUnit.Length - 3];
+            Array.Copy(nalUnit, 3, result, 0, result.Length);
+            return result;
+        }
+        return nalUnit;
     }
     public static byte[] EncodeToJpeg(byte[] rawImageData, int width, int height, Android.Graphics.ImageFormatType format, int quality = 80 )
     {
