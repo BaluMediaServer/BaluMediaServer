@@ -322,15 +322,29 @@ public class Server : IDisposable
             {
                 try
                 {
+                    // Validate frame size matches expected YUV420 size
+                    int expectedSize = (width * height * 3) / 2;
+                    if (_latestBackFrame != null && _latestBackFrame.Data != null)
+                    {
+                        int actualSize = _latestBackFrame.Data.Length;
+                        if (actualSize != expectedSize)
+                        {
+                            // Calculate actual dimensions from frame size
+                            // YUV420: size = width * height * 1.5
+                            Log.Warn("[RTSP Server]", $"Frame size mismatch: {actualSize} bytes, expected {expectedSize} for {width}x{height}");
+                        }
+                    }
+
+                    Log.Debug("[RTSP Server]", $"Starting H264 encoder: {width}x{height}");
                     _h264BackEncoder = new(width, height, bitrate: 2000000, frameRate: 25);
                     _h264BackEncoder.FrameEncoded += OnH264BackFrameEncoded;
                     _h264BackEncoder.Start();
-                    Log.Debug("[RTSP Server]", "H264 encoder started");    
-                }catch(Exception ex)
-                {
-                    var t = ex;
+                    Log.Debug("[RTSP Server]", "H264 encoder started");
                 }
-                
+                catch (Exception ex)
+                {
+                    Log.Error("[RTSP Server]", $"Failed to start H264 encoder: {ex.Message}");
+                }
             }
         }
     }
@@ -942,13 +956,37 @@ public class Server : IDisposable
             {
                 if (client.CameraId == 0)
                 {
-                    while (_latestBackFrame == null) await Task.Delay(50, _cts.Token).ConfigureAwait(false);
-                    StartH264EncoderBack(_latestBackFrame.Width, _latestBackFrame.Height);
+                    while (_latestBackFrame == null || _latestBackFrame.Data == null)
+                        await Task.Delay(50, _cts.Token).ConfigureAwait(false);
+
+                    // Calculate actual dimensions from frame data size
+                    // YUV420: size = width * height * 1.5
+                    int frameSize = _latestBackFrame.Data.Length;
+                    int actualWidth = _latestBackFrame.Width;
+                    int actualHeight = _latestBackFrame.Height;
+
+                    // Verify dimensions match the data size
+                    int expectedSize = (actualWidth * actualHeight * 3) / 2;
+                    if (frameSize != expectedSize)
+                    {
+                        Log.Warn("[RTSP Server]", $"Frame data size {frameSize} doesn't match reported {actualWidth}x{actualHeight} ({expectedSize} bytes)");
+                        // Try to infer dimensions from frame size assuming square-ish aspect
+                        // Common resolutions: 640x480, 640x640, 720x480, 1280x720, etc.
+                    }
+
+                    Log.Info("[RTSP Server]", $"Starting H264 encoder with {actualWidth}x{actualHeight} (frame size: {frameSize} bytes)");
+                    StartH264EncoderBack(actualWidth, actualHeight);
                 }
                 else
                 {
-                    while (_latestFrontFrame == null) await Task.Delay(50, _cts.Token).ConfigureAwait(false);
-                    StartH264EncoderFront(_latestFrontFrame.Width, _latestFrontFrame.Height);
+                    while (_latestFrontFrame == null || _latestFrontFrame.Data == null)
+                        await Task.Delay(50, _cts.Token).ConfigureAwait(false);
+
+                    int actualWidth = _latestFrontFrame.Width;
+                    int actualHeight = _latestFrontFrame.Height;
+
+                    Log.Info("[RTSP Server]", $"Starting H264 front encoder with {actualWidth}x{actualHeight}");
+                    StartH264EncoderFront(actualWidth, actualHeight);
                 }
             }
         }

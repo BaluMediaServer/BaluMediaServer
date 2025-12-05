@@ -32,6 +32,7 @@ public class H264Encoder : IDisposable
     private long _lastTimestamp = 0;
     private readonly EncoderInfo _bestEncoder = new();
     private readonly Stopwatch _stopwatch = new();
+    private int _selectedColorFormat = COLOR_FormatYUV420SemiPlanar;
     public event EventHandler<H264FrameEventArgs>? FrameEncoded;
     
     public class FrameData
@@ -252,13 +253,24 @@ public class H264Encoder : IDisposable
                 var format = MediaFormat.CreateVideoFormat(MediaFormat.MimetypeVideoAvc, _width, _height);
 
                 // Use the best color format from the selected encoder
-                int colorFormat = COLOR_FormatYUV420SemiPlanar; // Default
-                if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420SemiPlanar))
-                    colorFormat = COLOR_FormatYUV420SemiPlanar; // NV12
-                else if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420Flexible))
-                    colorFormat = COLOR_FormatYUV420Flexible;
+                // Prefer YUV420Flexible as it handles stride/alignment automatically
+                if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420Flexible))
+                {
+                    _selectedColorFormat = COLOR_FormatYUV420Flexible;
+                    Log.Debug("H264", "Using COLOR_FormatYUV420Flexible");
+                }
+                else if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420SemiPlanar))
+                {
+                    _selectedColorFormat = COLOR_FormatYUV420SemiPlanar; // NV12
+                    Log.Debug("H264", "Using COLOR_FormatYUV420SemiPlanar (NV12)");
+                }
+                else
+                {
+                    _selectedColorFormat = COLOR_FormatYUV420SemiPlanar; // Default fallback
+                    Log.Debug("H264", "Using default COLOR_FormatYUV420SemiPlanar");
+                }
 
-                format.SetInteger(MediaFormat.KeyColorFormat, colorFormat);
+                format.SetInteger(MediaFormat.KeyColorFormat, _selectedColorFormat);
                 format.SetInteger(MediaFormat.KeyBitRate, _bitrate);
                 format.SetInteger(MediaFormat.KeyFrameRate, _frameRate);
                 format.SetInteger(MediaFormat.KeyIFrameInterval, 2);
@@ -327,7 +339,7 @@ public class H264Encoder : IDisposable
 
                 Log.Info("H264", $"Encoder started successfully: {_bestEncoder.Name}");
                 Log.Info("H264", $"Format: {_width}x{_height} @ {_frameRate}fps, {_bitrate}bps");
-                Log.Info("H264", $"Color format: {colorFormat}");
+                Log.Info("H264", $"Color format: {_selectedColorFormat}");
                 
                 return true;
             }
@@ -387,7 +399,7 @@ public class H264Encoder : IDisposable
 
         if (frameData.Length != expectedSize)
         {
-            Log.Error("H264", $"Invalid frame size: {frameData.Length}, expected: {expectedSize}");
+            Log.Error("H264", $"Invalid frame size: {frameData.Length}, expected: {expectedSize} (encoder: {_width}x{_height})");
             return;
         }
 
@@ -481,17 +493,29 @@ public class H264Encoder : IDisposable
                 {
                     inputBuffer.Clear();
 
-                    // Convert NV21 to NV12 since we're using YUV420SemiPlanar
-                    var nv12Data = ConvertNV21ToNV12Pooled(frame.Data);
+                    byte[] frameData;
 
-                    // Ensure buffer can hold the entire frame
-                    if (inputBuffer.Capacity() < nv12Data.Length)
+                    // YUV420Flexible can accept NV21 directly, NV12 needs conversion
+                    if (_selectedColorFormat == COLOR_FormatYUV420Flexible)
                     {
-                        Log.Warn("H264MTK", $"Input buffer too small: {inputBuffer.Capacity()} < {nv12Data.Length}");
+                        // Flexible format handles NV21 directly
+                        frameData = frame.Data;
+                    }
+                    else
+                    {
+                        // Convert NV21 to NV12 for SemiPlanar format
+                        frameData = ConvertNV21ToNV12Pooled(frame.Data);
                     }
 
-                    var dataSize = Math.Min(nv12Data.Length, inputBuffer.Capacity());
-                    inputBuffer.Put(nv12Data, 0, dataSize);
+                    // Ensure buffer can hold the entire frame
+                    if (inputBuffer.Capacity() < frameData.Length)
+                    {
+                        Log.Warn("H264MTK", $"Input buffer too small: {inputBuffer.Capacity()} < {frameData.Length}");
+                        // Send what we can fit
+                    }
+
+                    var dataSize = Math.Min(frameData.Length, inputBuffer.Capacity());
+                    inputBuffer.Put(frameData, 0, dataSize);
 
                     _encoder.QueueInputBuffer(inputIndex, 0, dataSize, frame.Timestamp, 0);
                     _lastTimestamp = frame.Timestamp;
