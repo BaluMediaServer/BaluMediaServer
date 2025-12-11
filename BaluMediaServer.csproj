@@ -9,13 +9,13 @@
 		<!-- NuGet Package Properties -->
 		<GeneratePackageOnBuild>false</GeneratePackageOnBuild>
 		<PackageId>BaluMediaServer.CameraStreamer</PackageId>
-		<PackageVersion>1.3.1</PackageVersion>
+		<PackageVersion>1.5.0</PackageVersion>
 		<Authors>Nakano Miku 13</Authors>
 		<Company>Balu Media Server</Company>
 		<Product>Balu Media Camera Streamer</Product>
 		<Description>Android camera streaming library with dual camera support for MAUI applications</Description>
 		<Copyright>Copyright © Balu Media Server 2025</Copyright>
-		<PackageTags>android;camera;streaming;maui;dual-camera;rtsp;h264;mjpeg;rtp;rtcp;video;aac;h265;RTSP</PackageTags>
+		<PackageTags>android;camera;streaming;maui;dual-camera;rtsp;h264;mjpeg;rtp;rtcp;video;aac;h265;RTSP;rtsp</PackageTags>
 		<PackageProjectUrl>https://github.com/BaluMediaServer</PackageProjectUrl>
 		<RepositoryUrl>https://github.com/BaluMediaServer/BaluMediaServer</RepositoryUrl>
 		<RepositoryType>git</RepositoryType>
