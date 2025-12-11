@@ -41,6 +41,9 @@ public class Client : IDisposable
     public uint OctetCount { get; set; } = 0;
     public DateTime LastSenderReportTime { get; set; } = DateTime.MinValue;
     public uint LastRtpTimestampSent { get; set; } = 0;
+    // Connection health tracking
+    public DateTime LastActivityTime { get; set; } = DateTime.UtcNow;
+    public int ConsecutiveSendErrors { get; set; } = 0;
     public void Dispose()
     {
         this.Socket?.Close();

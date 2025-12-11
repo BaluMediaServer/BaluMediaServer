@@ -708,8 +708,8 @@ Server.OnClientsChange += (clients) => {
 ### Medium Term (v1.2-1.3)
 - ⬜ Add H.265 (HEVC) codec support
 - ✅ Reduce streaming latency (target: <100ms)
-- ⬜ Add comprehensive code documentation
-- ⬜ NuGet package distribution
+- ✅ Add comprehensive code documentation
+- ✅ NuGet package distribution
 - ⬜ Add unit tests and integration tests
 
 ### Long Term (v2.0+)
@@ -867,6 +867,45 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
 
   - Added XML documentation comments to all major methods explaining their purpose, parameters, and behavior.
   - Improved code readability with clear comments explaining RTP/RTCP protocol details.
+
+- v1.4.1: Client Connection Management Overhaul and H.264 Reliability Fix. This release addresses critical issues with abrupt client disconnection handling and encoder buffer size mismatches that caused delayed reconnections and missing video.
+
+  - Fixed Critical Client Collection Bug (ConcurrentBag → ConcurrentDictionary):
+
+  - Problem: The server used `ConcurrentBag<Client>` with `TryTake()` for client cleanup. `TryTake()` removes a **random** element, not the specific client being cleaned up. This corrupted the client list over time, causing ghost clients and preventing proper cleanup.
+
+  - Fix: Replaced `ConcurrentBag<Client>` with `ConcurrentDictionary<string, Client>`. Client cleanup now uses `TryRemove(client.Id, out _)` to remove the exact client being disconnected.
+
+  - Added TCP Connection Timeout Detection:
+
+  - Problem: `Socket.Connected` does not detect abrupt disconnections (network failure, process kill). The server would continue trying to stream to dead clients, blocking resources and preventing new clients from receiving video.
+
+  - Fix: Added comprehensive connection health tracking:
+    - `LastActivityTime` tracks last successful send per client
+    - `ConsecutiveSendErrors` counts sequential failures
+    - 5-second send timeout using `CancellationTokenSource` detects stuck connections
+    - 30-second inactivity timeout in streaming loop catches zombie connections
+    - Client marked as disconnected after 3 consecutive errors or socket exception
+
+  - Fixed H.264 Encoder Buffer Size Mismatch:
+
+  - Problem: The encoder was initialized with camera-reported dimensions (e.g., 640x480), but some cameras send frames with different actual sizes (e.g., 640x640). This caused `Input buffer too small` errors and dropped frames.
+
+  - Fix: Added `CalculateDimensionsFromFrameSize()` method that:
+    - Checks common resolutions against actual YUV420 frame size
+    - Calculates dimensions using width/height hints when possible
+    - Falls back to square aspect ratio calculation
+    - Ensures encoder is always initialized with correct frame dimensions
+
+  - Improved UDP Error Handling:
+
+  - Problem: UDP send errors weren't properly tracked, allowing broken connections to persist.
+
+  - Fix: UDP sends now track activity time and consecutive errors. Clients are disconnected after 5 consecutive UDP errors or when network is unreachable.
+
+  - Enhanced Error Logging:
+
+  - Added detailed logging for connection timeouts, send failures, and dimension mismatches to aid debugging.
 
 ---
 

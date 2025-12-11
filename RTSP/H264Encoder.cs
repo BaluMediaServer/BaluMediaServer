@@ -30,6 +30,7 @@ public class H264Encoder : IDisposable
     private const int COLOR_Format32bitARGB8888 = 2130708361;
     private const int COLOR_FormatYUV420Flexible = 2135033992;
     private long _lastTimestamp = 0;
+    private int _lastLoggedSize = 0;
     private readonly EncoderInfo _bestEncoder = new();
     private readonly Stopwatch _stopwatch = new();
     private int _selectedColorFormat = COLOR_FormatYUV420SemiPlanar;
@@ -273,7 +274,7 @@ public class H264Encoder : IDisposable
                 format.SetInteger(MediaFormat.KeyColorFormat, _selectedColorFormat);
                 format.SetInteger(MediaFormat.KeyBitRate, _bitrate);
                 format.SetInteger(MediaFormat.KeyFrameRate, _frameRate);
-                format.SetInteger(MediaFormat.KeyIFrameInterval, 2);
+                format.SetInteger(MediaFormat.KeyIFrameInterval, 1); // 1 second between keyframes for lower latency
                 
                 // Set profile and level for better compatibility
                 format.SetInteger(MediaFormat.KeyProfile, (int)MediaCodecProfileType.Avcprofilebaseline);
@@ -411,8 +412,8 @@ public class H264Encoder : IDisposable
 
         var timestamp = _stopwatch.ElapsedTicks * 1000000L / Stopwatch.Frequency;
 
-        // Drop frames if queue is backing up (keep only 2 frames max)
-        while (_frameQueue.Count > 2)
+        // Drop frames if queue is backing up (keep max 3 frames for smooth playback)
+        while (_frameQueue.Count > 3)
         {
             if (_frameQueue.TryDequeue(out _))
             {
@@ -449,10 +450,10 @@ public class H264Encoder : IDisposable
                 // Always try to drain output
                 processedOutput = DrainOutputBuffer(bufferInfo, ref sps, ref pps, ref gotFirstOutput);
                 
-                // Only sleep if we didn't process anything
+                // Small sleep to prevent CPU spinning and allow encoder to work
                 if (!processedInput && !processedOutput)
                 {
-                    //Thread.Sleep(1);
+                    Thread.Sleep(1);
                 }
             }
             catch (Exception ex)
@@ -470,8 +471,8 @@ public class H264Encoder : IDisposable
         
         try
         {
-            // Single attempt with no timeout for lower latency
-            var inputIndex = _encoder.DequeueInputBuffer(0);
+            // Wait up to 10ms for an input buffer (balances latency vs reliability)
+            var inputIndex = _encoder.DequeueInputBuffer(10000);
             
             if (inputIndex >= 0)
             {
@@ -493,25 +494,47 @@ public class H264Encoder : IDisposable
                 {
                     inputBuffer.Clear();
 
-                    byte[] frameData;
+                    // Calculate expected size for the encoder (width * height * 1.5 for YUV420)
+                    int expectedSize = (_width * _height * 3) / 2;
 
-                    // YUV420Flexible can accept NV21 directly, NV12 needs conversion
-                    if (_selectedColorFormat == COLOR_FormatYUV420Flexible)
+                    // Start with raw frame data
+                    byte[] frameData = frame.Data;
+
+                    // Log size mismatch for debugging (only once per unique size)
+                    if (frameData.Length != expectedSize && _lastLoggedSize != frameData.Length)
                     {
-                        // Flexible format handles NV21 directly
-                        frameData = frame.Data;
+                        _lastLoggedSize = frameData.Length;
+                        Log.Info("H264", $"Frame size: {frameData.Length}, encoder expects: {expectedSize} for {_width}x{_height}, diff: {frameData.Length - expectedSize}");
                     }
-                    else
+
+                    // FIRST: Handle stride padding from camera BEFORE any color conversion
+                    // This must happen on the original NV21 data
+                    if (frameData.Length > expectedSize)
                     {
-                        // Convert NV21 to NV12 for SemiPlanar format
-                        frameData = ConvertNV21ToNV12Pooled(frame.Data);
+                        // Frame larger than expected - has row stride padding
+                        // Need to remove padding row by row to avoid artifacts
+                        frameData = RemoveRowStridePadding(frameData, _width, _height);
+                    }
+                    else if (frameData.Length < expectedSize)
+                    {
+                        // Frame smaller than expected - pad
+                        byte[] padded = new byte[expectedSize];
+                        System.Buffer.BlockCopy(frameData, 0, padded, 0, frameData.Length);
+                        frameData = padded;
+                    }
+
+                    // THEN: Apply color format conversion if needed
+                    // YUV420Flexible can accept NV21 directly, NV12 needs conversion
+                    if (_selectedColorFormat != COLOR_FormatYUV420Flexible)
+                    {
+                        // Convert NV21 to NV12 for SemiPlanar format (now on stride-corrected data)
+                        frameData = ConvertNV21ToNV12(frameData);
                     }
 
                     // Ensure buffer can hold the entire frame
                     if (inputBuffer.Capacity() < frameData.Length)
                     {
                         Log.Warn("H264MTK", $"Input buffer too small: {inputBuffer.Capacity()} < {frameData.Length}");
-                        // Send what we can fit
                     }
 
                     var dataSize = Math.Min(frameData.Length, inputBuffer.Capacity());
@@ -527,6 +550,30 @@ public class H264Encoder : IDisposable
             Log.Error("H264MTK", $"Feed input error: {ex.Message}");
         }
     }
+    /// <summary>
+    /// Handles frame data that is larger than expected due to camera stride padding.
+    /// Uses simple truncation - takes only the expected bytes.
+    /// </summary>
+    private byte[] RemoveRowStridePadding(byte[] frameData, int width, int height)
+    {
+        int expectedSize = (width * height * 3) / 2;
+
+        // If frame matches or is smaller, handle simply
+        if (frameData.Length <= expectedSize)
+        {
+            if (frameData.Length == expectedSize)
+                return frameData;
+            byte[] paddedData = new byte[expectedSize];
+            System.Buffer.BlockCopy(frameData, 0, paddedData, 0, frameData.Length);
+            return paddedData;
+        }
+
+        // Simple truncation - just take the first expectedSize bytes
+        byte[] truncated = new byte[expectedSize];
+        System.Buffer.BlockCopy(frameData, 0, truncated, 0, expectedSize);
+        return truncated;
+    }
+
     private byte[] ConvertNV21ToNV12Pooled(byte[] nv21)
     {
         int ySize = _width * _height;
@@ -566,10 +613,11 @@ public class H264Encoder : IDisposable
     private bool DrainOutputBuffer(MediaCodec.BufferInfo bufferInfo, ref byte[]? sps, ref byte[]? pps, ref bool gotFirstOutput)
     {
         if (_encoder == null) return false;
-        
+
         try
         {
-            var outputIndex = _encoder.DequeueOutputBuffer(bufferInfo, 0);
+            // Wait up to 10ms for output (balances latency vs smooth playback)
+            var outputIndex = _encoder.DequeueOutputBuffer(bufferInfo, 10000);
             
             if (outputIndex >= 0)
             {
