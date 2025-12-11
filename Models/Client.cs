@@ -36,6 +36,14 @@ public class Client : IDisposable
     public ulong BaseEncoderTimestamp { get; set; } = 0;
     public uint BaseRtpTimestamp { get; set; } = 0;
     public readonly object RtcpLock = new();
+    // RTCP Sender Report tracking
+    public uint PacketCount { get; set; } = 0;
+    public uint OctetCount { get; set; } = 0;
+    public DateTime LastSenderReportTime { get; set; } = DateTime.MinValue;
+    public uint LastRtpTimestampSent { get; set; } = 0;
+    // Connection health tracking
+    public DateTime LastActivityTime { get; set; } = DateTime.UtcNow;
+    public int ConsecutiveSendErrors { get; set; } = 0;
     public void Dispose()
     {
         this.Socket?.Close();

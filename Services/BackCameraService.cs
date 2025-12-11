@@ -14,7 +14,7 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
     private readonly Context _context;
     private readonly CancellationTokenSource _cts = new();
     //private readonly BlockingCollection<VideoFrame> _videoFrames = new(25);
-    private Channel<VideoFrame> _videoFrames;
+    private Channel<VideoFrame> _videoFrames = default!;
     private Task? _thread;
     private DateTime _lastFrameTime;
     private readonly TimeSpan _minFrameInterval = TimeSpan.FromMilliseconds(22); // +- 45 fps 
@@ -31,15 +31,18 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
     {
         try
         {
+            _cameraCapture = new(_context);
+            _cameraCapture.SetBackCameraCallback(this);
             _cameraCapture?.StartBackCameraCapture(width, height);
             _threadRunning = true;
             _videoFrames = Channel.CreateBounded<VideoFrame>(
-            new BoundedChannelOptions(25)
-            {
-                FullMode = BoundedChannelFullMode.Wait,
-                SingleReader = true,
-                SingleWriter = false
-            });
+                new BoundedChannelOptions(25)
+                {
+                    FullMode = BoundedChannelFullMode.Wait,
+                    SingleReader = true,
+                    SingleWriter = false
+                }
+            );
             _thread = Task.Run(ProcessFramesAsync, _cts.Token);
         }
         catch (Exception ex)

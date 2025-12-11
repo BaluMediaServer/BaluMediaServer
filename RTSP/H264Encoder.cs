@@ -30,8 +30,10 @@ public class H264Encoder : IDisposable
     private const int COLOR_Format32bitARGB8888 = 2130708361;
     private const int COLOR_FormatYUV420Flexible = 2135033992;
     private long _lastTimestamp = 0;
+    private int _lastLoggedSize = 0;
     private readonly EncoderInfo _bestEncoder = new();
     private readonly Stopwatch _stopwatch = new();
+    private int _selectedColorFormat = COLOR_FormatYUV420SemiPlanar;
     public event EventHandler<H264FrameEventArgs>? FrameEncoded;
     
     public class FrameData
@@ -252,16 +254,27 @@ public class H264Encoder : IDisposable
                 var format = MediaFormat.CreateVideoFormat(MediaFormat.MimetypeVideoAvc, _width, _height);
 
                 // Use the best color format from the selected encoder
-                int colorFormat = COLOR_FormatYUV420SemiPlanar; // Default
-                if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420SemiPlanar))
-                    colorFormat = COLOR_FormatYUV420SemiPlanar; // NV12
-                else if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420Flexible))
-                    colorFormat = COLOR_FormatYUV420Flexible;
+                // Prefer YUV420Flexible as it handles stride/alignment automatically
+                if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420Flexible))
+                {
+                    _selectedColorFormat = COLOR_FormatYUV420Flexible;
+                    Log.Debug("H264", "Using COLOR_FormatYUV420Flexible");
+                }
+                else if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420SemiPlanar))
+                {
+                    _selectedColorFormat = COLOR_FormatYUV420SemiPlanar; // NV12
+                    Log.Debug("H264", "Using COLOR_FormatYUV420SemiPlanar (NV12)");
+                }
+                else
+                {
+                    _selectedColorFormat = COLOR_FormatYUV420SemiPlanar; // Default fallback
+                    Log.Debug("H264", "Using default COLOR_FormatYUV420SemiPlanar");
+                }
 
-                format.SetInteger(MediaFormat.KeyColorFormat, colorFormat);
+                format.SetInteger(MediaFormat.KeyColorFormat, _selectedColorFormat);
                 format.SetInteger(MediaFormat.KeyBitRate, _bitrate);
                 format.SetInteger(MediaFormat.KeyFrameRate, _frameRate);
-                format.SetInteger(MediaFormat.KeyIFrameInterval, 2);
+                format.SetInteger(MediaFormat.KeyIFrameInterval, 1); // 1 second between keyframes for lower latency
                 
                 // Set profile and level for better compatibility
                 format.SetInteger(MediaFormat.KeyProfile, (int)MediaCodecProfileType.Avcprofilebaseline);
@@ -327,7 +340,7 @@ public class H264Encoder : IDisposable
 
                 Log.Info("H264", $"Encoder started successfully: {_bestEncoder.Name}");
                 Log.Info("H264", $"Format: {_width}x{_height} @ {_frameRate}fps, {_bitrate}bps");
-                Log.Info("H264", $"Color format: {colorFormat}");
+                Log.Info("H264", $"Color format: {_selectedColorFormat}");
                 
                 return true;
             }
@@ -382,31 +395,32 @@ public class H264Encoder : IDisposable
     public void QueueFrame(byte[] frameData)
     {
         if (!_isRunning) return;
-        
+
         int expectedSize = (_width * _height * 3) / 2;
 
         if (frameData.Length != expectedSize)
         {
-            Log.Error("H264", $"Invalid frame size: {frameData.Length}, expected: {expectedSize}");
+            Log.Error("H264", $"Invalid frame size: {frameData.Length}, expected: {expectedSize} (encoder: {_width}x{_height})");
             return;
         }
+
         // Use actual time for timestamps to prevent stuttering
         if (!_stopwatch.IsRunning)
         {
             _stopwatch.Start();
         }
-        
+
         var timestamp = _stopwatch.ElapsedTicks * 1000000L / Stopwatch.Frequency;
-        
-        // Drop frames if queue is backing up (keep only 2 frames max)
-        while (_frameQueue.Count > 2)
+
+        // Drop frames if queue is backing up (keep max 3 frames for smooth playback)
+        while (_frameQueue.Count > 3)
         {
             if (_frameQueue.TryDequeue(out _))
             {
                 Log.Debug("H264", "Dropped old frame to prevent latency");
             }
         }
-        
+
         _frameQueue.Enqueue(new() { Data = frameData, Timestamp = timestamp });
     }
     
@@ -436,10 +450,10 @@ public class H264Encoder : IDisposable
                 // Always try to drain output
                 processedOutput = DrainOutputBuffer(bufferInfo, ref sps, ref pps, ref gotFirstOutput);
                 
-                // Only sleep if we didn't process anything
+                // Small sleep to prevent CPU spinning and allow encoder to work
                 if (!processedInput && !processedOutput)
                 {
-                    //Thread.Sleep(1);
+                    Thread.Sleep(1);
                 }
             }
             catch (Exception ex)
@@ -457,8 +471,8 @@ public class H264Encoder : IDisposable
         
         try
         {
-            // Single attempt with no timeout for lower latency
-            var inputIndex = _encoder.DequeueInputBuffer(0);
+            // Wait up to 10ms for an input buffer (balances latency vs reliability)
+            var inputIndex = _encoder.DequeueInputBuffer(10000);
             
             if (inputIndex >= 0)
             {
@@ -479,12 +493,53 @@ public class H264Encoder : IDisposable
                 if (inputBuffer != null)
                 {
                     inputBuffer.Clear();
-                    
-                    // Convert NV21 to NV12 since we're using YUV420SemiPlanar
-                    var nv12Data = ConvertNV21ToNV12Pooled(frame.Data);
-                    var dataSize = Math.Min(nv12Data.Length, inputBuffer.Capacity());
-                    inputBuffer.Put(nv12Data, 0, dataSize);
-                    
+
+                    // Calculate expected size for the encoder (width * height * 1.5 for YUV420)
+                    int expectedSize = (_width * _height * 3) / 2;
+
+                    // Start with raw frame data
+                    byte[] frameData = frame.Data;
+
+                    // Log size mismatch for debugging (only once per unique size)
+                    if (frameData.Length != expectedSize && _lastLoggedSize != frameData.Length)
+                    {
+                        _lastLoggedSize = frameData.Length;
+                        Log.Info("H264", $"Frame size: {frameData.Length}, encoder expects: {expectedSize} for {_width}x{_height}, diff: {frameData.Length - expectedSize}");
+                    }
+
+                    // FIRST: Handle stride padding from camera BEFORE any color conversion
+                    // This must happen on the original NV21 data
+                    if (frameData.Length > expectedSize)
+                    {
+                        // Frame larger than expected - has row stride padding
+                        // Need to remove padding row by row to avoid artifacts
+                        frameData = RemoveRowStridePadding(frameData, _width, _height);
+                    }
+                    else if (frameData.Length < expectedSize)
+                    {
+                        // Frame smaller than expected - pad
+                        byte[] padded = new byte[expectedSize];
+                        System.Buffer.BlockCopy(frameData, 0, padded, 0, frameData.Length);
+                        frameData = padded;
+                    }
+
+                    // THEN: Apply color format conversion if needed
+                    // YUV420Flexible can accept NV21 directly, NV12 needs conversion
+                    if (_selectedColorFormat != COLOR_FormatYUV420Flexible)
+                    {
+                        // Convert NV21 to NV12 for SemiPlanar format (now on stride-corrected data)
+                        frameData = ConvertNV21ToNV12(frameData);
+                    }
+
+                    // Ensure buffer can hold the entire frame
+                    if (inputBuffer.Capacity() < frameData.Length)
+                    {
+                        Log.Warn("H264MTK", $"Input buffer too small: {inputBuffer.Capacity()} < {frameData.Length}");
+                    }
+
+                    var dataSize = Math.Min(frameData.Length, inputBuffer.Capacity());
+                    inputBuffer.Put(frameData, 0, dataSize);
+
                     _encoder.QueueInputBuffer(inputIndex, 0, dataSize, frame.Timestamp, 0);
                     _lastTimestamp = frame.Timestamp;
                 }
@@ -495,6 +550,30 @@ public class H264Encoder : IDisposable
             Log.Error("H264MTK", $"Feed input error: {ex.Message}");
         }
     }
+    /// <summary>
+    /// Handles frame data that is larger than expected due to camera stride padding.
+    /// Uses simple truncation - takes only the expected bytes.
+    /// </summary>
+    private byte[] RemoveRowStridePadding(byte[] frameData, int width, int height)
+    {
+        int expectedSize = (width * height * 3) / 2;
+
+        // If frame matches or is smaller, handle simply
+        if (frameData.Length <= expectedSize)
+        {
+            if (frameData.Length == expectedSize)
+                return frameData;
+            byte[] paddedData = new byte[expectedSize];
+            System.Buffer.BlockCopy(frameData, 0, paddedData, 0, frameData.Length);
+            return paddedData;
+        }
+
+        // Simple truncation - just take the first expectedSize bytes
+        byte[] truncated = new byte[expectedSize];
+        System.Buffer.BlockCopy(frameData, 0, truncated, 0, expectedSize);
+        return truncated;
+    }
+
     private byte[] ConvertNV21ToNV12Pooled(byte[] nv21)
     {
         int ySize = _width * _height;
@@ -534,10 +613,11 @@ public class H264Encoder : IDisposable
     private bool DrainOutputBuffer(MediaCodec.BufferInfo bufferInfo, ref byte[]? sps, ref byte[]? pps, ref bool gotFirstOutput)
     {
         if (_encoder == null) return false;
-        
+
         try
         {
-            var outputIndex = _encoder.DequeueOutputBuffer(bufferInfo, 0);
+            // Wait up to 10ms for output (balances latency vs smooth playback)
+            var outputIndex = _encoder.DequeueOutputBuffer(bufferInfo, 10000);
             
             if (outputIndex >= 0)
             {
@@ -562,7 +642,7 @@ public class H264Encoder : IDisposable
                     outputBuffer.Position(bufferInfo.Offset);
                     outputBuffer.Limit(bufferInfo.Offset + bufferInfo.Size);
                     outputBuffer.Get(data);
-                    
+
                     // Check if this is config data
                     if ((bufferInfo.Flags & MediaCodecBufferFlags.CodecConfig) != 0)
                     {
@@ -571,9 +651,9 @@ public class H264Encoder : IDisposable
                     }
                     else
                     {
-                        // Regular frame
+                        // Regular frame - extract all NAL units properly
                         var nalUnits = new List<byte[]>();
-                        
+
                         // MediaTek might not include start codes, so add them
                         if (!HasStartCode(data))
                         {
@@ -587,9 +667,10 @@ public class H264Encoder : IDisposable
                         }
                         else
                         {
-                            nalUnits.Add(data);
+                            // Extract all NAL units (encoder may output multiple NALs in one buffer)
+                            nalUnits = ExtractNalUnits(data);
                         }
-                        
+
                         var frameEvent = new H264FrameEventArgs
                         {
                             NalUnits = nalUnits,
@@ -598,7 +679,7 @@ public class H264Encoder : IDisposable
                             Sps = sps,
                             Pps = pps
                         };
-                        
+
                         FrameEncoded?.Invoke(this, frameEvent);
                     }
                 }
@@ -636,7 +717,7 @@ public class H264Encoder : IDisposable
         return (data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1) ||
                (data[0] == 0 && data[1] == 0 && data[2] == 1);
     }
-    
+
     private void ParseConfigFrame(byte[] data, ref byte[]? sps, ref byte[]? pps)
     {
         // Parse the config frame for SPS/PPS
@@ -651,36 +732,53 @@ public class H264Encoder : IDisposable
             }
         }
     }
-    
+
     private List<byte[]> ExtractNalUnits(byte[] data)
     {
         var nalUnits = new List<byte[]>();
+
+        if (data.Length < 4)
+        {
+            if (data.Length > 0) nalUnits.Add(data);
+            return nalUnits;
+        }
+
         int i = 0;
-        
+
+        // Find first start code
         while (i < data.Length - 3)
         {
-            if ((i + 3 < data.Length && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) ||
-                (i + 4 < data.Length && data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1))
+            bool is4Byte = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1;
+            bool is3Byte = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1;
+
+            if (is4Byte || is3Byte)
             {
-                int startCodeLen = (data[i + 2] == 1) ? 3 : 4;
+                int startCodeLen = is4Byte ? 4 : 3;
                 int nalStart = i;
                 int nalEnd = data.Length;
-                
+
                 // Find next start code
-                for (int j = i + startCodeLen; j < data.Length - 3; j++)
+                for (int j = i + startCodeLen; j < data.Length - 2; j++)
                 {
-                    if ((data[j] == 0 && data[j + 1] == 0 && data[j + 2] == 1) ||
-                        (j + 3 < data.Length && data[j] == 0 && data[j + 1] == 0 && data[j + 2] == 0 && data[j + 3] == 1))
+                    bool next4Byte = (j + 3 < data.Length) &&
+                                     data[j] == 0 && data[j + 1] == 0 && data[j + 2] == 0 && data[j + 3] == 1;
+                    bool next3Byte = data[j] == 0 && data[j + 1] == 0 && data[j + 2] == 1;
+
+                    if (next4Byte || next3Byte)
                     {
                         nalEnd = j;
                         break;
                     }
                 }
-                
-                var nalUnit = new byte[nalEnd - nalStart];
-                Array.Copy(data, nalStart, nalUnit, 0, nalEnd - nalStart);
-                nalUnits.Add(nalUnit);
-                
+
+                int nalLength = nalEnd - nalStart;
+                if (nalLength > 0)
+                {
+                    var nalUnit = new byte[nalLength];
+                    System.Buffer.BlockCopy(data, nalStart, nalUnit, 0, nalLength);
+                    nalUnits.Add(nalUnit);
+                }
+
                 i = nalEnd;
             }
             else
@@ -688,13 +786,13 @@ public class H264Encoder : IDisposable
                 i++;
             }
         }
-        
-        // If no NAL units found, treat entire data as one NAL
+
+        // If no NAL units found, return the entire data as single NAL
         if (nalUnits.Count == 0 && data.Length > 0)
         {
             nalUnits.Add(data);
         }
-        
+
         return nalUnits;
     }
     
@@ -714,7 +812,7 @@ public class H264Encoder : IDisposable
                     Log.Debug("H264MTK", $"Got SPS from format: {sps.Length} bytes");
                 }
             }
-            
+
             if (format.ContainsKey("csd-1"))
             {
                 var ppsBuffer = format.GetByteBuffer("csd-1");

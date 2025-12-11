@@ -708,8 +708,8 @@ Server.OnClientsChange += (clients) => {
 ### Medium Term (v1.2-1.3)
 - ⬜ Add H.265 (HEVC) codec support
 - ✅ Reduce streaming latency (target: <100ms)
-- ⬜ Add comprehensive code documentation
-- ⬜ NuGet package distribution
+- ✅ Add comprehensive code documentation
+- ✅ NuGet package distribution
 - ⬜ Add unit tests and integration tests
 
 ### Long Term (v2.0+)
@@ -818,6 +818,94 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
   - Problem: The encoder thread (writing a new frame) and the network thread (reading that frame) were using the same lock. This meant one thread often had to wait for the other, causing a "hiccup" in frame delivery.
 
   - Fix: This lock has been completely replaced with a high-performance, lock-free Interlocked.Exchange operation. This allows the encoder and network threads to swap frame data atomically without ever blocking each other, resulting in a smoother handoff from camera to network.
+
+- v1.4.0: Major H.264 Codec Overhaul and VLC Compatibility Fix. This release addresses critical issues in the H.264 implementation that caused stutter, timing problems, and complete playback failure on VLC and other strict players.
+
+  - Fixed Critical Timestamp Unit Mismatch:
+
+  - Problem: The encoder outputs timestamps in microseconds (PresentationTimeUs), but the server was treating them as nanoseconds. This resulted in RTP timestamps being 1000x smaller than expected, causing massive stutter, frame overlap, and timing desynchronization.
+
+  - Fix: The timestamp conversion in `EncoderTimestampToRtp` now correctly converts microseconds to RTP units using fixed-point arithmetic: `(deltaUs * 9 + 50) / 100` (equivalent to `deltaUs * 90000 / 1_000_000`).
+
+  - Added VLC Compatibility (sprop-parameter-sets in SDP):
+
+  - Problem: VLC and many strict players require `sprop-parameter-sets` in the SDP to initialize the H.264 decoder. Without this, VLC would fail to decode the stream entirely.
+
+  - Fix: The SDP now dynamically includes base64-encoded SPS and PPS in the `a=fmtp` line when available. The server caches these parameter sets as they're received from the encoder.
+
+  - Fixed NAL Unit Extraction (Multiple NALs per Frame):
+
+  - Problem: The encoder was treating each output buffer as a single NAL unit, even when it contained multiple NAL units (e.g., SEI + IDR, or SPS + PPS combined). This caused incomplete frames and decoder confusion.
+
+  - Fix: Added `ExtractNalUnitsFromFrame` method that properly parses start codes and extracts all NAL units from encoder output. The server now sends each NAL unit as a separate RTP packet (or FU-A fragmented if large).
+
+  - Fixed SPS/PPS Start Code Handling:
+
+  - Problem: When extracting SPS/PPS from MediaFormat's csd-0/csd-1 buffers, the code assumed specific start code formats. Some encoders provide raw NAL data without start codes, others use 3-byte or 4-byte start codes.
+
+  - Fix: Added robust `GetStartCodeLength`, `GetNalType`, and `EnsureStartCode` helper methods that handle all cases. Parameter sets are now normalized to 4-byte start codes for consistent handling.
+
+  - Fixed Multi-Client Frame Delivery:
+
+  - Problem: Using `Interlocked.Exchange` with null replacement caused frames to be consumed by one client, leaving other clients without frames.
+
+  - Fix: Changed to non-destructive frame reading where each client tracks its own last-sent timestamp. Multiple clients can now receive the same frame, and per-client timestamp tracking prevents duplicate sends.
+
+  - Improved Frame Dropping Strategy:
+
+  - Problem: The encoder was aggressively dropping frames (keeping only 2 max), which could break B-frame prediction chains and cause visible stutter.
+
+  - Fix: Frame queue limit increased to 3 with single-frame-at-a-time dropping. This provides better buffering while maintaining low latency.
+
+  - Added RTCP Sender Reports:
+
+  - Problem: VLC and other players use RTCP Sender Reports (SR) for clock synchronization and jitter buffer management. Without SR packets, players may exhibit poor sync and choppy playback.
+
+  - Fix: The server now sends RTCP Sender Reports every 5 seconds. Each SR includes NTP timestamp, RTP timestamp, packet count, and octet count as per RFC 3550.
+
+  - Enhanced Code Documentation:
+
+  - Added XML documentation comments to all major methods explaining their purpose, parameters, and behavior.
+  - Improved code readability with clear comments explaining RTP/RTCP protocol details.
+
+- v1.4.1: Client Connection Management Overhaul and H.264 Reliability Fix. This release addresses critical issues with abrupt client disconnection handling and encoder buffer size mismatches that caused delayed reconnections and missing video.
+
+  - Fixed Critical Client Collection Bug (ConcurrentBag → ConcurrentDictionary):
+
+  - Problem: The server used `ConcurrentBag<Client>` with `TryTake()` for client cleanup. `TryTake()` removes a **random** element, not the specific client being cleaned up. This corrupted the client list over time, causing ghost clients and preventing proper cleanup.
+
+  - Fix: Replaced `ConcurrentBag<Client>` with `ConcurrentDictionary<string, Client>`. Client cleanup now uses `TryRemove(client.Id, out _)` to remove the exact client being disconnected.
+
+  - Added TCP Connection Timeout Detection:
+
+  - Problem: `Socket.Connected` does not detect abrupt disconnections (network failure, process kill). The server would continue trying to stream to dead clients, blocking resources and preventing new clients from receiving video.
+
+  - Fix: Added comprehensive connection health tracking:
+    - `LastActivityTime` tracks last successful send per client
+    - `ConsecutiveSendErrors` counts sequential failures
+    - 5-second send timeout using `CancellationTokenSource` detects stuck connections
+    - 30-second inactivity timeout in streaming loop catches zombie connections
+    - Client marked as disconnected after 3 consecutive errors or socket exception
+
+  - Fixed H.264 Encoder Buffer Size Mismatch:
+
+  - Problem: The encoder was initialized with camera-reported dimensions (e.g., 640x480), but some cameras send frames with different actual sizes (e.g., 640x640). This caused `Input buffer too small` errors and dropped frames.
+
+  - Fix: Added `CalculateDimensionsFromFrameSize()` method that:
+    - Checks common resolutions against actual YUV420 frame size
+    - Calculates dimensions using width/height hints when possible
+    - Falls back to square aspect ratio calculation
+    - Ensures encoder is always initialized with correct frame dimensions
+
+  - Improved UDP Error Handling:
+
+  - Problem: UDP send errors weren't properly tracked, allowing broken connections to persist.
+
+  - Fix: UDP sends now track activity time and consecutive errors. Clients are disconnected after 5 consecutive UDP errors or when network is unreachable.
+
+  - Enhanced Error Logging:
+
+  - Added detailed logging for connection timeouts, send failures, and dimension mismatches to aid debugging.
 
 ---
 
