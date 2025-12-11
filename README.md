@@ -907,6 +907,57 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
 
   - Added detailed logging for connection timeouts, send failures, and dimension mismatches to aid debugging.
 
+- v1.5.0: Stability and Performance Improvements. This release focuses on connection reliability, faster disconnection detection, smoother video playback, and reduced latency.
+
+  - Improved Socket Disconnection Detection:
+
+  - Problem: `Socket.Connected` property doesn't reliably detect abrupt TCP disconnections (client crash, network loss, etc.). The server would continue streaming to dead connections for extended periods.
+
+  - Fix: Added `IsSocketConnected()` method that uses `Socket.Poll()` to actively probe connection state. If poll returns readable but no data is available, the connection is confirmed closed. This detects dead connections within seconds instead of minutes.
+
+  - Reduced Reconnection Time (WatchDog Optimization):
+
+  - Problem: WatchDog ran every 60 seconds, causing long delays before the server detected all clients were gone and could reset state for new connections.
+
+  - Fix: WatchDog interval reduced to 5 seconds. Also improved logic to check `IsPlaying` status alongside socket connection, actively clean up dead clients, and clear SPS/PPS caches when resetting streaming state.
+
+  - Fixed Frame Queue for Smoother Playback:
+
+  - Problem: H.264 frames were stored in single variables (`_latestH264FrameBack/Front`) using `Interlocked.Exchange`. If the encoder produced frames faster than they could be sent, frames would be overwritten and lost, causing stuttering.
+
+  - Fix: Replaced single frame variables with `ConcurrentQueue<H264FrameEventArgs>` (max 5 frames buffer). Frames are now queued and sent in order, preventing loss during brief processing delays.
+
+  - Optimized Encoder Input/Output Handling:
+
+  - Problem: Encoder used 0ms timeout for buffer operations, causing missed buffers and aggressive frame dropping (max 1 frame in queue).
+
+  - Fix:
+    - Input buffer dequeue timeout increased to 10ms
+    - Output buffer dequeue timeout increased to 10ms
+    - Frame queue limit increased from 1 to 3 frames
+    - Re-enabled sleep in encoding loop to prevent CPU spinning
+
+  - Reduced Streaming Latency:
+
+  - Fix: Multiple latency optimizations applied:
+    - Socket buffers reduced from 256KB to 64KB (less buffering delay)
+    - TCP_NODELAY explicitly set on all connections
+    - I-frame interval reduced from 2s to 1s (faster stream recovery)
+    - Inactivity timeout reduced from 30s to 10s (faster dead connection cleanup)
+
+  - Enhanced Connection Health Checks:
+
+  - Fix: Streaming loop now checks three conditions before each frame:
+    - `IsSocketConnected()` for active connection state
+    - Inactivity timeout (10 seconds with no successful send)
+    - Consecutive send errors (disconnects after 3 failures)
+
+  - Fixed Frame Stride Padding Handling:
+
+  - Problem: Android cameras may include row stride padding in YUV frames, causing buffer size mismatches (e.g., 640x480 camera sending 614,398 bytes instead of expected 460,800).
+
+  - Fix: Added frame size normalization via truncation to expected size. While this may cause minor artifacts on some devices, it prevents encoder crashes and ensures video delivery.
+
 ---
 
 **Thanks for checking out Balu Media Server!** 
