@@ -1,7 +1,7 @@
 # 📡 Balu Media Server - MAUI RTSP Server for Android
 
 [![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](https://choosealicense.com/licenses/mit/)
-[![.NET](https://img.shields.io/badge/.NET-8.0-purple.svg)](https://dotnet.microsoft.com/)
+[![.NET](https://img.shields.io/badge/.NET-9.0-purple.svg)](https://dotnet.microsoft.com/)
 [![Android](https://img.shields.io/badge/Android-8.0%2B-green.svg)](https://developer.android.com/)
 [![Platform](https://img.shields.io/badge/Platform-Android-brightgreen.svg)](https://developer.android.com/)
 
@@ -62,14 +62,14 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 ## 🛠️ Installation
 
 ### Prerequisites
-- .NET 8.0 or later
+- .NET 9.0 or later (partial support on .NET 8.0)
 - Android SDK API Level 26+ (Android 8.0+)
 - Visual Studio 2022 with MAUI workload
 - Android device or emulator
 
 ### NuGet Package
 ```xml
-<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.1.9" />
+<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.1" />
 ```
 
 ### Manual Installation
@@ -288,16 +288,63 @@ public Server(
     int Port = 7778,                           // RTSP server port
     int MaxClients = 100,                      // Maximum concurrent clients
     string Address = "0.0.0.0",               // Bind address
-    Dictionary<string, string> Users,           // Authentication users (required)
-    bool BackCameraEnabled = true,              // Enable or disable back camera
-    bool FrontCameraEnabled = true,             // Enable or disable front camera
-    bool AuthRequired = true,                   // Disable full auth ignoring if a Users dict was passed (recommended just for testing)
-    int MjpegServerQuality = 80                 // Sets a default Mjpeg Image compression quality by default, ideal if the image to display is small, avoiding using too much CPU
+    Dictionary<string, string>? Users = null,  // Authentication users (optional, default admin user is created)
+    bool BackCameraEnabled = true,             // Enable or disable back camera
+    bool FrontCameraEnabled = true,            // Enable or disable front camera
+    bool AuthRequired = true,                  // Disable full auth ignoring if a Users dict was passed (recommended just for testing)
+    int MjpegServerQuality = 80,               // Sets a default Mjpeg Image compression quality
+    int MjpegServerPort = 8089,                // MJPEG HTTP server port
+    bool UseHttps = false,                     // Enable HTTPS for MJPEG server
+    string? CertificatePath = null,            // Path to SSL certificate
+    string? CertificatePassword = null         // Certificate password
 )
 
 public Server(
     ServerConfiguration config // Simple class to configure the server
 )
+```
+
+### ServerConfiguration Class
+
+A configuration class that simplifies server initialization with all available options.
+
+```csharp
+public class ServerConfiguration
+{
+    public int Port { get; set; } = 7778;                           // RTSP server port
+    public int MaxClients { get; set; } = 10;                       // Maximum concurrent clients
+    public Dictionary<string, string> Users { get; set; } = new();  // Authentication users
+    public int MjpegServerQuality { get; set; } = 80;               // MJPEG compression quality
+    public int MjpegServerPort { get; set; } = 8089;                // MJPEG HTTP server port
+    public bool AuthRequired { get; set; } = true;                  // Enable authentication
+    public bool FrontCameraEnabled { get; set; } = true;            // Enable front camera
+    public bool BackCameraEnabled { get; set; } = true;             // Enable back camera
+    public bool StartMjpegServer { get; set; } = true;              // Auto-start MJPEG server
+    public string BaseAddress { get; set; } = "0.0.0.0";            // Bind address
+    public VideoProfile PrimaryProfile { get; set; } = new();       // Primary video profile
+    public VideoProfile SecondaryProfile { get; set; } = new();     // Secondary video profile
+
+    // HTTPS configuration for MJPEG server
+    public bool UseHttps { get; set; } = false;                     // Enable HTTPS
+    public string? CertificatePath { get; set; }                    // SSL certificate path
+    public string? CertificatePassword { get; set; }                // Certificate password
+}
+```
+
+### VideoProfile Class
+
+Configuration for video encoding parameters.
+
+```csharp
+public class VideoProfile
+{
+    public string Name { get; set; } = "";                  // Profile name (used in URL path)
+    public int Height { get; set; } = 640;                  // Video height
+    public int Width { get; set; } = 480;                   // Video width
+    public int MaxBitrate { get; set; } = 4000000;          // Maximum bitrate (bps)
+    public int MinBitrate { get; set; } = 500000;           // Minimum bitrate (bps)
+    public int Quality { get; set; } = 80;                  // JPEG quality (10-100)
+}
 ```
 
 #### Methods
@@ -342,7 +389,16 @@ HTTP server for MJPEG streaming, perfect for web browser integration.
 
 #### Constructor
 ```csharp
-public MjpegServer(int port = 8089, int quality = 80)
+public MjpegServer(
+    int port = 8089,                              // HTTP server port
+    int quality = 30,                             // JPEG compression quality (1-100)
+    string bindAddress = "*",                     // Bind address ("*" for all interfaces)
+    bool authEnabled = false,                     // Enable Basic HTTP authentication
+    Dictionary<string, string>? users = null,    // Authentication users
+    bool useHttps = false,                        // Enable HTTPS
+    string? certificatePath = null,              // Path to SSL certificate
+    string? certificatePassword = null           // Certificate password
+)
 ```
 
 #### Methods
@@ -520,7 +576,7 @@ private async void StartPeriodicSnapshots()
 
 ### HTTP MJPEG URLs
 - **Back Camera**: `http://your-ip:8089/Back/`
-- **Front Camera**: `http://your-ip:8090/Front/`
+- **Front Camera**: `http://your-ip:8089/Front/`
 
 ### Connecting with Popular Clients
 
@@ -687,29 +743,30 @@ Server.OnClientsChange += (clients) => {
 ## ⚠️ Current Limitations
 
 - **Platform Support**: Only Android 8.0+ (API 26+) is currently supported
-- **Framework Support**: Currently tested only with .NET 9.0 (Partial support on .NET 8.0)
-- **Configuration**: Limited runtime configuration options for codec parameters
-- **Documentation**: No comprehensive API documentation yet (this README serves as primary docs)
+- **Framework Support**: Tested with .NET 9.0 (partial support on .NET 8.0)
 - **iOS Support**: Not available (long-term roadmap item)
-- **Image orientation**: Some devices can experiment image rotation
-- **Image blazor preview**: Some devices can experiment some issues displaying the images fetched from the MJPEG Server, this can depend if the devices allow access to LoopBack or not (Not fixable at all)
+- **Image orientation**: Some devices may experience image rotation issues
+- **Blazor preview**: Some devices may experience issues displaying images from the MJPEG Server, depending on LoopBack access restrictions
 
 
 ## 🛣️ Roadmap
 
-### Short Term (v1.1)
+### Completed (v1.1-v1.5)
 - ✅ Fix H.264 stream stutter issues
 - ✅ Add support for multiple profiles/routes (`/live/front`, `/live/back`)
 - ✅ Add user/password control panel
-- ⬜ Fix image rotation
 - ✅ Add bitrate/resolution configuration
-- ✅ **Fix UDP transport reliability issues** (currently TCP is recommended FIXED)
-
-### Medium Term (v1.2-1.3)
-- ⬜ Add H.265 (HEVC) codec support
+- ✅ Fix UDP transport reliability issues
 - ✅ Reduce streaming latency (target: <100ms)
 - ✅ Add comprehensive code documentation
 - ✅ NuGet package distribution
+- ✅ External network access for MJPEG server
+- ✅ HTTPS support for MJPEG server
+- ✅ Basic authentication for MJPEG server
+
+### Planned (v1.6+)
+- ⬜ Fix image rotation on some devices
+- ⬜ Add H.265 (HEVC) codec support
 - ⬜ Add unit tests and integration tests
 
 ### Long Term (v2.0+)
@@ -957,6 +1014,59 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
   - Problem: Android cameras may include row stride padding in YUV frames, causing buffer size mismatches (e.g., 640x480 camera sending 614,398 bytes instead of expected 460,800).
 
   - Fix: Added frame size normalization via truncation to expected size. While this may cause minor artifacts on some devices, it prevents encoder crashes and ensures video delivery.
+
+- v1.5.1: MJPEG Server External Access and Improvements. This release enables external device access to the MJPEG stream, making it usable from any device on the network via a simple `<img>` tag.
+
+  - Enabled External Network Access:
+
+  - Problem: MJPEG server was hardcoded to bind to `127.0.0.1` (localhost only), making it impossible for external devices to access the stream.
+
+  - Fix: Changed default binding to `0.0.0.0` (all interfaces). Added configurable `bindAddress` parameter and wildcard prefix support for broader compatibility.
+
+  - Added Optional Basic Authentication:
+
+  - Problem: When exposed to the network, the MJPEG stream had no authentication, creating a security risk.
+
+  - Fix: Added optional Basic HTTP authentication. When `AuthRequired` is enabled, clients must provide valid credentials. Authentication uses the same user database as the RTSP server.
+
+  - Added CORS Headers for Web Integration:
+
+  - Fix: MJPEG responses now include proper CORS headers (`Access-Control-Allow-Origin: *`) and cache control headers, enabling seamless integration with web pages on any domain.
+
+  - Fixed Front Camera Client Handling:
+
+  - Problem: `WriteDataAsync` only checked `_clientsBack` dictionary for client ID lookup, causing Front camera clients to not receive frames properly.
+
+  - Fix: Added `isBackCamera` parameter to correctly handle both Front and Back camera clients with proper dictionary lookups.
+
+  - Added Per-Client Timeout with Slow Client Protection:
+
+  - Problem: One slow client could block frame delivery to all other clients due to `Task.WhenAll()` waiting for everyone.
+
+  - Fix: Added `WriteDataAsyncWithTimeout()` wrapper with 2-second timeout per client. Slow clients are automatically disconnected without affecting others.
+
+  - Fixed Memory Leak in Client Tracking:
+
+  - Problem: `_clientLastFrameTime` dictionary was never cleaned up when clients disconnected, causing memory accumulation.
+
+  - Fix: Client IDs are now properly removed from `_clientLastFrameTime` in all cleanup paths (normal disconnect, timeout, error).
+
+  - Added Client Count Properties:
+
+  - Fix: Added `ClientCount`, `BackClientCount`, and `FrontClientCount` properties for monitoring connected MJPEG clients.
+
+  - Added MjpegServerPort Configuration:
+
+  - Fix: MJPEG server port is now configurable via `ServerConfiguration.MjpegServerPort` (default: 8089) or constructor parameter.
+
+  **Usage Example (External Access)**:
+  ```html
+  <!-- From any device on the network -->
+  <img src="http://192.168.1.100:8089/Back/" alt="Live Stream" />
+
+  <!-- With authentication -->
+  <img src="http://admin:password123@192.168.1.100:8089/Back/" alt="Live Stream" />
+  ```
 
 ---
 

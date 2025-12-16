@@ -56,7 +56,7 @@ public class Server : IDisposable
     public static event EventHandler<bool>? OnStreaming;
     public static event EventHandler<FrameEventArgs>? OnNewFrontFrame, OnNewBackFrame;
     public bool IsRunning { get; private set; } = false;
-    public Server(int Port = 7778, int MaxClients = 100, string Address = "0.0.0.0", Dictionary<string, string>? Users = null, bool BackCameraEnabled = true, bool FrontCameraEnabled = true, bool AuthRequired = true, int MjpegServerQuality = 80)
+    public Server(int Port = 7778, int MaxClients = 100, string Address = "0.0.0.0", Dictionary<string, string>? Users = null, bool BackCameraEnabled = true, bool FrontCameraEnabled = true, bool AuthRequired = true, int MjpegServerQuality = 80, int MjpegServerPort = 8089, bool UseHttps = false, string? CertificatePath = null, string? CertificatePassword = null)
     {
         EventBuss.Command += OnCommandSend;
         _enabled = true;
@@ -70,7 +70,17 @@ public class Server : IDisposable
                 else
                     AddUser(item.Key, item.Value);
         _mjpegServerQuality = MjpegServerQuality;
-        _mjpegServer = new(quality: _mjpegServerQuality);
+        // Pass auth settings and bind address to MJPEG server for external access
+        _mjpegServer = new(
+            port: MjpegServerPort,
+            quality: _mjpegServerQuality,
+            bindAddress: Address,
+            authEnabled: AuthRequired,
+            users: _users.ToDictionary(kvp => kvp.Key, kvp => kvp.Value),
+            useHttps: UseHttps,
+            certificatePath: CertificatePath,
+            certificatePassword: CertificatePassword
+        );
         _authRequired = AuthRequired;
         _frontCameraEnabled = FrontCameraEnabled;
         _backCameraEnabled = BackCameraEnabled;
@@ -79,6 +89,8 @@ public class Server : IDisposable
         _frontService.ErrorOccurred += LogError;
         ConfigureSocket();
     }
+    public bool IsStreaming() => _isStreaming;
+    public bool MjpegServerStreaming() => _mjpegServer.IsStreaming();
     public Server(ServerConfiguration configuration)
     {
         EventBuss.Command += OnCommandSend;
@@ -92,7 +104,19 @@ public class Server : IDisposable
                 else
                     AddUser(item.Key, item.Value);
         _mjpegServerQuality = configuration.MjpegServerQuality;
-        _mjpegServer = new(quality: _mjpegServerQuality);
+        // Pass auth settings and bind address to MJPEG server for external access
+        _mjpegServer = new(
+            port: configuration.MjpegServerPort,
+            quality: _mjpegServerQuality,
+            bindAddress: configuration.BaseAddress,
+            authEnabled: configuration.AuthRequired,
+            users: _users.ToDictionary(kvp => kvp.Key, kvp => kvp.Value),
+            useHttps: configuration.UseHttps,
+            certificatePath: configuration.CertificatePath,
+            certificatePassword: configuration.CertificatePassword
+        );
+        if (configuration.StartMjpegServer)
+            _mjpegServer.Start(true);
         _authRequired = configuration.AuthRequired;
         _frontCameraEnabled = configuration.FrontCameraEnabled;
         _backCameraEnabled = configuration.BackCameraEnabled;
@@ -167,7 +191,7 @@ public class Server : IDisposable
                     }
                     break;
                 case BussCommand.STOP_CAMERA_FRONT:
-                    if (!_isStreaming && _isCapturingFront && _frontCameraEnabled)
+                    if (!_isStreaming && _isCapturingFront && _frontCameraEnabled && !_mjpegServer.IsStreaming())
                     {
                         if (!IsRunning)
                         {
@@ -190,7 +214,7 @@ public class Server : IDisposable
                     }
                     break;
                 case BussCommand.STOP_CAMERA_BACK:
-                    if (!_isStreaming && _isCapturingBack && _backCameraEnabled)
+                    if (!_isStreaming && _isCapturingBack && _backCameraEnabled && !_mjpegServer.IsStreaming())
                     {
                         if (!IsRunning)
                         {
