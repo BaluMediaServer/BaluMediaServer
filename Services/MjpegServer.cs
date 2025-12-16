@@ -9,8 +9,13 @@ using BaluMediaServer.Models;
 using BaluMediaServer.Repositories;
 using Java.Lang;
 using JetBrains.Annotations;
+
 namespace BaluMediaServer.Services;
 
+/// <summary>
+/// HTTP server for MJPEG streaming, providing web browser-compatible video streams.
+/// Supports both front and back camera streams with optional HTTPS and Basic authentication.
+/// </summary>
 public class MjpegServer : IDisposable
 {
     private readonly HttpListener _listener;
@@ -32,6 +37,17 @@ public class MjpegServer : IDisposable
     private string? _certificatePath;
     private string? _certificatePassword;
 
+    /// <summary>
+    /// Initializes a new instance of the <see cref="MjpegServer"/> class.
+    /// </summary>
+    /// <param name="port">The HTTP server port. Default is 8089.</param>
+    /// <param name="quality">The JPEG compression quality (1-100). Default is 30.</param>
+    /// <param name="bindAddress">The address to bind to ("*" for all interfaces). Default is "*".</param>
+    /// <param name="authEnabled">Whether to enable Basic HTTP authentication. Default is false.</param>
+    /// <param name="users">Dictionary of username/password pairs for authentication.</param>
+    /// <param name="useHttps">Whether to use HTTPS instead of HTTP. Default is false.</param>
+    /// <param name="certificatePath">Path to the SSL certificate file for HTTPS.</param>
+    /// <param name="certificatePassword">Password for the SSL certificate.</param>
     public MjpegServer(int port = 8089, int quality = 30, string bindAddress = "*",
         bool authEnabled = false, Dictionary<string, string>? users = null,
         bool useHttps = false, string? certificatePath = null, string? certificatePassword = null)
@@ -65,7 +81,15 @@ public class MjpegServer : IDisposable
         Server.OnNewFrontFrame += OnFrontFrameAvailable;
         _watchdog = Task.Run(Watchdog, _cts.Token);
     }
+    /// <summary>
+    /// Gets a value indicating whether the server is currently streaming.
+    /// </summary>
+    /// <returns><c>true</c> if streaming is active; otherwise, <c>false</c>.</returns>
     public bool IsStreaming() => _streamStarted;
+
+    /// <summary>
+    /// Releases all resources used by the MJPEG server.
+    /// </summary>
     public void Dispose()
     {
         _cts?.Cancel();
@@ -148,6 +172,11 @@ public class MjpegServer : IDisposable
             Task.Run(async () => await PushFrontFrameAsync(jpegData), _cts.Token);
         }
     }
+    /// <summary>
+    /// Starts the MJPEG HTTP server and optionally begins camera streaming.
+    /// </summary>
+    /// <param name="StartWithoutStream">If true, starts the server without automatically starting cameras.
+    /// Cameras will start on-demand when the first client connects.</param>
     public void Start(bool StartWithoutStream = false)
     {
         try
@@ -174,6 +203,9 @@ public class MjpegServer : IDisposable
         
     }
 
+    /// <summary>
+    /// Stops the MJPEG server and disconnects all clients.
+    /// </summary>
     public void Stop()
     {
         _clientsBack.Clear();
@@ -410,6 +442,11 @@ public class MjpegServer : IDisposable
         }
     }
 
+    /// <summary>
+    /// Pushes a JPEG frame to all connected back camera clients.
+    /// </summary>
+    /// <param name="jpegBytes">The JPEG-encoded frame data.</param>
+    /// <returns>A task that represents the asynchronous operation.</returns>
     public async Task PushBackFrameAsync(byte[] jpegBytes)
     {
         if (_clientsBack.IsEmpty)
@@ -431,6 +468,11 @@ public class MjpegServer : IDisposable
         }
     }
 
+    /// <summary>
+    /// Pushes a JPEG frame to all connected front camera clients.
+    /// </summary>
+    /// <param name="jpegBytes">The JPEG-encoded frame data.</param>
+    /// <returns>A task that represents the asynchronous operation.</returns>
     public async Task PushFrontFrameAsync(byte[] jpegBytes)
     {
         if (_clientsFront.IsEmpty)

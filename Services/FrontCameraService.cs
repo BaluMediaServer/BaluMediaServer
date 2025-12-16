@@ -10,6 +10,10 @@ using Microsoft.Maui.ApplicationModel;
 
 namespace BaluMediaServer.Platforms.Android.Services;
 
+/// <summary>
+/// Service for capturing frames from the front-facing camera.
+/// Implements the Android camera callback interface and provides frame data via events.
+/// </summary>
 public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCameraFrameCallback
 {
     private CameraFrameCaptureService? _cameraCapture;
@@ -18,16 +22,39 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
     private Channel<VideoFrame> _videoFrames;
     private Task? _thread;
     private DateTime _lastFrameTime;
-    private readonly TimeSpan _minFrameInterval = TimeSpan.FromMilliseconds(22); // +- 45 fps 
+    private readonly TimeSpan _minFrameInterval = TimeSpan.FromMilliseconds(22); // +- 45 fps
+
+    /// <summary>
+    /// Event raised when a new frame is received and processed from the camera.
+    /// </summary>
     public event EventHandler<FrameEventArgs>? FrameReceived;
+
+    /// <summary>
+    /// Event raised when an error occurs during camera operations.
+    /// </summary>
     public event EventHandler<string>? ErrorOccurred;
+
+    /// <summary>
+    /// Indicates whether the frame processing thread is running.
+    /// </summary>
     public bool _threadRunning = false;
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="FrontCameraService"/> class.
+    /// Sets up the camera capture service with the front camera callback.
+    /// </summary>
     public FrontCameraService()
     {
         _context = Platform.CurrentActivity ?? global::Android.App.Application.Context;
         _cameraCapture = new CameraFrameCaptureService(_context);
         _cameraCapture.SetFrontCameraCallback(this);
     }
+
+    /// <summary>
+    /// Starts capturing frames from the front camera at the specified resolution.
+    /// </summary>
+    /// <param name="width">The desired capture width in pixels. Default is 640.</param>
+    /// <param name="height">The desired capture height in pixels. Default is 480.</param>
     public void StartCapture(int width = 640, int height = 480)
     {
         try
@@ -48,6 +75,10 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
             ErrorOccurred?.Invoke(this, $"Failed to start capture: {ex.Message}");
         }
     }
+
+    /// <summary>
+    /// Stops the front camera capture and completes the frame channel.
+    /// </summary>
     public void StopCapture()
     {
         try
@@ -61,7 +92,12 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
             ErrorOccurred?.Invoke(this, $"Failed to stop capture: {ex.Message}");
         }
     }
-    // IFrameCallback implementation
+
+    /// <summary>
+    /// Callback invoked by the native camera service when a new frame is available.
+    /// Implements rate limiting and queues frames for processing.
+    /// </summary>
+    /// <param name="frame">The video frame from the camera.</param>
     public void OnFrameAvailable(VideoFrame frame)
     {
         try
@@ -84,6 +120,11 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
             frame?.Dispose();
         }
     }
+
+    /// <summary>
+    /// Processes a single video frame and raises the FrameReceived event.
+    /// </summary>
+    /// <param name="frame">The video frame to process.</param>
     public void ProcessFrame(VideoFrame frame)
     {
         var args = new FrameEventArgs
@@ -97,6 +138,11 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
         };
         FrameReceived?.Invoke(this, args);
     }
+
+    /// <summary>
+    /// Continuously processes frames from the channel until cancelled.
+    /// </summary>
+    /// <returns>A task that represents the asynchronous frame processing operation.</returns>
     public async Task ProcessFramesAsync()
     {
         while (!_cts.IsCancellationRequested && _threadRunning)
@@ -124,10 +170,20 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
             }
         }
     }
+
+    /// <summary>
+    /// Raises the ErrorOccurred event with the specified error message.
+    /// </summary>
+    /// <param name="error">The error message to report.</param>
     public void OnError(string error)
     {
         ErrorOccurred?.Invoke(this, error);
     }
+
+    /// <summary>
+    /// Releases all resources used by the front camera service.
+    /// </summary>
+    /// <param name="disposing">True to release both managed and unmanaged resources.</param>
     protected override void Dispose(bool disposing)
     {
         if (disposing)

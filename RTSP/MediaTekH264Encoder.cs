@@ -9,6 +9,10 @@ using System.Buffers;
 
 namespace BaluMediaServer.Services;
 
+/// <summary>
+/// H.264 hardware encoder optimized for MediaTek chipsets.
+/// Provides low-latency encoding with MediaTek-specific optimizations.
+/// </summary>
 public class MediaTekH264Encoder : IDisposable
 {
     private MediaCodec? _encoder;
@@ -31,14 +35,35 @@ public class MediaTekH264Encoder : IDisposable
     private const int COLOR_FormatYUV420Flexible = 2135033992;
     private long _lastTimestamp = 0;
     private readonly Stopwatch _stopwatch = new();
+
+    /// <summary>
+    /// Event raised when a frame has been encoded and is ready for streaming.
+    /// </summary>
     public event EventHandler<H264FrameEventArgs>? FrameEncoded;
-    
+
+    /// <summary>
+    /// Represents frame data waiting to be encoded.
+    /// </summary>
     public class FrameData
     {
+        /// <summary>
+        /// Gets or sets the raw YUV frame data.
+        /// </summary>
         public byte[] Data { get; set; } = Array.Empty<byte>();
+
+        /// <summary>
+        /// Gets or sets the presentation timestamp in microseconds.
+        /// </summary>
         public long Timestamp { get; set; }
     }
-    
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="MediaTekH264Encoder"/> class.
+    /// </summary>
+    /// <param name="width">The video width in pixels.</param>
+    /// <param name="height">The video height in pixels.</param>
+    /// <param name="bitrate">The target bitrate in bits per second. Default is 2,000,000.</param>
+    /// <param name="frameRate">The target frame rate. Default is 30.</param>
     public MediaTekH264Encoder(int width, int height, int bitrate = 2000000, int frameRate = 30)
     {
         _width = width;
@@ -47,12 +72,16 @@ public class MediaTekH264Encoder : IDisposable
         _frameRate = frameRate;
     }
     
+    /// <summary>
+    /// Starts the H.264 encoder with MediaTek-specific optimizations.
+    /// </summary>
+    /// <returns><c>true</c> if the encoder started successfully; otherwise, <c>false</c>.</returns>
     public bool Start()
     {
         lock (_lock)
         {
             if (_isRunning) return true;
-            
+
             try
             {
                 // Create format with standard color format
@@ -138,12 +167,16 @@ public class MediaTekH264Encoder : IDisposable
             }
         }
     }
+    /// <summary>
+    /// Updates the encoder bitrate dynamically without restarting.
+    /// </summary>
+    /// <param name="newBitrate">The new bitrate in bits per second.</param>
     public void UpdateBitrate(int newBitrate)
     {
         lock (_lock)
         {
             if (!_isRunning || _encoder == null) return;
-            
+
             try
             {
                 // Create a Bundle with the new bitrate
@@ -164,10 +197,15 @@ public class MediaTekH264Encoder : IDisposable
             }
         }
     }
+    /// <summary>
+    /// Queues a raw YUV frame for encoding.
+    /// Drops older frames if queue backs up to minimize latency.
+    /// </summary>
+    /// <param name="frameData">The raw YUV420 frame data.</param>
     public void QueueFrame(byte[] frameData)
     {
         if (!_isRunning) return;
-        
+
         // Use actual time for timestamps to prevent stuttering
         if (!_stopwatch.IsRunning)
         {
@@ -229,10 +267,15 @@ public class MediaTekH264Encoder : IDisposable
         Log.Debug("H264MTK", "Encoding loop ended");
     }
     
+    /// <summary>
+    /// Feeds a frame into the encoder's input buffer.
+    /// Converts NV21 to NV12 format as required by the encoder.
+    /// </summary>
+    /// <param name="frame">The frame data to encode.</param>
     public void FeedInputBuffer(FrameData frame)
     {
         if (_encoder == null) return;
-        
+
         try
         {
             // Single attempt with no timeout for lower latency
@@ -538,6 +581,9 @@ public class MediaTekH264Encoder : IDisposable
         return nv12;
     }
     
+    /// <summary>
+    /// Stops the encoder and releases all resources.
+    /// </summary>
     public void Stop()
     {
         lock (_lock)
@@ -561,6 +607,9 @@ public class MediaTekH264Encoder : IDisposable
         }
     }
     
+    /// <summary>
+    /// Releases all resources used by the encoder.
+    /// </summary>
     public void Dispose()
     {
         Stop();

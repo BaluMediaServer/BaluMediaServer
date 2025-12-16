@@ -9,6 +9,10 @@ using System.Buffers;
 
 namespace BaluMediaServer.Services;
 
+/// <summary>
+/// General-purpose H.264 hardware encoder with automatic encoder selection.
+/// Selects the best available encoder based on device capabilities and supports multiple vendors.
+/// </summary>
 public class H264Encoder : IDisposable
 {
     private MediaCodec? _encoder;
@@ -34,14 +38,36 @@ public class H264Encoder : IDisposable
     private readonly EncoderInfo _bestEncoder = new();
     private readonly Stopwatch _stopwatch = new();
     private int _selectedColorFormat = COLOR_FormatYUV420SemiPlanar;
+
+    /// <summary>
+    /// Event raised when a frame has been encoded and is ready for streaming.
+    /// </summary>
     public event EventHandler<H264FrameEventArgs>? FrameEncoded;
-    
+
+    /// <summary>
+    /// Represents frame data waiting to be encoded.
+    /// </summary>
     public class FrameData
     {
+        /// <summary>
+        /// Gets or sets the raw YUV frame data.
+        /// </summary>
         public byte[] Data { get; set; } = Array.Empty<byte>();
+
+        /// <summary>
+        /// Gets or sets the presentation timestamp in microseconds.
+        /// </summary>
         public long Timestamp { get; set; }
     }
 
+    /// <summary>
+    /// Initializes a new instance of the <see cref="H264Encoder"/> class.
+    /// Automatically selects the best available hardware encoder.
+    /// </summary>
+    /// <param name="width">The video width in pixels.</param>
+    /// <param name="height">The video height in pixels.</param>
+    /// <param name="bitrate">The target bitrate in bits per second. Default is 2,000,000.</param>
+    /// <param name="frameRate">The target frame rate. Default is 30.</param>
     public H264Encoder(int width, int height, int bitrate = 2000000, int frameRate = 30)
     {
         _width = width;
@@ -81,6 +107,11 @@ public class H264Encoder : IDisposable
         "2130706688"   // COLOR_FormatYUV420Flexible
     };
 
+    /// <summary>
+    /// Selects the best H.264 encoder from available codecs based on capabilities and vendor priority.
+    /// </summary>
+    /// <param name="codecInfos">Array of available codec information.</param>
+    /// <returns>The <see cref="EncoderInfo"/> for the best available encoder.</returns>
     public static EncoderInfo SelectBestEncoder(MediaCodecInfo[] codecInfos)
     {
         var encoders = new List<EncoderInfo>();
@@ -242,6 +273,10 @@ public class H264Encoder : IDisposable
         }
     }
     
+    /// <summary>
+    /// Starts the H.264 encoder and begins the encoding loop.
+    /// </summary>
+    /// <returns><c>true</c> if the encoder started successfully; otherwise, <c>false</c>.</returns>
     public bool Start()
     {
         lock (_lock)
@@ -366,12 +401,16 @@ public class H264Encoder : IDisposable
         }
     }
 
+    /// <summary>
+    /// Updates the encoder bitrate dynamically without restarting.
+    /// </summary>
+    /// <param name="newBitrate">The new bitrate in bits per second.</param>
     public void UpdateBitrate(int newBitrate)
     {
         lock (_lock)
         {
             if (!_isRunning || _encoder == null) return;
-            
+
             try
             {
                 // Create a Bundle with the new bitrate
@@ -392,6 +431,11 @@ public class H264Encoder : IDisposable
             }
         }
     }
+    /// <summary>
+    /// Queues a raw YUV frame for encoding.
+    /// Older frames are dropped if the queue backs up to prevent latency.
+    /// </summary>
+    /// <param name="frameData">The raw YUV420 frame data.</param>
     public void QueueFrame(byte[] frameData)
     {
         if (!_isRunning) return;
@@ -465,10 +509,15 @@ public class H264Encoder : IDisposable
         Log.Debug("H264MTK", "Encoding loop ended");
     }
     
+    /// <summary>
+    /// Feeds a frame into the encoder's input buffer.
+    /// Handles color format conversion and stride padding as needed.
+    /// </summary>
+    /// <param name="frame">The frame data to encode.</param>
     public void FeedInputBuffer(FrameData frame)
     {
         if (_encoder == null) return;
-        
+
         try
         {
             // Wait up to 10ms for an input buffer (balances latency vs reliability)
@@ -860,6 +909,9 @@ public class H264Encoder : IDisposable
         return nv12;
     }
     
+    /// <summary>
+    /// Stops the encoder and releases all resources.
+    /// </summary>
     public void Stop()
     {
         lock (_lock)
@@ -883,6 +935,9 @@ public class H264Encoder : IDisposable
         }
     }
     
+    /// <summary>
+    /// Releases all resources used by the encoder.
+    /// </summary>
     public void Dispose()
     {
         Stop();

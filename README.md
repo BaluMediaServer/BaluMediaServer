@@ -69,7 +69,7 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 
 ### NuGet Package
 ```xml
-<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.1" />
+<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.2" />
 ```
 
 ### Manual Installation
@@ -277,6 +277,25 @@ public partial class MainPage : ContentPage
 ```
 
 ## 📖 Detailed API Documentation
+
+### Code Documentation
+
+All classes in this library include comprehensive XML documentation comments for IntelliSense support. This provides:
+
+- **Class-level summaries** describing the purpose of each component
+- **Method documentation** with `<param>`, `<returns>`, and `<summary>` tags
+- **Property documentation** explaining what each property represents
+- **Event documentation** describing when events are raised
+
+**Documented Classes:**
+| Category | Classes |
+|----------|---------|
+| **Models** | `Client`, `FrameEventArgs`, `H264FrameEventArgs`, `VideoProfile`, `ServerConfiguration`, `RtspRequest`, `RtspAuth`, `EncoderInfo` |
+| **Enums** | `AuthType`, `CodecType`, `BussCommand`, `TransportMode` |
+| **Services** | `Server`, `MjpegServer`, `FrontCameraService`, `BackCameraService` |
+| **Encoders** | `H264Encoder`, `MediaTekH264Encoder` |
+| **Utilities** | `EventBuss`, `FrameConverterHelper`, `FrameCallback` |
+| **Interfaces** | `ICameraService` |
 
 ### Server Class
 
@@ -1067,6 +1086,21 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
   <!-- With authentication -->
   <img src="http://admin:password123@192.168.1.100:8089/Back/" alt="Live Stream" />
   ```
+
+- v1.5.2: Comprehensive Code Documentation. Added XML documentation comments to all public classes, methods, properties, and events.
+
+  - **Models**: `FrameEventArgs`, `H264FrameEventArgs`, `Client`, `VideoProfile`, `ServerConfiguration`, `RtspRequest`, `RtspAuth`, `EncoderInfo`, `AuthType`, `CodecType`, `BussCommand`, `TransportMode`
+
+  - **Services**: `Server`, `MjpegServer`, `FrontCameraService`, `BackCameraService`
+
+  - **Encoders**: `H264Encoder` (general-purpose), `MediaTekH264Encoder` (MediaTek-optimized)
+
+  - **Utilities**: `EventBuss`, `FrameConverterHelper`, `FrameCallback`, `ICameraService`
+
+  - Benefits:
+    - Full IntelliSense support in Visual Studio and VS Code
+    - Auto-generated API documentation capability
+    - Improved code maintainability and developer experience
 
 ---
 

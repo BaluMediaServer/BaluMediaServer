@@ -19,6 +19,11 @@ using System.Runtime;
 
 namespace BaluMediaServer.Services;
 
+/// <summary>
+/// Main RTSP server implementation that handles client connections and video streaming.
+/// Supports H.264 and MJPEG codecs with both TCP interleaved and UDP transport modes.
+/// Manages front and back camera services and provides authentication support.
+/// </summary>
 public class Server : IDisposable
 {
     private FrontCameraService _frontService = new();
@@ -52,10 +57,46 @@ public class Server : IDisposable
     // Global SPS/PPS cache for SDP generation (updated when encoder provides them)
     private byte[]? _currentSps, _currentPps;
     private readonly object _spsPpsLock = new();
+    /// <summary>
+    /// Event raised when the client list changes.
+    /// </summary>
     public static event Action<List<Client>>? OnClientsChange;
+
+    /// <summary>
+    /// Event raised when streaming state changes.
+    /// </summary>
     public static event EventHandler<bool>? OnStreaming;
-    public static event EventHandler<FrameEventArgs>? OnNewFrontFrame, OnNewBackFrame;
+
+    /// <summary>
+    /// Event raised when a new frame is received from the front camera.
+    /// </summary>
+    public static event EventHandler<FrameEventArgs>? OnNewFrontFrame;
+
+    /// <summary>
+    /// Event raised when a new frame is received from the back camera.
+    /// </summary>
+    public static event EventHandler<FrameEventArgs>? OnNewBackFrame;
+
+    /// <summary>
+    /// Gets a value indicating whether the server is currently running.
+    /// </summary>
     public bool IsRunning { get; private set; } = false;
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="Server"/> class with individual parameters.
+    /// </summary>
+    /// <param name="Port">The RTSP server port. Default is 7778.</param>
+    /// <param name="MaxClients">The maximum number of concurrent clients. Default is 100.</param>
+    /// <param name="Address">The address to bind to. Default is "0.0.0.0" (all interfaces).</param>
+    /// <param name="Users">Dictionary of username/password pairs for authentication.</param>
+    /// <param name="BackCameraEnabled">Whether the back camera is enabled. Default is true.</param>
+    /// <param name="FrontCameraEnabled">Whether the front camera is enabled. Default is true.</param>
+    /// <param name="AuthRequired">Whether authentication is required. Default is true.</param>
+    /// <param name="MjpegServerQuality">JPEG quality for MJPEG streaming (1-100). Default is 80.</param>
+    /// <param name="MjpegServerPort">The MJPEG HTTP server port. Default is 8089.</param>
+    /// <param name="UseHttps">Whether to use HTTPS for the MJPEG server. Default is false.</param>
+    /// <param name="CertificatePath">Path to the SSL certificate for HTTPS.</param>
+    /// <param name="CertificatePassword">Password for the SSL certificate.</param>
     public Server(int Port = 7778, int MaxClients = 100, string Address = "0.0.0.0", Dictionary<string, string>? Users = null, bool BackCameraEnabled = true, bool FrontCameraEnabled = true, bool AuthRequired = true, int MjpegServerQuality = 80, int MjpegServerPort = 8089, bool UseHttps = false, string? CertificatePath = null, string? CertificatePassword = null)
     {
         EventBuss.Command += OnCommandSend;
@@ -89,8 +130,22 @@ public class Server : IDisposable
         _frontService.ErrorOccurred += LogError;
         ConfigureSocket();
     }
+    /// <summary>
+    /// Gets a value indicating whether RTSP streaming is active.
+    /// </summary>
+    /// <returns><c>true</c> if streaming is active; otherwise, <c>false</c>.</returns>
     public bool IsStreaming() => _isStreaming;
+
+    /// <summary>
+    /// Gets a value indicating whether the MJPEG server is streaming.
+    /// </summary>
+    /// <returns><c>true</c> if MJPEG streaming is active; otherwise, <c>false</c>.</returns>
     public bool MjpegServerStreaming() => _mjpegServer.IsStreaming();
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="Server"/> class using a configuration object.
+    /// </summary>
+    /// <param name="configuration">The server configuration settings.</param>
     public Server(ServerConfiguration configuration)
     {
         EventBuss.Command += OnCommandSend;
@@ -125,8 +180,27 @@ public class Server : IDisposable
         _frontService.ErrorOccurred += LogError;
         ConfigureSocket();
     }
+    /// <summary>
+    /// Adds a new user for authentication.
+    /// </summary>
+    /// <param name="user">The username.</param>
+    /// <param name="password">The password.</param>
+    /// <returns><c>true</c> if the user was added; <c>false</c> if the user already exists.</returns>
     public bool AddUser(string user, string password) => _users.TryAdd(user, password);
+
+    /// <summary>
+    /// Updates an existing user's password.
+    /// </summary>
+    /// <param name="user">The username.</param>
+    /// <param name="password">The new password.</param>
+    /// <returns><c>true</c> if the user was updated; otherwise, <c>false</c>.</returns>
     public bool UpdateUser(string user, string password) => RemoveUser(user) ? AddUser(user, password) : false;
+
+    /// <summary>
+    /// Removes a user from the authentication list.
+    /// </summary>
+    /// <param name="user">The username to remove.</param>
+    /// <returns><c>true</c> if the user was removed; otherwise, <c>false</c>.</returns>
     public bool RemoveUser(string user) => _users.TryRemove(user, out _);
     private void LogError(object? sender, string error)
     {
@@ -171,6 +245,10 @@ public class Server : IDisposable
         }
     }
 
+    /// <summary>
+    /// Adds a video profile configuration for streaming.
+    /// </summary>
+    /// <param name="profile">The video profile to add.</param>
     public void SetVideoProfile(VideoProfile profile) => _videoProfiles.Add(profile);
     private void OnCommandSend(BussCommand command)
     {
@@ -439,6 +517,9 @@ public class Server : IDisposable
             }
         }
     }
+    /// <summary>
+    /// Stops the RTSP server and disconnects all clients.
+    /// </summary>
     public void Stop()
     {
         IsRunning = false;
@@ -450,6 +531,10 @@ public class Server : IDisposable
         _socket.Close();
         _socket?.Dispose();
     }
+    /// <summary>
+    /// Starts the RTSP server and begins accepting client connections.
+    /// </summary>
+    /// <returns><c>true</c> if the server started successfully; otherwise, <c>false</c>.</returns>
     public bool Start()
     {
         //GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
@@ -521,6 +606,9 @@ public class Server : IDisposable
             await Task.Delay(5000, _cts.Token).ConfigureAwait(false); // Check every 5 seconds for faster reconnection
         }
     }
+    /// <summary>
+    /// Releases all resources used by the server.
+    /// </summary>
     public void Dispose()
     {
         IsRunning = false;
