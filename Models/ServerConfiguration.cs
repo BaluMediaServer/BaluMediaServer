@@ -80,4 +80,16 @@ public class ServerConfiguration
     /// Gets or sets the password for the SSL certificate.
     /// </summary>
     public string? CertificatePassword { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the server is enabled and allowed to start.
+    /// When false, calling <see cref="Server.Start"/> will return immediately without starting.
+    /// Default is true.
+    /// </summary>
+    /// <remarks>
+    /// This flag controls whether the server can be started. It is checked in the Server.Start() method
+    /// before initializing the socket and beginning to accept connections. Setting this to false
+    /// effectively disables the server without having to dispose of it.
+    /// </remarks>
+    public bool EnableServer { get; set; } = true;
 }

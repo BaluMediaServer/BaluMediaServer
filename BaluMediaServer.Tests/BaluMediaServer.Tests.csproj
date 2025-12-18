@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.0" />
+    <PackageReference Include="xunit" Version="2.9.0" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="FluentAssertions" Version="6.12.0" />
+    <PackageReference Include="coverlet.collector" Version="6.0.2">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <!-- Link model files from main project (pure C# models without Android dependencies) -->
+  <ItemGroup>
+    <Compile Include="..\Models\VideoProfile.cs" Link="LinkedSources\Models\VideoProfile.cs" />
+    <Compile Include="..\Models\ServerConfiguration.cs" Link="LinkedSources\Models\ServerConfiguration.cs" />
+    <Compile Include="..\Models\RtspRequest.cs" Link="LinkedSources\Models\RtspRequest.cs" />
+    <Compile Include="..\Models\Auth.cs" Link="LinkedSources\Models\Auth.cs" />
+    <Compile Include="..\Models\AuthType.cs" Link="LinkedSources\Models\AuthType.cs" />
+    <Compile Include="..\Models\CodecType.cs" Link="LinkedSources\Models\CodecType.cs" />
+    <Compile Include="..\Models\BussCommand.cs" Link="LinkedSources\Models\BussCommand.cs" />
+    <Compile Include="..\Models\FrameEventArgs.cs" Link="LinkedSources\Models\FrameEventArgs.cs" />
+    <Compile Include="..\Models\H264FrameEventArgs.cs" Link="LinkedSources\Models\H264FrameEventArgs.cs" />
+    <Compile Include="..\RTSP\EventBuss.cs" Link="LinkedSources\Infrastructure\EventBuss.cs" />
+  </ItemGroup>
+
+</Project>

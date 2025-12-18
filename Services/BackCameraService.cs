@@ -55,19 +55,22 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
     {
         try
         {
-            _cameraCapture = new(_context);
-            _cameraCapture.SetBackCameraCallback(this);
-            _cameraCapture?.StartBackCameraCapture(width, height);
-            _threadRunning = true;
+            // Create channel BEFORE starting capture to avoid race condition
             _videoFrames = Channel.CreateBounded<VideoFrame>(
                 new BoundedChannelOptions(25)
                 {
-                    FullMode = BoundedChannelFullMode.Wait,
+                    FullMode = BoundedChannelFullMode.DropOldest,
                     SingleReader = true,
                     SingleWriter = false
                 }
             );
+            _threadRunning = true;
             _thread = Task.Run(ProcessFramesAsync, _cts.Token);
+
+            // Now start the camera - frames can safely arrive
+            _cameraCapture = new(_context);
+            _cameraCapture.SetBackCameraCallback(this);
+            _cameraCapture?.StartBackCameraCapture(width, height);
         }
         catch (Exception ex)
         {
@@ -84,7 +87,7 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
         {
             _cameraCapture?.StopBackCameraCapture();
             _threadRunning = false;
-            _videoFrames.Writer.TryComplete();
+            _videoFrames?.Writer.TryComplete();
         }
         catch (Exception ex)
         {
@@ -101,6 +104,13 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
     {
         try
         {
+            // Check if channel exists (may be called before StartCapture)
+            if (_videoFrames == null)
+            {
+                frame?.Dispose();
+                return;
+            }
+
             var now = DateTime.UtcNow;
             if (now - _lastFrameTime < _minFrameInterval)
             {
@@ -190,7 +200,7 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
             _cameraCapture?.StopBackCameraCapture();
             _threadRunning = false;
             _cts?.Cancel();
-            _videoFrames.Writer.TryComplete();
+            _videoFrames?.Writer.TryComplete();
             if (_thread != null)
             {
                 try

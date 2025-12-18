@@ -28,10 +28,12 @@ public class Server : IDisposable
 {
     private FrontCameraService _frontService = new();
     private BackCameraService _backService = new();
-    private MjpegServer _mjpegServer = new();
+    private MjpegServer? _mjpegServer;
     private bool RequireAuthentication { get; set; } = true;
     private Socket _socket = default!;
-    private int _port = 7778, _maxClients = 100, _nextRtpPort = 5000, _mjpegServerQuality = 80;
+    private int _port = 7778, _maxClients = 100, _nextRtpPort = 5000, _mjpegServerQuality = 80, _mjpegServerPort = 8089;
+    private bool _mjpegUseHttps = false;
+    private string? _mjpegCertificatePath, _mjpegCertificatePassword;
     private readonly object _portLock = new();
     private readonly HashSet<int> _usedPorts = new();
     private CancellationTokenSource _cts = new();
@@ -111,21 +113,16 @@ public class Server : IDisposable
                 else
                     AddUser(item.Key, item.Value);
         _mjpegServerQuality = MjpegServerQuality;
-        // Pass auth settings and bind address to MJPEG server for external access
-        _mjpegServer = new(
-            port: MjpegServerPort,
-            quality: _mjpegServerQuality,
-            bindAddress: Address,
-            authEnabled: AuthRequired,
-            users: _users.ToDictionary(kvp => kvp.Key, kvp => kvp.Value),
-            useHttps: UseHttps,
-            certificatePath: CertificatePath,
-            certificatePassword: CertificatePassword
-        );
+        _mjpegServerPort = MjpegServerPort;
+        _mjpegUseHttps = UseHttps;
+        _mjpegCertificatePath = CertificatePath;
+        _mjpegCertificatePassword = CertificatePassword;
         _authRequired = AuthRequired;
         _frontCameraEnabled = FrontCameraEnabled;
         _backCameraEnabled = BackCameraEnabled;
         _address = Address;
+        // Pass auth settings and bind address to MJPEG server for external access
+        _mjpegServer = CreateMjpegServer();
         _backService.ErrorOccurred += LogError;
         _frontService.ErrorOccurred += LogError;
         ConfigureSocket();
@@ -140,7 +137,21 @@ public class Server : IDisposable
     /// Gets a value indicating whether the MJPEG server is streaming.
     /// </summary>
     /// <returns><c>true</c> if MJPEG streaming is active; otherwise, <c>false</c>.</returns>
-    public bool MjpegServerStreaming() => _mjpegServer.IsStreaming();
+    public bool MjpegServerStreaming() => _mjpegServer?.IsStreaming() ?? false;
+
+    /// <summary>
+    /// Creates a new MjpegServer instance with the stored configuration settings.
+    /// </summary>
+    private MjpegServer CreateMjpegServer() => new(
+        port: _mjpegServerPort,
+        quality: _mjpegServerQuality,
+        bindAddress: _address,
+        authEnabled: _authRequired,
+        users: _users.ToDictionary(kvp => kvp.Key, kvp => kvp.Value),
+        useHttps: _mjpegUseHttps,
+        certificatePath: _mjpegCertificatePath,
+        certificatePassword: _mjpegCertificatePassword
+    );
 
     /// <summary>
     /// Initializes a new instance of the <see cref="Server"/> class using a configuration object.
@@ -151,6 +162,7 @@ public class Server : IDisposable
         EventBuss.Command += OnCommandSend;
         _port = configuration.Port;
         _maxClients = configuration.MaxClients;
+        _enabled = configuration.EnableServer;
         AddUser("admin", "password123");
         if (configuration.Users != null)
             foreach (var item in configuration.Users)
@@ -159,23 +171,18 @@ public class Server : IDisposable
                 else
                     AddUser(item.Key, item.Value);
         _mjpegServerQuality = configuration.MjpegServerQuality;
-        // Pass auth settings and bind address to MJPEG server for external access
-        _mjpegServer = new(
-            port: configuration.MjpegServerPort,
-            quality: _mjpegServerQuality,
-            bindAddress: configuration.BaseAddress,
-            authEnabled: configuration.AuthRequired,
-            users: _users.ToDictionary(kvp => kvp.Key, kvp => kvp.Value),
-            useHttps: configuration.UseHttps,
-            certificatePath: configuration.CertificatePath,
-            certificatePassword: configuration.CertificatePassword
-        );
-        if (configuration.StartMjpegServer)
-            _mjpegServer.Start(true);
+        _mjpegServerPort = configuration.MjpegServerPort;
+        _mjpegUseHttps = configuration.UseHttps;
+        _mjpegCertificatePath = configuration.CertificatePath;
+        _mjpegCertificatePassword = configuration.CertificatePassword;
         _authRequired = configuration.AuthRequired;
         _frontCameraEnabled = configuration.FrontCameraEnabled;
         _backCameraEnabled = configuration.BackCameraEnabled;
         _address = configuration.BaseAddress;
+        // Pass auth settings and bind address to MJPEG server for external access
+        _mjpegServer = CreateMjpegServer();
+        if (configuration.StartMjpegServer)
+            _mjpegServer.Start(true);
         _backService.ErrorOccurred += LogError;
         _frontService.ErrorOccurred += LogError;
         ConfigureSocket();
@@ -269,7 +276,7 @@ public class Server : IDisposable
                     }
                     break;
                 case BussCommand.STOP_CAMERA_FRONT:
-                    if (!_isStreaming && _isCapturingFront && _frontCameraEnabled && !_mjpegServer.IsStreaming())
+                    if (!_isStreaming && _isCapturingFront && _frontCameraEnabled && !(_mjpegServer?.IsStreaming() ?? false))
                     {
                         if (!IsRunning)
                         {
@@ -292,11 +299,11 @@ public class Server : IDisposable
                     }
                     break;
                 case BussCommand.STOP_CAMERA_BACK:
-                    if (!_isStreaming && _isCapturingBack && _backCameraEnabled && !_mjpegServer.IsStreaming())
+                    if (!_isStreaming && _isCapturingBack && _backCameraEnabled && !(_mjpegServer?.IsStreaming() ?? false))
                     {
                         if (!IsRunning)
                         {
-                            _backService.FrameReceived -= OnFrontFrameAvailable;    
+                            _backService.FrameReceived -= OnBackFrameAvailable;
                         }
                         _backService.StopCapture();
                         _isCapturingBack = false;
@@ -306,8 +313,7 @@ public class Server : IDisposable
                     if (!_mjpegServerEnabled)
                     {
                         _mjpegServerEnabled = true;
-                        if(_mjpegServer == null)
-                            _mjpegServer = new(quality: _mjpegServerQuality);
+                        _mjpegServer ??= CreateMjpegServer();
                         _mjpegServer.Start();
                     }
                     break;
@@ -315,15 +321,15 @@ public class Server : IDisposable
                     if (_mjpegServerEnabled)
                     {
                         _mjpegServerEnabled = false;
-                        _mjpegServer.Stop();
+                        _mjpegServer?.Stop();
                         _mjpegServer?.Dispose();
-                        _mjpegServer = null!;
+                        _mjpegServer = null;
                     }
                     break;
                 case BussCommand.SWITCH_CAMERA:
-                    _mjpegServer.Stop();
+                    _mjpegServer?.Stop();
                     _mjpegServer?.Dispose();
-                    _mjpegServer = new(quality: _mjpegServerQuality);
+                    _mjpegServer = CreateMjpegServer();
                     _socket?.Close();
                     ConfigureSocket();
                     if (_frontCameraEnabled)
@@ -527,7 +533,7 @@ public class Server : IDisposable
         _cts = new();
         _backService.FrameReceived -= OnBackFrameAvailable;
         _frontService.FrameReceived -= OnFrontFrameAvailable;
-        _mjpegServer.Stop();
+        _mjpegServer?.Stop();
         _socket.Close();
         _socket?.Dispose();
     }

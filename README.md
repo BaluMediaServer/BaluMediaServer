@@ -69,7 +69,7 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 
 ### NuGet Package
 ```xml
-<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.2" />
+<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.5" />
 ```
 
 ### Manual Installation
@@ -339,6 +339,7 @@ public class ServerConfiguration
     public bool FrontCameraEnabled { get; set; } = true;            // Enable front camera
     public bool BackCameraEnabled { get; set; } = true;             // Enable back camera
     public bool StartMjpegServer { get; set; } = true;              // Auto-start MJPEG server
+    public bool EnableServer { get; set; } = true;                  // Enable/disable server startup
     public string BaseAddress { get; set; } = "0.0.0.0";            // Bind address
     public VideoProfile PrimaryProfile { get; set; } = new();       // Primary video profile
     public VideoProfile SecondaryProfile { get; set; } = new();     // Secondary video profile
@@ -759,6 +760,60 @@ Server.OnClientsChange += (clients) => {
 ![Mobile App](Docs/DEMO.jpeg)
 
 
+## 🧪 Testing
+
+The project includes a comprehensive unit test suite using xUnit and FluentAssertions.
+
+### Running Tests
+
+```bash
+# Navigate to test project
+cd BaluMediaServer.Tests
+
+# Run all tests
+dotnet test
+
+# Run tests with detailed output
+dotnet test --verbosity normal
+
+# Run with code coverage
+dotnet test --collect:"XPlat Code Coverage"
+
+# Run specific test class
+dotnet test --filter "FullyQualifiedName~VideoProfileTests"
+```
+
+### Test Coverage
+
+| Component | Tests | Coverage |
+|-----------|-------|----------|
+| VideoProfile | 22 | Quality clamping, name sanitization, defaults |
+| ServerConfiguration | 27 | All property defaults, HTTPS config |
+| EventBuss | 7 | Command propagation, subscriptions |
+| RtspRequest | 21 | CSeq parsing, headers, properties |
+| Enums | 57 | AuthType, CodecType, BussCommand validation |
+| **Total** | **134** | **~90% of testable code** |
+
+### Test Structure
+
+```
+BaluMediaServer.Tests/
+├── Unit/
+│   ├── Models/
+│   │   ├── VideoProfileTests.cs
+│   │   ├── ServerConfigurationTests.cs
+│   │   └── RtspRequestTests.cs
+│   ├── Infrastructure/
+│   │   └── EventBussTests.cs
+│   └── Enums/
+│       └── EnumTests.cs
+└── BaluMediaServer.Tests.csproj
+```
+
+### Note on Android-Dependent Code
+
+Unit tests cover pure C# components. Android-dependent classes (camera services, encoders, network servers) require integration testing on an Android device/emulator.
+
 ## ⚠️ Current Limitations
 
 - **Platform Support**: Only Android 8.0+ (API 26+) is currently supported
@@ -782,11 +837,12 @@ Server.OnClientsChange += (clients) => {
 - ✅ External network access for MJPEG server
 - ✅ HTTPS support for MJPEG server
 - ✅ Basic authentication for MJPEG server
+- ✅ Unit testing infrastructure with xUnit
 
 ### Planned (v1.6+)
 - ⬜ Fix image rotation on some devices
 - ⬜ Add H.265 (HEVC) codec support
-- ⬜ Add unit tests and integration tests
+- ⬜ Add integration tests for Android-dependent code
 
 ### Long Term (v2.0+)
 - ⬜ iOS support via .NET MAUI
@@ -1101,6 +1157,80 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
     - Full IntelliSense support in Visual Studio and VS Code
     - Auto-generated API documentation capability
     - Improved code maintainability and developer experience
+
+- v1.5.3: Unit Testing Infrastructure. Added comprehensive unit test suite using xUnit and FluentAssertions.
+
+  - **Test Project**: `BaluMediaServer.Tests` targeting `net9.0` with file linking approach for cross-targeting compatibility
+
+  - **Test Coverage (134 tests)**:
+    - `VideoProfileTests` (22 tests): Quality clamping, name sanitization, default values
+    - `ServerConfigurationTests` (27 tests): All property defaults, HTTPS config, camera settings
+    - `EventBussTests` (7 tests): Command propagation, multiple subscribers, unsubscribe handling
+    - `RtspRequestTests` (21 tests): CSeq parsing, header handling, property initialization
+    - `EnumTests` (57 tests): AuthType, CodecType, BussCommand value validation and parsing
+
+  - **Tools**: xUnit, FluentAssertions, Coverlet for code coverage
+
+  - **Run Tests**:
+    ```bash
+    cd BaluMediaServer.Tests
+    dotnet test
+    dotnet test --collect:"XPlat Code Coverage"
+    ```
+
+- v1.5.4: Critical Bug Fixes for Server Startup and MJPEG Streaming. This release addresses multiple issues that could cause the server to fail silently or MJPEG streaming to not transmit video.
+
+  - **Fixed Wrong Event Unsubscription in Server.cs**:
+
+  - Problem: When stopping the back camera via `BussCommand.STOP_CAMERA_BACK`, the code was incorrectly unsubscribing from `OnFrontFrameAvailable` instead of `OnBackFrameAvailable`. This caused event handler leaks and potential memory issues.
+
+  - Fix: Corrected the event unsubscription to use `OnBackFrameAvailable` for the back camera service.
+
+  - **Fixed MJPEG Server Initialization Issues**:
+
+  - Problem: The `MjpegServer` was being created with default parameters at field initialization, causing:
+    - Memory leak from orphaned event subscriptions (the initial instance subscribed to static events but was replaced in the constructor)
+    - Lost configuration when MJPEG server was recreated (only `quality` parameter was passed, losing port, authentication, HTTPS settings, etc.)
+
+  - Fix:
+    - Added stored fields for all MJPEG server settings (`_mjpegServerPort`, `_mjpegUseHttps`, `_mjpegCertificatePath`, `_mjpegCertificatePassword`)
+    - Created `CreateMjpegServer()` helper method that uses all stored configuration
+    - Changed `_mjpegServer` to nullable with proper null checks throughout
+    - All MJPEG server recreation points now use the helper method with full configuration
+
+  - **Fixed Channel Initialization Race Condition in Camera Services**:
+
+  - Problem: In both `BackCameraService` and `FrontCameraService`, the camera capture was started BEFORE the frame channel was created. This caused:
+    - `NullReferenceException` if frames arrived immediately after starting capture
+    - Potential frame loss during the race window
+    - The `BoundedChannelFullMode.Wait` setting could block the native camera callback thread
+
+  - Fix:
+    - Reordered initialization to create the channel BEFORE starting camera capture
+    - Changed `BoundedChannelFullMode.Wait` to `DropOldest` to prevent blocking the camera callback thread (real-time video should drop old frames, not block)
+    - Added null checks in `OnFrameAvailable()`, `StopCapture()`, and `Dispose()` methods
+
+  - **Impact**: These fixes resolve issues where the server would appear to start successfully but:
+    - MJPEG streaming would not transmit any video
+    - Camera services could crash on first frame
+    - Event handlers could leak memory over time
+
+- v1.5.5: Critical Server Startup Fix (EnableServer Flag). This release fixes a critical bug where servers created using `ServerConfiguration` would never start.
+
+  - **Fixed Missing EnableServer Configuration Property**:
+
+  - Problem: When using the `Server(ServerConfiguration config)` constructor, the internal `_enabled` flag was always set to `false`. This caused `Server.Start()` to return immediately without actually starting the server, as the start logic checks `if (_enabled && !IsRunning)` before proceeding.
+
+  - Root Cause: The `ServerConfiguration` class was missing the `EnableServer` property. Since `bool` defaults to `false` in C#, any server created via the configuration constructor would have `_enabled = false`, silently preventing startup.
+
+  - Fix:
+    - Added `EnableServer` property to `ServerConfiguration` class with default value of `true`
+    - Server constructor now correctly reads this value: `_enabled = configuration.EnableServer`
+    - Added comprehensive XML documentation explaining the property's purpose
+
+  - **Impact**: This was a critical bug that caused servers initialized with `ServerConfiguration` to appear to start (no errors thrown) but never actually accept connections. The `Start()` method would return `false` silently. This fix ensures servers start correctly by default.
+
+  - **Migration Note**: Existing code using `ServerConfiguration` will now work correctly without any changes, as `EnableServer` defaults to `true`. If you need to disable a server, explicitly set `EnableServer = false`.
 
 ---
 

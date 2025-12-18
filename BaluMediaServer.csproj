@@ -9,7 +9,7 @@
 		<!-- NuGet Package Properties -->
 		<GeneratePackageOnBuild>false</GeneratePackageOnBuild>
 		<PackageId>BaluMediaServer.CameraStreamer</PackageId>
-		<PackageVersion>1.5.0</PackageVersion>
+		<PackageVersion>1.5.5</PackageVersion>
 		<Authors>Nakano Miku 13</Authors>
 		<Company>Balu Media Server</Company>
 		<Product>Balu Media Camera Streamer</Product>
@@ -20,7 +20,7 @@
 		<RepositoryUrl>https://github.com/BaluMediaServer/BaluMediaServer</RepositoryUrl>
 		<RepositoryType>git</RepositoryType>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
-		<PackageReleaseNotes>Initial release with dual camera support</PackageReleaseNotes>
+		<PackageReleaseNotes>v1.5.5: Critical Server Startup Fix (EnableServer Flag) - Fixed missing EnableServer configuration property that caused servers using ServerConfiguration to not start</PackageReleaseNotes>
 		
 		<!-- Include symbols for debugging -->
 		<IncludeSymbols>true</IncludeSymbols>
@@ -30,6 +30,12 @@
 		<DevelopmentDependency>false</DevelopmentDependency>
 	</PropertyGroup>
 
+
+	<!-- Exclude test project folder from compilation -->
+	<ItemGroup>
+		<Compile Remove="BaluMediaServer.Tests\**" />
+		<None Remove="BaluMediaServer.Tests\**" />
+	</ItemGroup>
 
 	<ItemGroup>
 		<PackageReference Include="Microsoft.Maui.Essentials" Version="$(MauiVersion)" />

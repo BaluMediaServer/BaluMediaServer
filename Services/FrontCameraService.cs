@@ -59,16 +59,19 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
     {
         try
         {
-            _cameraCapture?.StartFrontCameraCapture(width, height);
+            // Create channel BEFORE starting capture to avoid race condition
             _videoFrames = Channel.CreateBounded<VideoFrame>(
                     new BoundedChannelOptions(25)
                     {
-                        FullMode = BoundedChannelFullMode.Wait,
+                        FullMode = BoundedChannelFullMode.DropOldest,
                         SingleReader = true,
                         SingleWriter = false
                     });
             _threadRunning = true;
             _thread = Task.Run(ProcessFramesAsync, _cts.Token);
+
+            // Now start the camera - frames can safely arrive
+            _cameraCapture?.StartFrontCameraCapture(width, height);
         }
         catch (Exception ex)
         {
@@ -102,6 +105,13 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
     {
         try
         {
+            // Check if channel exists (may be called before StartCapture)
+            if (_videoFrames == null)
+            {
+                frame?.Dispose();
+                return;
+            }
+
             var now = DateTime.UtcNow;
             if (now - _lastFrameTime < _minFrameInterval)
             {
@@ -190,7 +200,7 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
         {
             _cameraCapture?.StopFrontCameraCapture();
             _cts?.Cancel();
-            _videoFrames.Writer.TryComplete();
+            _videoFrames?.Writer.TryComplete();
             if (_thread != null)
             {
                 try
