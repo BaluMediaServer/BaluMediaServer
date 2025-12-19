@@ -579,16 +579,28 @@ public class Server : IDisposable
                     CleanupClient(client);
                 }
 
+                // Check if MJPEG server has active clients
+                var mjpegClientCount = _mjpegServer?.ClientCount ?? 0;
+                var mjpegHasClients = _mjpegServerEnabled && mjpegClientCount > 0;
+
                 if (playingClients == 0 && _isStreaming)
                 {
                     Log.Info("[RTSP Server]", "No playing clients, stopping encoders and resetting streaming state");
-                    if (!_mjpegServerEnabled)
+
+                    if (!mjpegHasClients)
                     {
-                        if (!_isCapturingBack)
-                            _backService.StopCapture();
-                        if (!_isCapturingFront)
-                            _frontService.StopCapture();
+                        // Stop cameras and reset capture flags since no clients are using them
+                        _backService.StopCapture();
+                        _frontService.StopCapture();
+                        _isCapturingBack = false;
+                        _isCapturingFront = false;
+                        Log.Info("[RTSP Server]", "Cameras stopped - no RTSP or MJPEG clients");
                     }
+                    else
+                    {
+                        Log.Info("[RTSP Server]", $"Keeping cameras running for {mjpegClientCount} MJPEG client(s)");
+                    }
+
                     StopH264EncoderBack();
                     StopH264EncoderFront();
                     _clients.Clear();
@@ -602,6 +614,15 @@ public class Server : IDisposable
                     }
                     _clientSpsCache.Clear();
                     _clientPpsCache.Clear();
+                }
+                // Also check: cameras running for MJPEG but no MJPEG or RTSP clients
+                else if (playingClients == 0 && !_isStreaming && (_isCapturingBack || _isCapturingFront) && !mjpegHasClients)
+                {
+                    Log.Info("[RTSP Server]", "Cameras running but no clients - stopping cameras");
+                    _backService.StopCapture();
+                    _frontService.StopCapture();
+                    _isCapturingBack = false;
+                    _isCapturingFront = false;
                 }
             }
             catch (Exception ex)

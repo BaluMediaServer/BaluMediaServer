@@ -69,7 +69,7 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 
 ### NuGet Package
 ```xml
-<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.5" />
+<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.6" />
 ```
 
 ### Manual Installation
@@ -1231,6 +1231,31 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
   - **Impact**: This was a critical bug that caused servers initialized with `ServerConfiguration` to appear to start (no errors thrown) but never actually accept connections. The `Start()` method would return `false` silently. This fix ensures servers start correctly by default.
 
   - **Migration Note**: Existing code using `ServerConfiguration` will now work correctly without any changes, as `EnableServer` defaults to `true`. If you need to disable a server, explicitly set `EnableServer = false`.
+
+- v1.5.6: Camera Resource Management Fix. This release fixes a critical bug where cameras would continue running after all clients disconnected, wasting device resources.
+
+  - **Fixed Camera Not Stopping When Clients Disconnect**:
+
+  - Problem: When RTSP streaming started, the code set `_isCapturingBack = true` (or `_isCapturingFront`), but these flags were never reset when clients disconnected. The WatchDog checked `if (!_isCapturingBack)` before stopping cameras, so it would skip stopping them because the flag was still `true`.
+
+  - Fix:
+    - Removed the broken condition that prevented cameras from stopping
+    - Now properly resets `_isCapturingBack` and `_isCapturingFront` to `false` when stopping cameras
+    - Cameras now correctly stop when all RTSP clients disconnect
+
+  - **Improved MJPEG Client Detection**:
+
+  - Problem: The WatchDog only checked if MJPEG server was enabled (`_mjpegServerEnabled`), not if it actually had connected clients. This meant cameras would keep running even when MJPEG server had no clients.
+
+  - Fix: Now checks `_mjpegServer?.ClientCount` to determine if MJPEG has active clients before deciding to keep cameras running.
+
+  - **Added Catch-All Resource Cleanup**:
+
+  - Fix: Added a second condition to catch the case where cameras are running (started by EventBuss or MJPEG) but all clients have disconnected:
+    - If no RTSP clients are playing AND no MJPEG clients are connected AND cameras are running, cameras will now stop
+    - Logs clearly indicate when cameras are stopped or kept running for clients
+
+  - **Impact**: This fix prevents unnecessary battery drain and CPU usage when no clients are connected to the stream.
 
 ---
 
