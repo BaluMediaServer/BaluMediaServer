@@ -39,6 +39,11 @@ public class H264Encoder : IDisposable
     private readonly Stopwatch _stopwatch = new();
     private int _selectedColorFormat = COLOR_FormatYUV420SemiPlanar;
 
+    // Frame-rate synchronized timestamp management
+    private long _frameNumber = 0;
+    private long _frameIntervalUs; // Microseconds per frame based on target FPS
+    private long _baseTimestamp = -1;
+
     /// <summary>
     /// Event raised when a frame has been encoded and is ready for streaming.
     /// </summary>
@@ -74,6 +79,7 @@ public class H264Encoder : IDisposable
         _height = height;
         _bitrate = bitrate;
         _frameRate = frameRate;
+        _frameIntervalUs = 1_000_000L / frameRate; // e.g., 40000us for 25fps
         var codecList = new MediaCodecList(new());
         var codecInfos = codecList.GetCodecInfos();
 
@@ -448,16 +454,29 @@ public class H264Encoder : IDisposable
             return;
         }
 
-        // Use actual time for timestamps to prevent stuttering
-        if (!_stopwatch.IsRunning)
+        // Initialize timing on first frame
+        if (_baseTimestamp < 0)
         {
-            _stopwatch.Start();
+            _stopwatch.Restart();
+            _baseTimestamp = 0;
+            _frameNumber = 0;
         }
 
-        var timestamp = _stopwatch.ElapsedTicks * 1000000L / Stopwatch.Frequency;
+        // Frame-rate synchronized timestamp calculation
+        // Use ideal timestamp based on frame number to prevent drift
+        long idealTimestamp = _baseTimestamp + (_frameNumber * _frameIntervalUs);
 
-        // Drop frames if queue is backing up (keep max 3 frames for smooth playback)
-        while (_frameQueue.Count > 3)
+        // Get actual elapsed time for bounds checking
+        long actualTimestamp = _stopwatch.ElapsedTicks * 1_000_000L / Stopwatch.Frequency;
+
+        // Hybrid approach: use ideal timestamp but bound by actual time
+        // This prevents drift while handling encoding delays
+        long timestamp = Math.Min(idealTimestamp, actualTimestamp + _frameIntervalUs);
+
+        _frameNumber++;
+
+        // Drop frames if queue is backing up (keep max 2 frames for lower latency)
+        while (_frameQueue.Count > 2)
         {
             if (_frameQueue.TryDequeue(out _))
             {
@@ -520,8 +539,8 @@ public class H264Encoder : IDisposable
 
         try
         {
-            // Wait up to 10ms for an input buffer (balances latency vs reliability)
-            var inputIndex = _encoder.DequeueInputBuffer(10000);
+            // Wait up to 5ms for an input buffer (reduced for lower latency)
+            var inputIndex = _encoder.DequeueInputBuffer(5000);
             
             if (inputIndex >= 0)
             {
@@ -665,8 +684,8 @@ public class H264Encoder : IDisposable
 
         try
         {
-            // Wait up to 10ms for output (balances latency vs smooth playback)
-            var outputIndex = _encoder.DequeueOutputBuffer(bufferInfo, 10000);
+            // Wait up to 5ms for output (reduced for lower latency)
+            var outputIndex = _encoder.DequeueOutputBuffer(bufferInfo, 5000);
             
             if (outputIndex >= 0)
             {

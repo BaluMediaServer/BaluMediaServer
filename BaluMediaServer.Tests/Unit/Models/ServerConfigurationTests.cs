@@ -193,9 +193,9 @@ public class ServerConfigurationTests
         // Arrange & Act
         var config = new ServerConfiguration();
 
-        // Assert
-        config.PrimaryProfile.Height.Should().Be(640);
-        config.PrimaryProfile.Width.Should().Be(480);
+        // Assert - VGA resolution is 640x480 (width x height)
+        config.PrimaryProfile.Width.Should().Be(640);
+        config.PrimaryProfile.Height.Should().Be(480);
         config.PrimaryProfile.Quality.Should().Be(80);
     }
 

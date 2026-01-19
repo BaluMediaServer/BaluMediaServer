@@ -13,23 +13,23 @@ public class VideoProfileTests
     #region Default Values Tests
 
     [Fact]
-    public void Constructor_ShouldSetDefaultHeight_To640()
+    public void Constructor_ShouldSetDefaultWidth_To640()
     {
         // Arrange & Act
         var profile = new VideoProfile();
 
-        // Assert
-        profile.Height.Should().Be(640);
+        // Assert - VGA resolution is 640x480 (width x height)
+        profile.Width.Should().Be(640);
     }
 
     [Fact]
-    public void Constructor_ShouldSetDefaultWidth_To480()
+    public void Constructor_ShouldSetDefaultHeight_To480()
     {
         // Arrange & Act
         var profile = new VideoProfile();
 
-        // Assert
-        profile.Width.Should().Be(480);
+        // Assert - VGA resolution is 640x480 (width x height)
+        profile.Height.Should().Be(480);
     }
 
     [Fact]
@@ -322,6 +322,109 @@ public class VideoProfileTests
 
         // Assert
         profile.MinBitrate.Should().Be(250000);
+    }
+
+    #endregion
+
+    #region Resolution Preset Tests
+
+    [Fact]
+    public void Resolution_WhenSetToVGA_ShouldUpdateWidthAndHeight()
+    {
+        // Arrange
+        var profile = new VideoProfile();
+
+        // Act
+        profile.Resolution = VideoResolution.VGA_640x480;
+
+        // Assert
+        profile.Width.Should().Be(640);
+        profile.Height.Should().Be(480);
+    }
+
+    [Fact]
+    public void Resolution_WhenSetToHD_ShouldUpdateWidthAndHeight()
+    {
+        // Arrange
+        var profile = new VideoProfile();
+
+        // Act
+        profile.Resolution = VideoResolution.HD_1280x720;
+
+        // Assert
+        profile.Width.Should().Be(1280);
+        profile.Height.Should().Be(720);
+    }
+
+    [Fact]
+    public void Resolution_WhenSetToFullHD_ShouldUpdateBitrates()
+    {
+        // Arrange
+        var profile = new VideoProfile();
+
+        // Act
+        profile.Resolution = VideoResolution.FullHD_1920x1080;
+
+        // Assert
+        profile.MinBitrate.Should().Be(4000000);
+        profile.MaxBitrate.Should().Be(8000000);
+    }
+
+    [Fact]
+    public void Width_WhenSetManually_ShouldClearResolutionPreset()
+    {
+        // Arrange
+        var profile = new VideoProfile();
+        profile.Resolution = VideoResolution.HD_1280x720;
+
+        // Act
+        profile.Width = 800;
+
+        // Assert
+        profile.Resolution.Should().BeNull();
+    }
+
+    [Fact]
+    public void Height_WhenSetManually_ShouldClearResolutionPreset()
+    {
+        // Arrange
+        var profile = new VideoProfile();
+        profile.Resolution = VideoResolution.HD_1280x720;
+
+        // Act
+        profile.Height = 600;
+
+        // Assert
+        profile.Resolution.Should().BeNull();
+    }
+
+    [Fact]
+    public void GetFrameBufferSize_ShouldReturnCorrectSizeForVGA()
+    {
+        // Arrange
+        var profile = new VideoProfile();
+        profile.Resolution = VideoResolution.VGA_640x480;
+
+        // Act
+        var size = profile.GetFrameBufferSize();
+
+        // Assert - (640 * 480 * 3) / 2 = 460800
+        size.Should().Be(460800);
+    }
+
+    [Fact]
+    public void GetDimensions_ShouldReturnWidthAndHeight()
+    {
+        // Arrange
+        var profile = new VideoProfile();
+        profile.Resolution = VideoResolution.HD_1280x720;
+
+        // Act
+        var (width, height) = profile.GetDimensions();
+
+        // Assert
+        width.Should().Be(1280);
+        height.Should().Be(720);
     }
 
     #endregion

@@ -69,7 +69,7 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 
 ### NuGet Package
 ```xml
-<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.6" />
+<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.7" />
 ```
 
 ### Manual Installation
@@ -290,8 +290,8 @@ All classes in this library include comprehensive XML documentation comments for
 **Documented Classes:**
 | Category | Classes |
 |----------|---------|
-| **Models** | `Client`, `FrameEventArgs`, `H264FrameEventArgs`, `VideoProfile`, `ServerConfiguration`, `RtspRequest`, `RtspAuth`, `EncoderInfo` |
-| **Enums** | `AuthType`, `CodecType`, `BussCommand`, `TransportMode` |
+| **Models** | `Client`, `FrameEventArgs`, `H264FrameEventArgs`, `VideoProfile`, `VideoResolution`, `ServerConfiguration`, `RtspRequest`, `RtspAuth`, `EncoderInfo` |
+| **Enums** | `AuthType`, `CodecType`, `BussCommand`, `TransportMode`, `VideoResolution` |
 | **Services** | `Server`, `MjpegServer`, `FrontCameraService`, `BackCameraService` |
 | **Encoders** | `H264Encoder`, `MediaTekH264Encoder` |
 | **Utilities** | `EventBuss`, `FrameConverterHelper`, `FrameCallback` |
@@ -315,7 +315,9 @@ public Server(
     int MjpegServerPort = 8089,                // MJPEG HTTP server port
     bool UseHttps = false,                     // Enable HTTPS for MJPEG server
     string? CertificatePath = null,            // Path to SSL certificate
-    string? CertificatePassword = null         // Certificate password
+    string? CertificatePassword = null,        // Certificate password
+    VideoResolution BackCameraResolution = VideoResolution.VGA_640x480,   // Back camera resolution
+    VideoResolution FrontCameraResolution = VideoResolution.VGA_640x480   // Front camera resolution
 )
 
 public Server(
@@ -344,6 +346,20 @@ public class ServerConfiguration
     public VideoProfile PrimaryProfile { get; set; } = new();       // Primary video profile
     public VideoProfile SecondaryProfile { get; set; } = new();     // Secondary video profile
 
+    // Resolution configuration (affects H.264 encoder)
+    public VideoResolution BackCameraResolution { get; set; } = VideoResolution.VGA_640x480;   // Back camera resolution preset
+    public int BackCameraWidth { get; set; } = 0;                   // Custom back camera width (0 = use preset)
+    public int BackCameraHeight { get; set; } = 0;                  // Custom back camera height (0 = use preset)
+    public VideoResolution FrontCameraResolution { get; set; } = VideoResolution.VGA_640x480;  // Front camera resolution preset
+    public int FrontCameraWidth { get; set; } = 0;                  // Custom front camera width (0 = use preset)
+    public int FrontCameraHeight { get; set; } = 0;                 // Custom front camera height (0 = use preset)
+
+    // Helper methods
+    public int GetBackCameraWidth()  => BackCameraWidth > 0 ? BackCameraWidth : BackCameraResolution.GetWidth();
+    public int GetBackCameraHeight() => BackCameraHeight > 0 ? BackCameraHeight : BackCameraResolution.GetHeight();
+    public int GetFrontCameraWidth() => FrontCameraWidth > 0 ? FrontCameraWidth : FrontCameraResolution.GetWidth();
+    public int GetFrontCameraHeight() => FrontCameraHeight > 0 ? FrontCameraHeight : FrontCameraResolution.GetHeight();
+
     // HTTPS configuration for MJPEG server
     public bool UseHttps { get; set; } = false;                     // Enable HTTPS
     public string? CertificatePath { get; set; }                    // SSL certificate path
@@ -359,13 +375,53 @@ Configuration for video encoding parameters.
 public class VideoProfile
 {
     public string Name { get; set; } = "";                  // Profile name (used in URL path)
-    public int Height { get; set; } = 640;                  // Video height
-    public int Width { get; set; } = 480;                   // Video width
+    public VideoResolution? Resolution { get; set; }        // Resolution preset (auto-sets Width, Height, and bitrates)
+    public int Width { get; set; } = 640;                   // Video width (setting clears Resolution preset)
+    public int Height { get; set; } = 480;                  // Video height (setting clears Resolution preset)
     public int MaxBitrate { get; set; } = 4000000;          // Maximum bitrate (bps)
     public int MinBitrate { get; set; } = 500000;           // Minimum bitrate (bps)
     public int Quality { get; set; } = 80;                  // JPEG quality (10-100)
+
+    // Helper methods
+    public int GetFrameBufferSize() => (Width * Height * 3) / 2;  // YUV420 buffer size for H.264
+    public (int Width, int Height) GetDimensions() => (Width, Height);
 }
 ```
+
+### VideoResolution Enum
+
+Predefined video resolution presets for camera capture and H.264 encoding.
+
+```csharp
+public enum VideoResolution
+{
+    QVGA_320x240,       // 320x240 - Lowest quality, minimal bandwidth (~115 KB buffer)
+    Low_480x360,        // 480x360 - Low quality (~259 KB buffer)
+    VGA_640x480,        // 640x480 - Standard (default), most compatible (~460 KB buffer)
+    SVGA_800x600,       // 800x600 - Enhanced standard (~720 KB buffer)
+    HD_1280x720,        // 1280x720 - HD 720p (~1.38 MB buffer)
+    FullHD_1920x1080    // 1920x1080 - Full HD 1080p (~3.11 MB buffer)
+}
+
+// Extension methods
+public static int GetWidth(this VideoResolution resolution);
+public static int GetHeight(this VideoResolution resolution);
+public static int GetRecommendedMinBitrate(this VideoResolution resolution);
+public static int GetRecommendedMaxBitrate(this VideoResolution resolution);
+public static (int Width, int Height) GetDimensions(this VideoResolution resolution);
+public static int GetFrameBufferSize(this VideoResolution resolution);
+public static string GetDisplayName(this VideoResolution resolution);
+```
+
+**Resolution and H.264 Relationship:**
+| Resolution | Frame Buffer | Min Bitrate | Max Bitrate |
+|------------|-------------|-------------|-------------|
+| QVGA (320x240) | ~115 KB | 300 Kbps | 500 Kbps |
+| Low (480x360) | ~259 KB | 500 Kbps | 800 Kbps |
+| VGA (640x480) | ~460 KB | 800 Kbps | 1.5 Mbps |
+| SVGA (800x600) | ~720 KB | 1 Mbps | 2 Mbps |
+| HD (1280x720) | ~1.38 MB | 2 Mbps | 4 Mbps |
+| Full HD (1920x1080) | ~3.11 MB | 4 Mbps | 8 Mbps |
 
 #### Methods
 ```csharp
@@ -383,6 +439,24 @@ public bool RemoveUser(string username)
 
 // Update user from the "database" *NO REBOOT REQUIRED
 public bool UpdateUser(string username, string password)
+
+// Set back camera resolution using preset (call before Start() for best results)
+public void SetBackCameraResolution(VideoResolution resolution)
+
+// Set back camera resolution using custom dimensions
+public void SetBackCameraResolution(int width, int height)
+
+// Set front camera resolution using preset (call before Start() for best results)
+public void SetFrontCameraResolution(VideoResolution resolution)
+
+// Set front camera resolution using custom dimensions
+public void SetFrontCameraResolution(int width, int height)
+
+// Get current back camera resolution
+public (int Width, int Height) GetBackCameraResolution()
+
+// Get current front camera resolution
+public (int Width, int Height) GetFrontCameraResolution()
 
 // Static method to encode YUV data to JPEG
 public static byte[] EncodeToJpeg(byte[] rawImageData, int width, int height, Android.Graphics.ImageFormatType format)
@@ -517,16 +591,71 @@ The H.264 encoder automatically optimizes for MediaTek devices but can be config
 // Dynamic bitrate adjustment happens automatically based on network conditions
 ```
 
-### Multiple Camera Resolutions
+### Video Resolution Configuration
+
+Resolution directly affects H.264 encoder performance and bandwidth requirements. Higher resolutions need more processing power and network bandwidth.
+
+#### Using Resolution Presets (Recommended)
 
 ```csharp
-// Start cameras with custom resolution
-var frontCamera = new FrontCameraService();
-frontCamera.StartCapture(1920, 1080); // Full HD
+using BaluMediaServer.Models;
 
-var backCamera = new BackCameraService();
-backCamera.StartCapture(1280, 720);   // HD
+// Option 1: Configure via ServerConfiguration
+var config = new ServerConfiguration
+{
+    Port = 7778,
+    BackCameraResolution = VideoResolution.HD_1280x720,    // HD for back camera
+    FrontCameraResolution = VideoResolution.VGA_640x480,  // Standard for front camera
+    Users = new Dictionary<string, string> { { "admin", "password" } }
+};
+var server = new Server(config);
+
+// Option 2: Configure via constructor parameters
+var server = new Server(
+    Port: 7778,
+    BackCameraResolution: VideoResolution.HD_1280x720,
+    FrontCameraResolution: VideoResolution.VGA_640x480,
+    Users: new Dictionary<string, string> { { "admin", "password" } }
+);
+
+// Option 3: Configure at runtime (before Start())
+var server = new Server(Port: 7778, Users: users);
+server.SetBackCameraResolution(VideoResolution.HD_1280x720);
+server.SetFrontCameraResolution(VideoResolution.VGA_640x480);
+server.Start();
 ```
+
+#### Using Custom Resolutions
+
+```csharp
+// Via ServerConfiguration
+var config = new ServerConfiguration
+{
+    BackCameraWidth = 800,
+    BackCameraHeight = 600,
+    FrontCameraWidth = 640,
+    FrontCameraHeight = 480
+};
+
+// Via Server methods
+server.SetBackCameraResolution(800, 600);
+server.SetFrontCameraResolution(640, 480);
+
+// Direct camera service (advanced usage)
+var backCamera = new BackCameraService();
+backCamera.StartCapture(1280, 720);
+```
+
+#### Resolution Selection Guidelines
+
+| Use Case | Recommended Resolution | Notes |
+|----------|----------------------|-------|
+| Low bandwidth / Mobile data | QVGA (320x240) or Low (480x360) | Minimal data usage |
+| Standard streaming | VGA (640x480) | Default, most compatible |
+| High quality local network | HD (1280x720) | Good balance |
+| Maximum quality | Full HD (1920x1080) | Requires powerful device |
+
+**Important:** The H.264 encoder buffer size is calculated as `(width * height * 3) / 2` for YUV420 format. Higher resolutions significantly increase memory usage.
 
 ### Frame Capture for Snapshots and Processing
 
@@ -1256,6 +1385,40 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
     - Logs clearly indicate when cameras are stopped or kept running for clients
 
   - **Impact**: This fix prevents unnecessary battery drain and CPU usage when no clients are connected to the stream.
+
+- v1.5.7: Configurable Video Resolution. This release adds full support for configuring camera resolution, allowing users to select from predefined presets or specify custom resolutions.
+
+  - **New VideoResolution Enum**:
+
+  - Added `VideoResolution` enum with common presets: QVGA (320x240), Low (480x360), VGA (640x480), SVGA (800x600), HD (1280x720), Full HD (1920x1080)
+  - Each preset includes recommended bitrate settings for H.264 encoding
+  - Extension methods provide helper functions: `GetWidth()`, `GetHeight()`, `GetRecommendedMinBitrate()`, `GetRecommendedMaxBitrate()`, `GetFrameBufferSize()`, `GetDisplayName()`
+
+  - **ServerConfiguration Resolution Support**:
+
+  - Added `BackCameraResolution` and `FrontCameraResolution` properties for preset selection
+  - Added `BackCameraWidth`, `BackCameraHeight`, `FrontCameraWidth`, `FrontCameraHeight` for custom resolutions
+  - Helper methods `GetBackCameraWidth()`, `GetBackCameraHeight()`, etc. resolve effective resolution
+
+  - **Server Class Enhancements**:
+
+  - Constructor now accepts `BackCameraResolution` and `FrontCameraResolution` parameters
+  - New methods: `SetBackCameraResolution()`, `SetFrontCameraResolution()`, `GetBackCameraResolution()`, `GetFrontCameraResolution()`
+  - Camera capture and H.264 encoder now use configured resolution
+
+  - **VideoProfile Updates**:
+
+  - Added `Resolution` property for preset-based configuration
+  - Setting `Resolution` automatically updates `Width`, `Height`, `MinBitrate`, and `MaxBitrate`
+  - Helper methods: `GetFrameBufferSize()`, `GetDimensions()`
+
+  - **H.264 Encoder Considerations**:
+
+  - Resolution directly affects encoder buffer size: `(width * height * 3) / 2` for YUV420
+  - Higher resolutions require more processing power and bandwidth
+  - Bitrate recommendations scale with resolution for optimal quality
+
+  - **Impact**: Users can now easily configure video resolution to balance quality, bandwidth, and device performance. Default resolution remains VGA (640x480) for backward compatibility.
 
 ---
 

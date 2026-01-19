@@ -41,6 +41,7 @@ public class Server : IDisposable
     private string _uri = string.Empty;
     private bool _isStreaming = false, _enabled = false, _isCapturingFront = false, _isCapturingBack = false,
     _mjpegServerEnabled = false, _frontCameraEnabled = true, _backCameraEnabled = true, _authRequired = true;
+    private int _backCameraWidth = 640, _backCameraHeight = 480, _frontCameraWidth = 640, _frontCameraHeight = 480;
     private FrameEventArgs? _latestFrontFrame, _latestBackFrame;
     private readonly ConcurrentDictionary<string, string> _nonceCache = new();
     private readonly string _address = string.Empty;
@@ -53,6 +54,7 @@ public class Server : IDisposable
     private int _h264BackEncoderExpectedFrameSize = 0, _h264FrontEncoderExpectedFrameSize = 0;
     private List<VideoProfile> _videoProfiles = new();
     private readonly Dictionary<string, byte[]?> _clientSpsCache = new(), _clientPpsCache = new();
+    private readonly ConcurrentDictionary<string, FramePacer> _clientPacers = new();
     private static readonly byte[] StandardQuantizationTables = GetStandardQuantizationTables();
     private readonly ArrayPool<byte> _arrayPool = ArrayPool<byte>.Shared;
     private ConcurrentDictionary<string, string> _users = new();
@@ -99,7 +101,9 @@ public class Server : IDisposable
     /// <param name="UseHttps">Whether to use HTTPS for the MJPEG server. Default is false.</param>
     /// <param name="CertificatePath">Path to the SSL certificate for HTTPS.</param>
     /// <param name="CertificatePassword">Password for the SSL certificate.</param>
-    public Server(int Port = 7778, int MaxClients = 100, string Address = "0.0.0.0", Dictionary<string, string>? Users = null, bool BackCameraEnabled = true, bool FrontCameraEnabled = true, bool AuthRequired = true, int MjpegServerQuality = 80, int MjpegServerPort = 8089, bool UseHttps = false, string? CertificatePath = null, string? CertificatePassword = null)
+    /// <param name="BackCameraResolution">Resolution for back camera. Default is VGA (640x480).</param>
+    /// <param name="FrontCameraResolution">Resolution for front camera. Default is VGA (640x480).</param>
+    public Server(int Port = 7778, int MaxClients = 100, string Address = "0.0.0.0", Dictionary<string, string>? Users = null, bool BackCameraEnabled = true, bool FrontCameraEnabled = true, bool AuthRequired = true, int MjpegServerQuality = 80, int MjpegServerPort = 8089, bool UseHttps = false, string? CertificatePath = null, string? CertificatePassword = null, VideoResolution BackCameraResolution = VideoResolution.VGA_640x480, VideoResolution FrontCameraResolution = VideoResolution.VGA_640x480)
     {
         EventBuss.Command += OnCommandSend;
         _enabled = true;
@@ -121,6 +125,11 @@ public class Server : IDisposable
         _frontCameraEnabled = FrontCameraEnabled;
         _backCameraEnabled = BackCameraEnabled;
         _address = Address;
+        // Store camera resolution configuration
+        _backCameraWidth = BackCameraResolution.GetWidth();
+        _backCameraHeight = BackCameraResolution.GetHeight();
+        _frontCameraWidth = FrontCameraResolution.GetWidth();
+        _frontCameraHeight = FrontCameraResolution.GetHeight();
         // Pass auth settings and bind address to MJPEG server for external access
         _mjpegServer = CreateMjpegServer();
         _backService.ErrorOccurred += LogError;
@@ -179,6 +188,11 @@ public class Server : IDisposable
         _frontCameraEnabled = configuration.FrontCameraEnabled;
         _backCameraEnabled = configuration.BackCameraEnabled;
         _address = configuration.BaseAddress;
+        // Store camera resolution configuration
+        _backCameraWidth = configuration.GetBackCameraWidth();
+        _backCameraHeight = configuration.GetBackCameraHeight();
+        _frontCameraWidth = configuration.GetFrontCameraWidth();
+        _frontCameraHeight = configuration.GetFrontCameraHeight();
         // Pass auth settings and bind address to MJPEG server for external access
         _mjpegServer = CreateMjpegServer();
         if (configuration.StartMjpegServer)
@@ -209,6 +223,81 @@ public class Server : IDisposable
     /// <param name="user">The username to remove.</param>
     /// <returns><c>true</c> if the user was removed; otherwise, <c>false</c>.</returns>
     public bool RemoveUser(string user) => _users.TryRemove(user, out _);
+
+    /// <summary>
+    /// Sets the resolution for the back camera using a predefined preset.
+    /// This should be called before starting the server for best results.
+    /// </summary>
+    /// <param name="resolution">The resolution preset to use.</param>
+    /// <remarks>
+    /// Changing resolution while streaming may cause temporary interruption.
+    /// The H.264 encoder buffer size is calculated based on resolution.
+    /// </remarks>
+    public void SetBackCameraResolution(VideoResolution resolution)
+    {
+        _backCameraWidth = resolution.GetWidth();
+        _backCameraHeight = resolution.GetHeight();
+    }
+
+    /// <summary>
+    /// Sets a custom resolution for the back camera.
+    /// This should be called before starting the server for best results.
+    /// </summary>
+    /// <param name="width">The width in pixels.</param>
+    /// <param name="height">The height in pixels.</param>
+    /// <remarks>
+    /// Ensure the camera supports the specified resolution.
+    /// The H.264 encoder buffer is calculated as (width * height * 3) / 2.
+    /// </remarks>
+    public void SetBackCameraResolution(int width, int height)
+    {
+        _backCameraWidth = width;
+        _backCameraHeight = height;
+    }
+
+    /// <summary>
+    /// Sets the resolution for the front camera using a predefined preset.
+    /// This should be called before starting the server for best results.
+    /// </summary>
+    /// <param name="resolution">The resolution preset to use.</param>
+    /// <remarks>
+    /// Changing resolution while streaming may cause temporary interruption.
+    /// The H.264 encoder buffer size is calculated based on resolution.
+    /// </remarks>
+    public void SetFrontCameraResolution(VideoResolution resolution)
+    {
+        _frontCameraWidth = resolution.GetWidth();
+        _frontCameraHeight = resolution.GetHeight();
+    }
+
+    /// <summary>
+    /// Sets a custom resolution for the front camera.
+    /// This should be called before starting the server for best results.
+    /// </summary>
+    /// <param name="width">The width in pixels.</param>
+    /// <param name="height">The height in pixels.</param>
+    /// <remarks>
+    /// Ensure the camera supports the specified resolution.
+    /// The H.264 encoder buffer is calculated as (width * height * 3) / 2.
+    /// </remarks>
+    public void SetFrontCameraResolution(int width, int height)
+    {
+        _frontCameraWidth = width;
+        _frontCameraHeight = height;
+    }
+
+    /// <summary>
+    /// Gets the current back camera resolution.
+    /// </summary>
+    /// <returns>A tuple containing (Width, Height).</returns>
+    public (int Width, int Height) GetBackCameraResolution() => (_backCameraWidth, _backCameraHeight);
+
+    /// <summary>
+    /// Gets the current front camera resolution.
+    /// </summary>
+    /// <returns>A tuple containing (Width, Height).</returns>
+    public (int Width, int Height) GetFrontCameraResolution() => (_frontCameraWidth, _frontCameraHeight);
+
     private void LogError(object? sender, string error)
     {
         if (sender is FrontCameraService)
@@ -269,9 +358,9 @@ public class Server : IDisposable
                         if (!IsRunning)
                         {
                             _frontService = new();
-                            _frontService.FrameReceived += OnFrontFrameAvailable;    
+                            _frontService.FrameReceived += OnFrontFrameAvailable;
                         }
-                        _frontService.StartCapture();
+                        _frontService.StartCapture(_frontCameraWidth, _frontCameraHeight);
                         _isCapturingFront = true;
                     }
                     break;
@@ -294,7 +383,7 @@ public class Server : IDisposable
                             _backService = new();
                             _backService.FrameReceived += OnBackFrameAvailable;
                         }
-                        _backService.StartCapture();
+                        _backService.StartCapture(_backCameraWidth, _backCameraHeight);
                         _isCapturingBack = true;
                     }
                     break;
@@ -388,11 +477,15 @@ public class Server : IDisposable
         // Update global SPS/PPS cache for SDP generation
         UpdateSpsPpsCache(e);
 
-        // Add to queue, limit queue size to prevent memory buildup
+        // Add to queue with smart dropping (max 3 frames, preserve keyframes)
         _h264FrameQueueFront.Enqueue(e);
-        while (_h264FrameQueueFront.Count > 5)
+        while (_h264FrameQueueFront.Count > 3)
         {
-            _h264FrameQueueFront.TryDequeue(out _);
+            if (!TryDropNonKeyFrame(_h264FrameQueueFront))
+            {
+                // Fallback: drop oldest if all are keyframes (rare)
+                _h264FrameQueueFront.TryDequeue(out _);
+            }
         }
     }
 
@@ -401,12 +494,45 @@ public class Server : IDisposable
         // Update global SPS/PPS cache for SDP generation
         UpdateSpsPpsCache(e);
 
-        // Add to queue, limit queue size to prevent memory buildup
+        // Add to queue with smart dropping (max 3 frames, preserve keyframes)
         _h264FrameQueueBack.Enqueue(e);
-        while (_h264FrameQueueBack.Count > 5)
+        while (_h264FrameQueueBack.Count > 3)
         {
-            _h264FrameQueueBack.TryDequeue(out _);
+            if (!TryDropNonKeyFrame(_h264FrameQueueBack))
+            {
+                // Fallback: drop oldest if all are keyframes (rare)
+                _h264FrameQueueBack.TryDequeue(out _);
+            }
         }
+    }
+
+    /// <summary>
+    /// Tries to drop a non-keyframe from the queue to preserve IDR frames.
+    /// Preserving keyframes prevents decoder corruption when frames are dropped.
+    /// </summary>
+    /// <returns>True if a non-keyframe was dropped, false if all frames are keyframes</returns>
+    private static bool TryDropNonKeyFrame(ConcurrentQueue<H264FrameEventArgs> queue)
+    {
+        // Drain queue to find a non-keyframe to drop
+        var frames = new List<H264FrameEventArgs>();
+        while (queue.TryDequeue(out var frame))
+        {
+            frames.Add(frame);
+        }
+
+        // Find first non-keyframe to drop (prefer dropping oldest non-keyframe)
+        int dropIndex = frames.FindIndex(f => !f.IsKeyFrame);
+        if (dropIndex >= 0)
+        {
+            frames.RemoveAt(dropIndex);
+            foreach (var f in frames) queue.Enqueue(f);
+            Log.Debug("[RTSP Server]", "Dropped non-keyframe to maintain queue depth");
+            return true;
+        }
+
+        // No non-keyframe found, restore queue
+        foreach (var f in frames) queue.Enqueue(f);
+        return false;
     }
 
     /// <summary>
@@ -1140,12 +1266,12 @@ public class Server : IDisposable
         {
             if (!_isCapturingFront && client.CameraId == 1)
             {
-                _frontService.StartCapture();
+                _frontService.StartCapture(_frontCameraWidth, _frontCameraHeight);
                 _isCapturingFront = true;
             }
             else if (!_isCapturingBack && client.CameraId == 0)
             {
-                _backService.StartCapture();
+                _backService.StartCapture(_backCameraWidth, _backCameraHeight);
                 _isCapturingBack = true;
             }
             
@@ -1323,6 +1449,42 @@ public class Server : IDisposable
             // Check if this is a new frame
             if (h264Frame.Timestamp > client.LastH264FrameTimestamp)
             {
+                // Get or create pacer for this client (25 FPS default)
+                var pacer = _clientPacers.GetOrAdd(client.Id, _ => new FramePacer(25));
+
+                // Detect IDR frame by checking NAL type (type 5 = IDR)
+                bool isIdrFrame = h264Frame.IsKeyFrame;
+                if (!isIdrFrame && h264Frame.NalUnits.Count > 0)
+                {
+                    var firstNal = h264Frame.NalUnits[0];
+                    int nalTypeOffset = 0;
+                    if (firstNal.Length >= 5 && firstNal[0] == 0 && firstNal[1] == 0 && firstNal[2] == 0 && firstNal[3] == 1)
+                        nalTypeOffset = 4;
+                    else if (firstNal.Length >= 4 && firstNal[0] == 0 && firstNal[1] == 0 && firstNal[2] == 1)
+                        nalTypeOffset = 3;
+
+                    if (nalTypeOffset > 0 && firstNal.Length > nalTypeOffset)
+                    {
+                        int nalType = firstNal[nalTypeOffset] & 0x1F;
+                        isIdrFrame = (nalType == 5); // IDR slice
+                    }
+                }
+
+                // Check if we should drop this frame for smooth pacing
+                // Never drops keyframes, limits consecutive drops
+                if (pacer.ShouldDropFrame(isIdrFrame))
+                {
+                    pacer.RecordDrop();
+                    return false;
+                }
+
+                // Wait for proper timing to maintain consistent frame rate
+                int delayMs = pacer.GetDelayForNextFrame();
+                if (delayMs > 0)
+                {
+                    await Task.Delay(delayMs, _cts.Token).ConfigureAwait(false);
+                }
+
                 uint frameRtpTimestamp = EncoderTimestampToRtp((ulong)h264Frame.Timestamp, ref client);
 
                 lock (client)
@@ -1333,24 +1495,6 @@ public class Server : IDisposable
 
                 try
                 {
-                    // Detect IDR frame by checking NAL type (type 5 = IDR)
-                    bool isIdrFrame = h264Frame.IsKeyFrame;
-                    if (!isIdrFrame && h264Frame.NalUnits.Count > 0)
-                    {
-                        var firstNal = h264Frame.NalUnits[0];
-                        int nalTypeOffset = 0;
-                        if (firstNal.Length >= 5 && firstNal[0] == 0 && firstNal[1] == 0 && firstNal[2] == 0 && firstNal[3] == 1)
-                            nalTypeOffset = 4;
-                        else if (firstNal.Length >= 4 && firstNal[0] == 0 && firstNal[1] == 0 && firstNal[2] == 1)
-                            nalTypeOffset = 3;
-
-                        if (nalTypeOffset > 0 && firstNal.Length > nalTypeOffset)
-                        {
-                            int nalType = firstNal[nalTypeOffset] & 0x1F;
-                            isIdrFrame = (nalType == 5); // IDR slice
-                        }
-                    }
-
                     // Send SPS/PPS before keyframes/IDR frames, first frame, or if not cached
                     bool needsSpsPps = isIdrFrame ||
                                     client.FrameCount == 1 ||
@@ -1393,6 +1537,9 @@ public class Server : IDisposable
                         bool isLastNalOfFrame = i == nalCount - 1;
                         await SendH264NalAsRtp(client, nalUnit, frameRtpTimestamp, isLastNalOfFrame).ConfigureAwait(false);
                     }
+
+                    // Mark frame as sent for pacing
+                    pacer.MarkFrameSent();
                     return true;
                 }
                 catch (Exception ex)
@@ -1916,8 +2063,17 @@ public class Server : IDisposable
                 client.RtpChannel = 0;
                 client.RtcpChannel = 1;
             }
-            client.Width = 640;
-            client.Height = 480;
+            // Set client dimensions based on camera configuration
+            if (client.CameraId == 1) // Front camera
+            {
+                client.Width = _frontCameraWidth;
+                client.Height = _frontCameraHeight;
+            }
+            else // Back camera
+            {
+                client.Width = _backCameraWidth;
+                client.Height = _backCameraHeight;
+            }
             responseHeaders["Transport"] = $"RTP/AVP/TCP;unicast;interleaved={client.RtpChannel}-{client.RtcpChannel}";
         }
         else if (transportParams.ContainsKey("client_port"))
@@ -2107,6 +2263,7 @@ public class Server : IDisposable
                 ReleaseClientPorts(client);
                 _clientSpsCache.Remove(client.Id);
                 _clientPpsCache.Remove(client.Id);
+                _clientPacers.TryRemove(client.Id, out _);
                 _clients.TryRemove(client.Id, out _);
                 client.Dispose();
             }

@@ -24,6 +24,7 @@
 
   <!-- Link model files from main project (pure C# models without Android dependencies) -->
   <ItemGroup>
+    <Compile Include="..\Models\VideoResolution.cs" Link="LinkedSources\Models\VideoResolution.cs" />
     <Compile Include="..\Models\VideoProfile.cs" Link="LinkedSources\Models\VideoProfile.cs" />
     <Compile Include="..\Models\ServerConfiguration.cs" Link="LinkedSources\Models\ServerConfiguration.cs" />
     <Compile Include="..\Models\RtspRequest.cs" Link="LinkedSources\Models\RtspRequest.cs" />
