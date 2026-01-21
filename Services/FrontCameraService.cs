@@ -25,6 +25,22 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
     private readonly TimeSpan _minFrameInterval = TimeSpan.FromMilliseconds(22); // +- 45 fps
 
     /// <summary>
+    /// Calculates the channel capacity based on resolution to limit memory usage.
+    /// </summary>
+    /// <param name="width">The video width in pixels.</param>
+    /// <param name="height">The video height in pixels.</param>
+    /// <returns>The calculated channel capacity.</returns>
+    private static int GetChannelCapacity(int width, int height)
+    {
+        int frameSize = (width * height * 3) / 2; // YUV420 frame size
+        // Target ~8MB max buffer to prevent memory issues at high resolutions
+        // Keep minimal buffer for high-res to reduce memory pressure
+        const int maxBufferSize = 8_000_000;
+        int capacity = Math.Max(2, maxBufferSize / frameSize);
+        return Math.Min(capacity, 10); // Cap at 10 frames max
+    }
+
+    /// <summary>
     /// Event raised when a new frame is received and processed from the camera.
     /// </summary>
     public event EventHandler<FrameEventArgs>? FrameReceived;
@@ -60,8 +76,10 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
         try
         {
             // Create channel BEFORE starting capture to avoid race condition
+            // Use dynamic capacity based on resolution to limit memory usage
+            int channelCapacity = GetChannelCapacity(width, height);
             _videoFrames = Channel.CreateBounded<VideoFrame>(
-                    new BoundedChannelOptions(25)
+                    new BoundedChannelOptions(channelCapacity)
                     {
                         FullMode = BoundedChannelFullMode.DropOldest,
                         SingleReader = true,
@@ -108,26 +126,45 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
             // Check if channel exists (may be called before StartCapture)
             if (_videoFrames == null)
             {
-                frame?.Dispose();
+                RecycleFrame(frame);
                 return;
             }
 
             var now = DateTime.UtcNow;
             if (now - _lastFrameTime < _minFrameInterval)
             {
-                frame?.Dispose();
+                RecycleFrame(frame);
                 return; // Drop immediately
             }
             _lastFrameTime = DateTime.UtcNow;
             if (!_videoFrames.Writer.TryWrite(frame))
             {
-                frame?.Dispose();
+                RecycleFrame(frame);
             }
         }
         catch (Exception ex)
         {
             ErrorOccurred?.Invoke(this, $"Error processing frame: {ex.Message}");
-            frame?.Dispose();
+            RecycleFrame(frame);
+        }
+    }
+
+    /// <summary>
+    /// Recycles the frame buffer back to the native pool for reuse.
+    /// This reduces memory allocations at high resolutions.
+    /// </summary>
+    /// <param name="frame">The video frame to recycle.</param>
+    private void RecycleFrame(VideoFrame? frame)
+    {
+        if (frame == null) return;
+        try
+        {
+            _cameraCapture?.RecycleFrame(frame);
+        }
+        catch
+        {
+            // Fallback to dispose if recycle fails
+            frame.Dispose();
         }
     }
 
@@ -167,7 +204,8 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
                 }
                 finally
                 {
-                    frame?.Dispose();
+                    // Recycle frame buffer back to native pool for reuse
+                    RecycleFrame(frame);
                 }
             }
             catch (OperationCanceledException)

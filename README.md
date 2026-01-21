@@ -30,7 +30,9 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 ### 🔹 MAUI Integration
 - Uses a .NET MAUI Library to integrate with the AAR
 - Provides two camera services: `FrontCameraService` and `BackCameraService`
-- Real-time frame capture at resolutions from 640x480 to 1920x1080+ (device dependent)
+- Real-time frame capture at resolutions from 320x240 up to **4K UHD (3840x2160)** (device dependent)
+- Automatic encoder resolution validation with graceful fallback
+- Dynamic memory-optimized buffer management for high resolutions
 - Default frame rate: 45 FPS (adjusts dynamically)
 
 ### 🔹 RTSP Server (Pure C#)
@@ -59,6 +61,37 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 - Basic watchdog system to disconnect inactive clients
 - Automatic resource cleanup and memory management
 
+### 🔹 Modular RTSP Architecture (v1.5.8+)
+
+The RTSP server has been refactored into focused, testable modules for better maintainability:
+
+```
+RTSP/
+├── Server.cs                    # Main composition root (~700 lines)
+├── Protocol/
+│   ├── RtspProtocolHandler.cs   # RTSP request parsing and response handling
+│   └── SdpGenerator.cs          # SDP generation for H.264/MJPEG
+├── Transport/
+│   ├── TransportManager.cs      # UDP/TCP sending, port management
+│   ├── RtpPacketBuilder.cs      # RTP packet creation and NAL fragmentation
+│   └── RtcpManager.cs           # RTCP sender reports and receiver feedback
+├── Streaming/
+│   ├── StreamingController.cs   # Main streaming orchestration
+│   ├── H264EncoderManager.cs    # H.264 encoder lifecycle management
+│   └── FramePacer.cs            # Frame delivery timing control
+├── Security/
+│   └── AuthenticationManager.cs # Digest/Basic authentication
+└── ClientManagement/
+    └── ClientManager.cs         # Client lifecycle and cleanup
+```
+
+**Benefits:**
+- **Single Responsibility**: Each module handles one specific concern
+- **Testability**: Interfaces enable dependency injection and unit testing
+- **Maintainability**: Smaller files (~150-350 lines) are easier to navigate
+- **Error Tracking**: Stack traces point to specific modules
+- **Extensibility**: Modules can be extended or replaced independently
+
 ## 🛠️ Installation
 
 ### Prerequisites
@@ -69,7 +102,7 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 
 ### NuGet Package
 ```xml
-<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.7" />
+<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.8" />
 ```
 
 ### Manual Installation
@@ -295,7 +328,8 @@ All classes in this library include comprehensive XML documentation comments for
 | **Services** | `Server`, `MjpegServer`, `FrontCameraService`, `BackCameraService` |
 | **Encoders** | `H264Encoder`, `MediaTekH264Encoder` |
 | **Utilities** | `EventBuss`, `FrameConverterHelper`, `FrameCallback` |
-| **Interfaces** | `ICameraService` |
+| **Interfaces** | `ICameraService`, `IAuthenticationManager`, `IClientManager`, `IH264EncoderManager`, `IRtcpManager`, `IRtpPacketBuilder`, `IRtspProtocolHandler`, `ISdpGenerator`, `IStreamingController`, `ITransportManager` |
+| **RTSP Modules** | `AuthenticationManager`, `ClientManager`, `H264EncoderManager`, `RtcpManager`, `RtpPacketBuilder`, `RtspProtocolHandler`, `SdpGenerator`, `StreamingController`, `TransportManager`, `FramePacer` |
 
 ### Server Class
 
@@ -390,7 +424,7 @@ public class VideoProfile
 
 ### VideoResolution Enum
 
-Predefined video resolution presets for camera capture and H.264 encoding.
+Predefined video resolution presets for camera capture and H.264 encoding. **Now supports up to 4K UHD!**
 
 ```csharp
 public enum VideoResolution
@@ -400,7 +434,9 @@ public enum VideoResolution
     VGA_640x480,        // 640x480 - Standard (default), most compatible (~460 KB buffer)
     SVGA_800x600,       // 800x600 - Enhanced standard (~720 KB buffer)
     HD_1280x720,        // 1280x720 - HD 720p (~1.38 MB buffer)
-    FullHD_1920x1080    // 1920x1080 - Full HD 1080p (~3.11 MB buffer)
+    FullHD_1920x1080,   // 1920x1080 - Full HD 1080p (~3.11 MB buffer)
+    QHD_2560x1440,      // 2560x1440 - QHD/2K (~5.53 MB buffer)
+    UHD_3840x2160       // 3840x2160 - 4K UHD (~12.4 MB buffer)
 }
 
 // Extension methods
@@ -422,6 +458,10 @@ public static string GetDisplayName(this VideoResolution resolution);
 | SVGA (800x600) | ~720 KB | 1 Mbps | 2 Mbps |
 | HD (1280x720) | ~1.38 MB | 2 Mbps | 4 Mbps |
 | Full HD (1920x1080) | ~3.11 MB | 4 Mbps | 8 Mbps |
+| QHD/2K (2560x1440) | ~5.53 MB | 8 Mbps | 16 Mbps |
+| 4K UHD (3840x2160) | ~12.4 MB | 15 Mbps | 30 Mbps |
+
+**Note:** High resolutions (QHD, 4K) require devices with hardware encoder support. The library automatically validates encoder capabilities and falls back to the nearest supported resolution if the requested resolution is not available.
 
 #### Methods
 ```csharp
@@ -653,9 +693,11 @@ backCamera.StartCapture(1280, 720);
 | Low bandwidth / Mobile data | QVGA (320x240) or Low (480x360) | Minimal data usage |
 | Standard streaming | VGA (640x480) | Default, most compatible |
 | High quality local network | HD (1280x720) | Good balance |
-| Maximum quality | Full HD (1920x1080) | Requires powerful device |
+| Professional quality | Full HD (1920x1080) | Requires powerful device |
+| Ultra-high quality | QHD/2K (2560x1440) | High-end devices only |
+| Maximum quality | 4K UHD (3840x2160) | Flagship devices, high bandwidth required |
 
-**Important:** The H.264 encoder buffer size is calculated as `(width * height * 3) / 2` for YUV420 format. Higher resolutions significantly increase memory usage.
+**Important:** The H.264 encoder buffer size is calculated as `(width * height * 3) / 2` for YUV420 format. Higher resolutions significantly increase memory usage. The library uses dynamic buffer management to prevent OOM crashes at high resolutions.
 
 ### Frame Capture for Snapshots and Processing
 
@@ -954,7 +996,7 @@ Unit tests cover pure C# components. Android-dependent classes (camera services,
 
 ## 🛣️ Roadmap
 
-### Completed (v1.1-v1.5)
+### Completed (v1.1-v1.5.8)
 - ✅ Fix H.264 stream stutter issues
 - ✅ Add support for multiple profiles/routes (`/live/front`, `/live/back`)
 - ✅ Add user/password control panel
@@ -967,6 +1009,11 @@ Unit tests cover pure C# components. Android-dependent classes (camera services,
 - ✅ HTTPS support for MJPEG server
 - ✅ Basic authentication for MJPEG server
 - ✅ Unit testing infrastructure with xUnit
+- ✅ **4K UHD and QHD resolution support**
+- ✅ **High resolution OOM crash fix**
+- ✅ **Automatic encoder resolution validation and fallback**
+- ✅ **Dynamic memory-optimized buffer management**
+- ✅ **Modular RTSP server architecture refactoring**
 
 ### Planned (v1.6+)
 - ⬜ Fix image rotation on some devices
@@ -1419,6 +1466,91 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
   - Bitrate recommendations scale with resolution for optimal quality
 
   - **Impact**: Users can now easily configure video resolution to balance quality, bandwidth, and device performance. Default resolution remains VGA (640x480) for backward compatibility.
+
+- v1.5.8: Modular Architecture Refactoring and High Resolution Support. This release refactors the monolithic Server.cs into focused, testable modules and adds support for resolutions up to 4K UHD.
+
+  - **Major RTSP Server Modular Refactoring**:
+
+  - Problem: The original `Server.cs` was 2,621 lines with 68 methods handling too many responsibilities (networking, protocol parsing, authentication, encoding, streaming, transport, etc.), making it difficult to maintain, test, and debug.
+
+  - Fix: Refactored into 9 focused modules with clear interfaces:
+
+    | Module | Responsibility | Lines |
+    |--------|---------------|-------|
+    | `RtspProtocolHandler` | RTSP request parsing and response generation | ~326 |
+    | `SdpGenerator` | SDP generation for H.264 and MJPEG | ~173 |
+    | `AuthenticationManager` | Digest/Basic authentication, nonce management | ~275 |
+    | `TransportManager` | UDP/TCP transport, port allocation | ~254 |
+    | `RtpPacketBuilder` | RTP packet creation, NAL fragmentation | ~292 |
+    | `RtcpManager` | RTCP sender reports, receiver feedback | ~242 |
+    | `H264EncoderManager` | H.264 encoder lifecycle, frame queues | ~435 |
+    | `StreamingController` | Main streaming orchestration | ~340 |
+    | `ClientManager` | Client lifecycle, cleanup, caching | ~153 |
+    | `Server` (reduced) | Composition root, wiring | ~700 |
+
+  - **New Directory Structure**:
+    ```
+    RTSP/
+    ├── Server.cs
+    ├── Protocol/
+    │   ├── IRtspProtocolHandler.cs, RtspProtocolHandler.cs
+    │   └── ISdpGenerator.cs, SdpGenerator.cs
+    ├── Transport/
+    │   ├── ITransportManager.cs, TransportManager.cs
+    │   ├── IRtpPacketBuilder.cs, RtpPacketBuilder.cs
+    │   └── IRtcpManager.cs, RtcpManager.cs
+    ├── Streaming/
+    │   ├── IH264EncoderManager.cs, H264EncoderManager.cs
+    │   ├── IStreamingController.cs, StreamingController.cs
+    │   └── FramePacer.cs
+    ├── Security/
+    │   └── IAuthenticationManager.cs, AuthenticationManager.cs
+    └── ClientManagement/
+        └── IClientManager.cs, ClientManager.cs
+    ```
+
+  - **Benefits**:
+    - **Single Responsibility**: Each module handles one specific concern
+    - **Testability**: Interfaces enable dependency injection and unit testing
+    - **Maintainability**: Smaller files (~150-350 lines) are easier to navigate
+    - **Error Tracking**: Stack traces now point to specific modules
+    - **Extensibility**: Modules can be extended or replaced independently
+
+  - **Added 4K UHD and QHD Resolution Support**:
+
+  - New resolution presets: QHD/2K (2560x1440) and 4K UHD (3840x2160)
+  - Encoder now supports fallback resolutions including 4K, QHD+, QHD, and FHD+
+  - EncoderInfo now tracks `Supports4K`, `SupportsQHD`, `SupportsFullHD`, and `SupportsHD` capabilities
+
+  - **Fixed High Resolution OOM Crashes**:
+
+  - Problem: Streaming at resolutions higher than HD 720p (e.g., FullHD, 1920x1440, 4K) caused `OutOfMemoryError` crashes due to excessive frame buffer memory usage.
+
+  - Root Causes Identified:
+    - Fixed 25-frame camera buffer caused ~78MB memory usage at FullHD
+    - No encoder resolution validation before MediaCodec configuration
+    - No graceful fallback when encoder didn't support requested resolution
+
+  - Fix:
+    - **Dynamic Channel Capacity**: Camera services now calculate buffer capacity based on resolution. Target ~8MB max buffer with 2-10 frames depending on resolution (vs. fixed 25 frames before)
+    - **Encoder Resolution Validation**: `IsResolutionSupported()` method checks if encoder supports the requested resolution before configuration
+    - **Graceful Fallback**: `GetNearestSupportedResolution()` finds the nearest supported resolution if requested resolution isn't available
+    - **ActualWidth/ActualHeight Properties**: Encoder exposes actual resolution being used after any fallback
+    - **Server Dimension Updates**: Server tracks and updates stored dimensions when encoder falls back to different resolution
+
+  - **EncoderInfo Enhancements**:
+
+  - Added `MaxSupportedWidth` and `MaxSupportedHeight` properties
+  - Added `Supports4K`, `SupportsQHD`, `SupportsFullHD`, `SupportsHD` boolean flags
+  - These are populated during encoder evaluation for capability reporting
+
+  - **Camera Library Improvements** (Kotlin AAR):
+
+  - Dynamic ImageReader buffer sizing based on resolution
+  - Memory pressure detection to prevent OOM in camera capture layer
+  - Optimized buffer pool management for high-resolution frames
+
+  - **Impact**: The codebase is now more maintainable and testable. Users can safely request high resolutions (including 4K) without crashes. The library will automatically fall back to the nearest supported resolution if the device's encoder doesn't support the requested resolution.
 
 ---
 

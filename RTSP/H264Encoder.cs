@@ -16,8 +16,8 @@ namespace BaluMediaServer.Services;
 public class H264Encoder : IDisposable
 {
     private MediaCodec? _encoder;
-    private readonly int _width;
-    private readonly int _height;
+    private int _width;
+    private int _height;
     private int _bitrate;
     private readonly int _frameRate;
     private bool _isRunning;
@@ -48,6 +48,16 @@ public class H264Encoder : IDisposable
     /// Event raised when a frame has been encoded and is ready for streaming.
     /// </summary>
     public event EventHandler<H264FrameEventArgs>? FrameEncoded;
+
+    /// <summary>
+    /// Gets the actual width being used by the encoder after any resolution fallback.
+    /// </summary>
+    public int ActualWidth => _width;
+
+    /// <summary>
+    /// Gets the actual height being used by the encoder after any resolution fallback.
+    /// </summary>
+    public int ActualHeight => _height;
 
     /// <summary>
     /// Represents frame data waiting to be encoded.
@@ -242,6 +252,18 @@ public class H264Encoder : IDisposable
                 }
             }
 
+            // 4b. Check video capabilities for supported resolutions
+            var videoCaps = caps.VideoCapabilities;
+            if (videoCaps != null)
+            {
+                encoderInfo.MaxSupportedWidth = (int)videoCaps.SupportedWidths.Upper;
+                encoderInfo.MaxSupportedHeight = (int)videoCaps.SupportedHeights.Upper;
+                encoderInfo.Supports4K = videoCaps.IsSizeSupported(3840, 2160);
+                encoderInfo.SupportsQHD = videoCaps.IsSizeSupported(2560, 1440);
+                encoderInfo.SupportsFullHD = videoCaps.IsSizeSupported(1920, 1080);
+                encoderInfo.SupportsHD = videoCaps.IsSizeSupported(1280, 720);
+            }
+
             // 5. Check profile/level support
             if (caps.ProfileLevels != null && caps.ProfileLevels.Count > 0)
             {
@@ -278,7 +300,52 @@ public class H264Encoder : IDisposable
             return null!;
         }
     }
-    
+
+    /// <summary>
+    /// Checks if the specified resolution is supported by the encoder.
+    /// </summary>
+    /// <param name="width">The width in pixels.</param>
+    /// <param name="height">The height in pixels.</param>
+    /// <returns><c>true</c> if the resolution is supported; otherwise, <c>false</c>.</returns>
+    private bool IsResolutionSupported(int width, int height)
+    {
+        if (_bestEncoder?.Capabilities?.VideoCapabilities == null) return true;
+        return _bestEncoder.Capabilities.VideoCapabilities.IsSizeSupported(width, height);
+    }
+
+    /// <summary>
+    /// Gets the nearest supported resolution that fits within the requested dimensions.
+    /// </summary>
+    /// <param name="width">The requested width in pixels.</param>
+    /// <param name="height">The requested height in pixels.</param>
+    /// <returns>A tuple containing the nearest supported width and height.</returns>
+    private (int width, int height) GetNearestSupportedResolution(int width, int height)
+    {
+        var videoCaps = _bestEncoder?.Capabilities?.VideoCapabilities;
+        if (videoCaps == null) return (width, height);
+
+        // Try common resolutions in descending order (including 4K and high-res)
+        var resolutions = new[] {
+            (3840, 2160), // 4K UHD
+            (3200, 1800), // QHD+
+            (2560, 1440), // QHD/2K
+            (1920, 1440), // FHD+ (4:3)
+            (1920, 1080), // FHD
+            (1280, 720),  // HD
+            (800, 600),
+            (640, 480),   // VGA
+            (480, 360),
+            (320, 240)
+        };
+
+        foreach (var (w, h) in resolutions)
+        {
+            if (w <= width && h <= height && videoCaps.IsSizeSupported(w, h))
+                return (w, h);
+        }
+        return (640, 480); // Safe fallback
+    }
+
     /// <summary>
     /// Starts the H.264 encoder and begins the encoding loop.
     /// </summary>
@@ -291,6 +358,15 @@ public class H264Encoder : IDisposable
 
             try
             {
+                // Check resolution support and fall back if necessary
+                if (!IsResolutionSupported(_width, _height))
+                {
+                    var (newW, newH) = GetNearestSupportedResolution(_width, _height);
+                    Log.Warn("H264", $"Resolution {_width}x{_height} not supported, falling back to {newW}x{newH}");
+                    _width = newW;
+                    _height = newH;
+                }
+
                 // Create format with encoder's supported color format
                 var format = MediaFormat.CreateVideoFormat(MediaFormat.MimetypeVideoAvc, _width, _height);
 
@@ -315,7 +391,7 @@ public class H264Encoder : IDisposable
                 format.SetInteger(MediaFormat.KeyColorFormat, _selectedColorFormat);
                 format.SetInteger(MediaFormat.KeyBitRate, _bitrate);
                 format.SetInteger(MediaFormat.KeyFrameRate, _frameRate);
-                format.SetInteger(MediaFormat.KeyIFrameInterval, 1); // 1 second between keyframes for lower latency
+                format.SetFloat(MediaFormat.KeyIFrameInterval, 0.25f); // 0.25 seconds between keyframes for fast recovery
                 
                 // Set profile and level for better compatibility
                 format.SetInteger(MediaFormat.KeyProfile, (int)MediaCodecProfileType.Avcprofilebaseline);

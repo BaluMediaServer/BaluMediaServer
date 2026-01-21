@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
@@ -19,12 +20,12 @@ namespace BaluMediaServer.Services;
 public class MjpegServer : IDisposable
 {
     private readonly HttpListener _listener;
-    private Task? _thread, _watchdog;
-    private DateTime _lastFrame = DateTime.UtcNow, _lastBackFrameSent = DateTime.UtcNow, _lastFrontFrameSent = DateTime.UtcNow;
-    private readonly double _frameIntervalMs;
+    private Task? _thread, _watchdog, _backEncoderTask, _frontEncoderTask;
+    private DateTime _lastFrame = DateTime.UtcNow;
     private readonly CancellationTokenSource _cts = new();
     private readonly ConcurrentDictionary<HttpListenerResponse, string> _clientsFront = new(), _clientsBack = new();
     private readonly ConcurrentDictionary<string, DateTime> _clientLastFrameTime = new();
+    private readonly ConcurrentDictionary<string, int> _clientFrameCount = new(); // Track frames for batch flushing
     private int _quality = 80;
     private int _port;
     private string _bindAddress;
@@ -32,10 +33,28 @@ public class MjpegServer : IDisposable
     private volatile bool _streamStarted = true;  // volatile for thread-safe reads
     private readonly object _streamLock = new();
     private Dictionary<string, string> _users = new();
-    private const int ClientTimeoutSeconds = 30;
     private bool _useHttps = false;
     private string? _certificatePath;
     private string? _certificatePassword;
+
+    // Performance optimization constants
+    private const int ClientTimeoutSeconds = 30;
+    private const int WriteTimeoutMs = 5000;        // Increased from 2000ms for slow networks
+    private const int WatchdogTimeoutSeconds = 10;  // Increased from 5s for better tolerance
+    private const int FlushEveryNFrames = 5;        // Batch flushing for smoother delivery
+    private const int FrameQueueCapacity = 10;      // Larger buffer for smoother video
+
+    // Frame queues for background encoding (larger buffer = smoother video, more delay)
+    private readonly Channel<FrameEventArgs> _backFrameQueue = Channel.CreateBounded<FrameEventArgs>(
+        new BoundedChannelOptions(FrameQueueCapacity) { FullMode = BoundedChannelFullMode.DropOldest });
+    private readonly Channel<FrameEventArgs> _frontFrameQueue = Channel.CreateBounded<FrameEventArgs>(
+        new BoundedChannelOptions(FrameQueueCapacity) { FullMode = BoundedChannelFullMode.DropOldest });
+
+    // Pre-computed boundary bytes to avoid repeated allocations
+    private static readonly byte[] BoundaryBytes = Encoding.ASCII.GetBytes("\r\n--frame\r\n");
+    private static readonly byte[] ContentTypeBytes = Encoding.ASCII.GetBytes("Content-Type: image/jpeg\r\n");
+    private static readonly byte[] ContentLengthPrefix = Encoding.ASCII.GetBytes("Content-Length: ");
+    private static readonly byte[] HeaderEnd = Encoding.ASCII.GetBytes("\r\n\r\n");
 
     /// <summary>
     /// Initializes a new instance of the <see cref="MjpegServer"/> class.
@@ -52,7 +71,6 @@ public class MjpegServer : IDisposable
         bool authEnabled = false, Dictionary<string, string>? users = null,
         bool useHttps = false, string? certificatePath = null, string? certificatePassword = null)
     {
-        _frameIntervalMs = 1000.0 / 30;
         _port = port;
         _bindAddress = bindAddress;
         _authEnabled = authEnabled;
@@ -80,6 +98,10 @@ public class MjpegServer : IDisposable
         Server.OnNewBackFrame += OnBackFrameAvailable;
         Server.OnNewFrontFrame += OnFrontFrameAvailable;
         _watchdog = Task.Run(Watchdog, _cts.Token);
+
+        // Start background encoder tasks (don't block camera callbacks)
+        _backEncoderTask = Task.Run(BackEncoderLoopAsync, _cts.Token);
+        _frontEncoderTask = Task.Run(FrontEncoderLoopAsync, _cts.Token);
     }
     /// <summary>
     /// Gets a value indicating whether the server is currently streaming.
@@ -95,14 +117,20 @@ public class MjpegServer : IDisposable
         _cts?.Cancel();
         Server.OnNewBackFrame -= OnBackFrameAvailable;
         Server.OnNewFrontFrame -= OnFrontFrameAvailable;
-        
+
+        // Complete frame queues to stop encoder tasks
+        _backFrameQueue.Writer.TryComplete();
+        _frontFrameQueue.Writer.TryComplete();
+
         //EventBuss.Command -= OnCommandSend;
         _listener?.Close();
-        
+
         try
         {
             _thread?.Dispose();
             _watchdog?.Dispose();
+            _backEncoderTask?.Dispose();
+            _frontEncoderTask?.Dispose();
         }
         catch { }
         _cts?.Dispose();
@@ -129,9 +157,9 @@ public class MjpegServer : IDisposable
                 // This prevents the watchdog from starting cameras when using StartWithoutStream mode
                 if (_streamStarted && _listener.IsListening && ClientCount > 0)
                 {
-                    if ((DateTime.UtcNow - _lastFrame).TotalSeconds > 5)
+                    if ((DateTime.UtcNow - _lastFrame).TotalSeconds > WatchdogTimeoutSeconds)
                     {
-                        Log.Debug("MJPEG SERVER", "Watchdog: No frames received for 5s, restarting cameras");
+                        Log.Debug("MJPEG SERVER", $"Watchdog: No frames received for {WatchdogTimeoutSeconds}s, restarting cameras");
                         EventBuss.SendCommand(BussCommand.START_CAMERA_FRONT);
                         EventBuss.SendCommand(BussCommand.START_CAMERA_BACK);
                         await Task.Delay(5000, _cts.Token);
@@ -150,26 +178,71 @@ public class MjpegServer : IDisposable
     {
         if (arg != null && arg.Data != null && arg.Data.Length > 0)
         {
-            var now = DateTime.UtcNow;
-            if ((now - _lastBackFrameSent).TotalMilliseconds < _frameIntervalMs)
-                return;
-            
-            _lastBackFrameSent = now;
-            var jpegData = Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height, Android.Graphics.ImageFormatType.Nv21, _quality);
-            Task.Run(async () => await PushBackFrameAsync(jpegData), _cts.Token);
+            // No frame rate limiting - queue all frames for smoother video
+            // The bounded channel will drop oldest if overwhelmed
+            _backFrameQueue.Writer.TryWrite(arg);
         }
     }
+
     private void OnFrontFrameAvailable(object? sender, FrameEventArgs arg)
     {
         if (arg != null && arg.Data != null && arg.Data.Length > 0)
         {
-            var now = DateTime.UtcNow;
-            if ((now - _lastFrontFrameSent).TotalMilliseconds < _frameIntervalMs)
-                return;
+            // No frame rate limiting - queue all frames for smoother video
+            // The bounded channel will drop oldest if overwhelmed
+            _frontFrameQueue.Writer.TryWrite(arg);
+        }
+    }
 
-            _lastFrontFrameSent = now;
-            var jpegData = Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height, Android.Graphics.ImageFormatType.Nv21, _quality);
-            Task.Run(async () => await PushFrontFrameAsync(jpegData), _cts.Token);
+    /// <summary>
+    /// Background task that encodes and pushes back camera frames.
+    /// </summary>
+    private async Task BackEncoderLoopAsync()
+    {
+        await foreach (var arg in _backFrameQueue.Reader.ReadAllAsync(_cts.Token))
+        {
+            try
+            {
+                if (_clientsBack.IsEmpty) continue; // Skip encoding if no clients
+
+                var jpegData = Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height,
+                    Android.Graphics.ImageFormatType.Nv21, _quality);
+                await PushBackFrameAsync(jpegData).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (System.Exception ex)
+            {
+                Log.Debug("MJPEG SERVER", $"Back encoder error: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Background task that encodes and pushes front camera frames.
+    /// </summary>
+    private async Task FrontEncoderLoopAsync()
+    {
+        await foreach (var arg in _frontFrameQueue.Reader.ReadAllAsync(_cts.Token))
+        {
+            try
+            {
+                if (_clientsFront.IsEmpty) continue; // Skip encoding if no clients
+
+                var jpegData = Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height,
+                    Android.Graphics.ImageFormatType.Nv21, _quality);
+                await PushFrontFrameAsync(jpegData).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (System.Exception ex)
+            {
+                Log.Debug("MJPEG SERVER", $"Front encoder error: {ex.Message}");
+            }
         }
     }
     /// <summary>
@@ -345,8 +418,9 @@ public class MjpegServer : IDisposable
                 _clientsFront.TryRemove(response, out _);
             }
 
-            // Cleanup frame time tracking
+            // Cleanup frame time and frame count tracking
             _clientLastFrameTime.TryRemove(clientId, out _);
+            _clientFrameCount.TryRemove(clientId, out _);
 
             try
             {
@@ -390,9 +464,10 @@ public class MjpegServer : IDisposable
             return false;
         }
     }
-    private async Task WriteDataAsync(HttpListenerResponse client, byte[] jpegBytes, bool isBackCamera)
+    private async Task WriteDataAsync(HttpListenerResponse client, byte[] jpegBytes, bool isBackCamera, CancellationToken cancellationToken)
     {
         string? clientId = null;
+        byte[]? combinedBuffer = null;
 
         try
         {
@@ -412,13 +487,40 @@ public class MjpegServer : IDisposable
             // Update last frame time for this client (used for timeout tracking)
             _clientLastFrameTime[clientId] = DateTime.UtcNow;
 
-            // Write MJPEG frame
-            var header = Encoding.ASCII.GetBytes(
-                $"\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {jpegBytes.Length}\r\n\r\n");
+            // Build complete frame in single buffer for efficient single write
+            var contentLengthStr = jpegBytes.Length.ToString();
+            var headerSize = BoundaryBytes.Length + ContentTypeBytes.Length +
+                            ContentLengthPrefix.Length + contentLengthStr.Length + HeaderEnd.Length;
+            var totalSize = headerSize + jpegBytes.Length;
 
-            await client.OutputStream.WriteAsync(header, 0, header.Length, _cts.Token).ConfigureAwait(false);
-            await client.OutputStream.WriteAsync(jpegBytes, 0, jpegBytes.Length, _cts.Token).ConfigureAwait(false);
-            await client.OutputStream.FlushAsync(_cts.Token).ConfigureAwait(false);
+            // Rent buffer from pool to avoid allocation
+            combinedBuffer = ArrayPool<byte>.Shared.Rent(totalSize);
+
+            // Copy all parts into combined buffer
+            var offset = 0;
+            Buffer.BlockCopy(BoundaryBytes, 0, combinedBuffer, offset, BoundaryBytes.Length);
+            offset += BoundaryBytes.Length;
+            Buffer.BlockCopy(ContentTypeBytes, 0, combinedBuffer, offset, ContentTypeBytes.Length);
+            offset += ContentTypeBytes.Length;
+            Buffer.BlockCopy(ContentLengthPrefix, 0, combinedBuffer, offset, ContentLengthPrefix.Length);
+            offset += ContentLengthPrefix.Length;
+            var contentLengthBytes = Encoding.ASCII.GetBytes(contentLengthStr);
+            Buffer.BlockCopy(contentLengthBytes, 0, combinedBuffer, offset, contentLengthBytes.Length);
+            offset += contentLengthBytes.Length;
+            Buffer.BlockCopy(HeaderEnd, 0, combinedBuffer, offset, HeaderEnd.Length);
+            offset += HeaderEnd.Length;
+            Buffer.BlockCopy(jpegBytes, 0, combinedBuffer, offset, jpegBytes.Length);
+
+            // Single write for entire frame (more efficient than multiple small writes)
+            await client.OutputStream.WriteAsync(combinedBuffer, 0, totalSize, cancellationToken).ConfigureAwait(false);
+
+            // Batch flushing: only flush every N frames to reduce syscalls
+            var frameCount = _clientFrameCount.AddOrUpdate(clientId, 1, (_, count) => count + 1);
+            if (frameCount >= FlushEveryNFrames)
+            {
+                await client.OutputStream.FlushAsync(cancellationToken).ConfigureAwait(false);
+                _clientFrameCount[clientId] = 0;
+            }
         }
         catch
         {
@@ -432,13 +534,22 @@ public class MjpegServer : IDisposable
                 _clientsFront.TryRemove(client, out _);
             }
 
-            // Cleanup frame time tracking
+            // Cleanup frame time and frame count tracking
             if (clientId != null)
             {
                 _clientLastFrameTime.TryRemove(clientId, out _);
+                _clientFrameCount.TryRemove(clientId, out _);
             }
 
             try { client.OutputStream.Close(); client.Close(); } catch { }
+        }
+        finally
+        {
+            // Return buffer to pool
+            if (combinedBuffer != null)
+            {
+                ArrayPool<byte>.Shared.Return(combinedBuffer);
+            }
         }
     }
 
@@ -456,7 +567,7 @@ public class MjpegServer : IDisposable
 
         // Fire-and-forget per client to avoid blocking on slow clients
         var tasks = _clientsBack.Keys.Select(client =>
-            WriteDataAsyncWithTimeout(client, jpegBytes, isBackCamera: true, timeoutMs: 2000));
+            WriteDataAsyncWithTimeout(client, jpegBytes, isBackCamera: true));
 
         try
         {
@@ -482,7 +593,7 @@ public class MjpegServer : IDisposable
 
         // Fire-and-forget per client to avoid blocking on slow clients
         var tasks = _clientsFront.Keys.Select(client =>
-            WriteDataAsyncWithTimeout(client, jpegBytes, isBackCamera: false, timeoutMs: 2000));
+            WriteDataAsyncWithTimeout(client, jpegBytes, isBackCamera: false));
 
         try
         {
@@ -497,35 +608,39 @@ public class MjpegServer : IDisposable
     /// <summary>
     /// Writes frame data with a timeout to prevent slow clients from blocking others
     /// </summary>
-    private async Task WriteDataAsyncWithTimeout(HttpListenerResponse client, byte[] jpegBytes, bool isBackCamera, int timeoutMs)
+    private async Task WriteDataAsyncWithTimeout(HttpListenerResponse client, byte[] jpegBytes, bool isBackCamera)
     {
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
-        cts.CancelAfter(timeoutMs);
+        cts.CancelAfter(WriteTimeoutMs);
 
         try
         {
-            await WriteDataAsync(client, jpegBytes, isBackCamera).ConfigureAwait(false);
+            // FIX: Pass the linked cancellation token to WriteDataAsync
+            await WriteDataAsync(client, jpegBytes, isBackCamera, cts.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
             // Timeout - remove slow client
+            string? clientId = null;
             if (isBackCamera)
             {
-                if (_clientsBack.TryRemove(client, out var clientId))
+                if (_clientsBack.TryRemove(client, out clientId))
                 {
                     _clientLastFrameTime.TryRemove(clientId, out _);
+                    _clientFrameCount.TryRemove(clientId, out _);
                 }
             }
             else
             {
-                if (_clientsFront.TryRemove(client, out var clientId))
+                if (_clientsFront.TryRemove(client, out clientId))
                 {
                     _clientLastFrameTime.TryRemove(clientId, out _);
+                    _clientFrameCount.TryRemove(clientId, out _);
                 }
             }
 
             try { client.OutputStream.Close(); client.Close(); } catch { }
-            Log.Debug("MJPEG SERVER", "Removed slow client due to timeout");
+            Log.Debug("MJPEG SERVER", $"Removed slow client due to {WriteTimeoutMs}ms timeout");
         }
     }
 

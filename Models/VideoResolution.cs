@@ -50,12 +50,26 @@ public enum VideoResolution
     HD_1280x720,
 
     /// <summary>
-    /// 1920x1080 resolution (Full HD/1080p). Maximum quality.
+    /// 1920x1080 resolution (Full HD/1080p). High quality.
     /// Requires significant processing power and bandwidth.
-    /// May not be supported on all devices or cause performance issues.
     /// Recommended bitrate: 4-8 Mbps. Frame buffer: ~3.11 MB.
     /// </summary>
-    FullHD_1920x1080
+    FullHD_1920x1080,
+
+    /// <summary>
+    /// 2560x1440 resolution (QHD/2K). Ultra-high quality.
+    /// Requires high-end device with hardware encoder support.
+    /// Recommended bitrate: 8-16 Mbps. Frame buffer: ~5.53 MB.
+    /// </summary>
+    QHD_2560x1440,
+
+    /// <summary>
+    /// 3840x2160 resolution (4K UHD). Maximum quality.
+    /// Requires flagship device with 4K hardware encoder support.
+    /// May not be supported on all devices - encoder will fall back automatically.
+    /// Recommended bitrate: 15-30 Mbps. Frame buffer: ~12.4 MB.
+    /// </summary>
+    UHD_3840x2160
 }
 
 /// <summary>
@@ -77,6 +91,8 @@ public static class VideoResolutionExtensions
         VideoResolution.SVGA_800x600 => 800,
         VideoResolution.HD_1280x720 => 1280,
         VideoResolution.FullHD_1920x1080 => 1920,
+        VideoResolution.QHD_2560x1440 => 2560,
+        VideoResolution.UHD_3840x2160 => 3840,
         _ => 640
     };
 
@@ -93,6 +109,8 @@ public static class VideoResolutionExtensions
         VideoResolution.SVGA_800x600 => 600,
         VideoResolution.HD_1280x720 => 720,
         VideoResolution.FullHD_1920x1080 => 1080,
+        VideoResolution.QHD_2560x1440 => 1440,
+        VideoResolution.UHD_3840x2160 => 2160,
         _ => 480
     };
 
@@ -109,6 +127,8 @@ public static class VideoResolutionExtensions
         VideoResolution.SVGA_800x600 => 1000000,
         VideoResolution.HD_1280x720 => 2000000,
         VideoResolution.FullHD_1920x1080 => 4000000,
+        VideoResolution.QHD_2560x1440 => 8000000,
+        VideoResolution.UHD_3840x2160 => 15000000,
         _ => 800000
     };
 
@@ -125,6 +145,8 @@ public static class VideoResolutionExtensions
         VideoResolution.SVGA_800x600 => 2000000,
         VideoResolution.HD_1280x720 => 4000000,
         VideoResolution.FullHD_1920x1080 => 8000000,
+        VideoResolution.QHD_2560x1440 => 16000000,
+        VideoResolution.UHD_3840x2160 => 30000000,
         _ => 1500000
     };
 
@@ -158,6 +180,8 @@ public static class VideoResolutionExtensions
         VideoResolution.SVGA_800x600 => "SVGA (800x600)",
         VideoResolution.HD_1280x720 => "HD 720p (1280x720)",
         VideoResolution.FullHD_1920x1080 => "Full HD 1080p (1920x1080)",
+        VideoResolution.QHD_2560x1440 => "QHD 2K (2560x1440)",
+        VideoResolution.UHD_3840x2160 => "4K UHD (3840x2160)",
         _ => "VGA (640x480)"
     };
 }

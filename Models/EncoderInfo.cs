@@ -48,4 +48,34 @@ public class EncoderInfo
     /// Gets or sets the codec capabilities including supported profiles and levels.
     /// </summary>
     public MediaCodecInfo.CodecCapabilities Capabilities { get; set; } = default!;
+
+    /// <summary>
+    /// Gets or sets the maximum supported video width in pixels.
+    /// </summary>
+    public int MaxSupportedWidth { get; set; }
+
+    /// <summary>
+    /// Gets or sets the maximum supported video height in pixels.
+    /// </summary>
+    public int MaxSupportedHeight { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the encoder supports FullHD (1920x1080) resolution.
+    /// </summary>
+    public bool SupportsFullHD { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the encoder supports HD (1280x720) resolution.
+    /// </summary>
+    public bool SupportsHD { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the encoder supports 4K UHD (3840x2160) resolution.
+    /// </summary>
+    public bool Supports4K { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the encoder supports QHD/2K (2560x1440) resolution.
+    /// </summary>
+    public bool SupportsQHD { get; set; }
 }
