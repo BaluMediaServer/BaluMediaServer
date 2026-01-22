@@ -521,6 +521,11 @@ public class Server : IDisposable
                 var playingClients = _clientManager.PlayingClientCount;
                 var deadClients = _clientManager.GetDeadClients();
 
+                if (deadClients.Count > 0)
+                {
+                    Log.Info("[RTSP Server]", $"WatchDog cleaning up {deadClients.Count} dead client(s)");
+                }
+
                 foreach (var client in deadClients)
                 {
                     _clientManager.CleanupClient(client);
@@ -531,7 +536,7 @@ public class Server : IDisposable
 
                 if (playingClients == 0 && _isStreaming)
                 {
-                    Log.Info("[RTSP Server]", "No playing clients, stopping encoders and resetting streaming state");
+                    Log.Info("[RTSP Server]", $"WatchDog: No playing RTSP clients, stopping encoders (MJPEG clients: {mjpegClientCount})");
 
                     if (!mjpegHasClients)
                     {
@@ -539,11 +544,11 @@ public class Server : IDisposable
                         _frontService.StopCapture();
                         _isCapturingBack = false;
                         _isCapturingFront = false;
-                        Log.Info("[RTSP Server]", "Cameras stopped - no RTSP or MJPEG clients");
+                        Log.Info("[RTSP Server]", "WatchDog: Cameras stopped - no RTSP or MJPEG clients");
                     }
                     else
                     {
-                        Log.Info("[RTSP Server]", $"Keeping cameras running for {mjpegClientCount} MJPEG client(s)");
+                        Log.Info("[RTSP Server]", $"WatchDog: Keeping cameras running for {mjpegClientCount} MJPEG client(s)");
                     }
 
                     _encoderManager.StopEncoder(0);

@@ -56,8 +56,10 @@ public class TransportManager : ITransportManager
             if (socket?.Connected ?? false)
             {
                 // Use a timeout for the send operation to detect stuck connections
+                // Reduced from 5s to 3s for faster detection, with improved error counting
+                // Allows up to 10 consecutive timeouts before disconnect (~30 seconds total)
                 using var sendCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
-                sendCts.CancelAfter(5000); // 5 second timeout for send
+                sendCts.CancelAfter(3000);
 
                 await socket.SendAsync(frame, SocketFlags.None, sendCts.Token).ConfigureAwait(false);
 
@@ -76,45 +78,59 @@ public class TransportManager : ITransportManager
         }
         catch (OperationCanceledException)
         {
-            Log.Warn("[TransportManager]", "TCP send timeout - client may be disconnected");
             if (client != null)
             {
                 lock (client)
                 {
                     client.ConsecutiveSendErrors++;
+                    Log.Warn("[TransportManager]", $"TCP send timeout (3s) - client {client.Id} error count: {client.ConsecutiveSendErrors}");
                     if (client.ConsecutiveSendErrors >= 10)
                     {
                         client.IsPlaying = false;
+                        Log.Error("[TransportManager]", $"Client {client.Id} marked for cleanup - too many timeouts");
                     }
                 }
+            }
+            else
+            {
+                Log.Warn("[TransportManager]", "TCP send timeout - client may be disconnected");
             }
             return false;
         }
         catch (SocketException ex)
         {
-            Log.Error("[TransportManager]", $"TCP send socket error: {ex.Message}");
             if (client != null)
             {
+                Log.Error("[TransportManager]", $"TCP send socket error for client {client.Id}: {ex.SocketErrorCode} - {ex.Message}");
                 lock (client)
                 {
-                    client.IsPlaying = false; // Mark for cleanup
+                    client.IsPlaying = false; // Mark for cleanup on socket errors
                 }
+            }
+            else
+            {
+                Log.Error("[TransportManager]", $"TCP send socket error: {ex.SocketErrorCode} - {ex.Message}");
             }
             return false;
         }
         catch (Exception ex)
         {
-            Log.Error("[TransportManager]", $"TCP send error: {ex.Message}");
             if (client != null)
             {
                 lock (client)
                 {
                     client.ConsecutiveSendErrors++;
+                    Log.Error("[TransportManager]", $"TCP send error for client {client.Id} (error count: {client.ConsecutiveSendErrors}): {ex.Message}");
                     if (client.ConsecutiveSendErrors >= 10)
                     {
                         client.IsPlaying = false;
+                        Log.Error("[TransportManager]", $"Client {client.Id} marked for cleanup after {client.ConsecutiveSendErrors} errors");
                     }
                 }
+            }
+            else
+            {
+                Log.Error("[TransportManager]", $"TCP send error: {ex.Message}");
             }
             return false;
         }
@@ -140,16 +156,18 @@ public class TransportManager : ITransportManager
         }
         catch (SocketException ex)
         {
-            Log.Error("[TransportManager]", $"UDP send error: {ex.Message}");
             lock (client)
             {
                 client.ConsecutiveSendErrors++;
+                Log.Error("[TransportManager]", $"UDP send error for client {client.Id} (error count: {client.ConsecutiveSendErrors}): {ex.SocketErrorCode} - {ex.Message}");
+
                 // Mark client for cleanup if persistent errors
                 if (ex.SocketErrorCode == SocketError.HostUnreachable ||
                     ex.SocketErrorCode == SocketError.NetworkUnreachable ||
                     client.ConsecutiveSendErrors >= 5)
                 {
                     client.IsPlaying = false;
+                    Log.Warn("[TransportManager]", $"Client {client.Id} marked for cleanup - unreachable or too many UDP errors");
                 }
             }
             return false;
@@ -237,7 +255,8 @@ public class TransportManager : ITransportManager
 
             // Poll with SelectRead: returns true if connection is closed, reset, terminated, or data is available
             // If Poll returns true but Available is 0, the connection was closed
-            bool pollResult = socket.Poll(1000, SelectMode.SelectRead); // 1ms timeout
+            // Increased from 1ms to 10ms timeout to be more forgiving for slower but stable connections
+            bool pollResult = socket.Poll(10000, SelectMode.SelectRead);
             bool hasData = socket.Available > 0;
 
             // If poll says readable but no data available, the socket was closed

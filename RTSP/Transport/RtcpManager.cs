@@ -139,47 +139,75 @@ public class RtcpManager : IRtcpManager
     {
         byte[] buffer = new byte[1024];
 
-        while (!client.IsPlaying && !_cancellationToken.IsCancellationRequested)
-            await Task.Delay(100, _cancellationToken).ConfigureAwait(false);
+        try
+        {
+            while (!client.IsPlaying && !_cancellationToken.IsCancellationRequested)
+                await Task.Delay(100, _cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return; // Server shutdown during wait
+        }
 
         while (!_cancellationToken.IsCancellationRequested && client.RtcpSocket != null)
         {
             try
             {
-                var timeout = Task.Delay(TimeSpan.FromSeconds(60), _cancellationToken); // 1 minute timeout
-                EndPoint remoteEndpoint = new IPEndPoint(IPAddress.Any, 0);
-                var task = client.RtcpSocket.ReceiveFromAsync(buffer, SocketFlags.None, remoteEndpoint, _cancellationToken).AsTask();
-                var result = await Task.WhenAny(task, timeout).ConfigureAwait(false);
+                // Increased timeout from 60s to 120s as some clients don't send RTCP packets regularly
+                // This prevents premature disconnection of UDP clients with sparse RTCP feedback
+                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_cancellationToken);
+                timeoutCts.CancelAfter(TimeSpan.FromSeconds(120));
 
-                if (result == timeout)
+                EndPoint remoteEndpoint = new IPEndPoint(IPAddress.Any, 0);
+                var result = await client.RtcpSocket.ReceiveFromAsync(buffer, SocketFlags.None, remoteEndpoint, timeoutCts.Token).ConfigureAwait(false);
+
+                if (result.ReceivedBytes > 0 && buffer.Length >= 2)
                 {
-                    ClientCleanupRequired?.Invoke(this, client);
-                    break;
-                }
-                else
-                {
-                    var request = task.Result;
-                    if (request.ReceivedBytes > 0 && buffer.Length >= 2)
+                    if (buffer[1] == 203) // BYE
                     {
-                        if (buffer[1] == 203) // BYE
-                        {
-                            ClientCleanupRequired?.Invoke(this, client);
-                            break;
-                        }
-                        else if (buffer[1] == 201) // RR (Receiver Report)
-                        {
-                            HandleRtcpReport(client, buffer);
-                        }
+                        Log.Info("[RtcpManager]", $"Client {client.Id} sent RTCP BYE packet - graceful disconnect");
+                        ClientCleanupRequired?.Invoke(this, client);
+                        break;
+                    }
+                    else if (buffer[1] == 201) // RR (Receiver Report)
+                    {
+                        Log.Debug("[RtcpManager]", $"Received RTCP Receiver Report from client {client.Id}");
+                        HandleRtcpReport(client, buffer);
                     }
                 }
             }
             catch (OperationCanceledException)
             {
+                // Normal cancellation - either timeout or server shutdown
+                if (_cancellationToken.IsCancellationRequested)
+                {
+                    // Server shutdown - just exit quietly
+                    Log.Debug("[RtcpManager]", $"RTCP listener for client {client.Id} stopped - server shutdown");
+                    break;
+                }
+                else
+                {
+                    // Timeout - client inactive (no RTCP packets received)
+                    Log.Warn("[RtcpManager]", $"RTCP listener timeout (120s) for client {client.Id} - no RTCP packets received");
+                    ClientCleanupRequired?.Invoke(this, client);
+                    break;
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                // Socket was disposed - client disconnected
+                Log.Debug("[RtcpManager]", $"RTCP listener for client {client.Id} stopped - socket disposed");
+                break;
+            }
+            catch (SocketException ex)
+            {
+                // Socket error - client disconnected
+                Log.Warn("[RtcpManager]", $"RTCP listener for client {client.Id} stopped - socket error: {ex.SocketErrorCode}");
                 break;
             }
             catch (Exception ex)
             {
-                Log.Error("[RtcpManager]", $"Error listening RTCP: {ex.Message}");
+                Log.Warn("[RtcpManager]", $"RTCP listener for client {client.Id} stopped: {ex.Message}");
                 break;
             }
         }

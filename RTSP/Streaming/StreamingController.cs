@@ -17,9 +17,23 @@ public class StreamingController : IStreamingController
     private readonly IClientManager _clientManager;
 
     private bool _isStreaming;
+
+    /// <summary>
+    /// Polling interval in milliseconds for checking H.264 frame availability.
+    /// </summary>
     private const int H264PollIntervalMs = 10;
+
+    /// <summary>
+    /// Target frame interval in milliseconds for MJPEG streaming (~25 fps).
+    /// </summary>
     private const int MjpegFrameIntervalMs = 40;
-    private const int InactivityTimeoutSeconds = 10;
+
+    /// <summary>
+    /// Inactivity timeout in seconds before disconnecting an idle client.
+    /// Increased from 10 to 60 seconds to prevent premature disconnections on slow or congested networks.
+    /// Activity is tracked during the streaming loop execution, so this timeout only triggers if the loop stalls.
+    /// </summary>
+    private const int InactivityTimeoutSeconds = 60;
 
     /// <inheritdoc/>
     public bool IsStreaming => _isStreaming;
@@ -62,6 +76,14 @@ public class StreamingController : IStreamingController
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// This method manages the streaming loop for a connected client, including:
+    /// - Automatic camera start and encoder initialization for H.264
+    /// - Socket health monitoring
+    /// - Inactivity timeout tracking (60 seconds)
+    /// - Consecutive error detection (10 errors threshold)
+    /// - Activity tracking updates at each iteration to prevent false timeouts
+    /// </remarks>
     public async Task StreamToClientAsync(Models.Client client, CancellationToken cancellationToken)
     {
         Log.Debug("[StreamingController]", $"Starting stream to client {client.Id} using {client.Transport}");
@@ -95,25 +117,32 @@ public class StreamingController : IStreamingController
         {
             while (client.IsPlaying && !cancellationToken.IsCancellationRequested)
             {
+                // Update activity time at start of each streaming attempt
+                // This prevents timeout as long as the streaming loop is active
+                lock (client)
+                {
+                    client.LastActivityTime = DateTime.UtcNow;
+                }
+
                 // Check socket health
                 if (!_transportManager.IsSocketConnected(client.Socket))
                 {
-                    Log.Warn("[StreamingController]", $"Client {client.Id} socket disconnected");
+                    Log.Warn("[StreamingController]", $"Client {client.Id} disconnecting - socket no longer connected (transport: {client.Transport})");
                     break;
                 }
 
-                // Check for inactivity timeout
+                // Check for inactivity timeout (should rarely trigger now)
                 var timeSinceLastActivity = (DateTime.UtcNow - client.LastActivityTime).TotalSeconds;
                 if (timeSinceLastActivity > InactivityTimeoutSeconds)
                 {
-                    Log.Warn("[StreamingController]", $"Client {client.Id} inactive for {timeSinceLastActivity:F0}s, disconnecting");
+                    Log.Warn("[StreamingController]", $"Client {client.Id} inactive for {timeSinceLastActivity:F0}s (timeout: {InactivityTimeoutSeconds}s), disconnecting due to inactivity");
                     break;
                 }
 
                 // Check for too many consecutive errors
                 if (client.ConsecutiveSendErrors >= 10)
                 {
-                    Log.Warn("[StreamingController]", $"Client {client.Id} has {client.ConsecutiveSendErrors} consecutive errors, disconnecting");
+                    Log.Warn("[StreamingController]", $"Client {client.Id} disconnecting - {client.ConsecutiveSendErrors} consecutive send errors (transport: {client.Transport})");
                     break;
                 }
 

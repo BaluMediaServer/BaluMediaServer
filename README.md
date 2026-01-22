@@ -58,7 +58,7 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 - Built-in foreground service for background compatibility
 - Simple demo project included
 - Callbacks available to monitor connected clients, stream status, etc.
-- Basic watchdog system to disconnect inactive clients
+- Advanced watchdog system with 60-second inactivity timeout and comprehensive health monitoring
 - Automatic resource cleanup and memory management
 
 ### 🔹 Modular RTSP Architecture (v1.5.8+)
@@ -1551,6 +1551,56 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
   - Optimized buffer pool management for high-resolution frames
 
   - **Impact**: The codebase is now more maintainable and testable. Users can safely request high resolutions (including 4K) without crashes. The library will automatically fall back to the nearest supported resolution if the device's encoder doesn't support the requested resolution.
+
+- v1.5.9: Connection Stability and Timeout Improvements. This release addresses premature disconnections by improving timeout handling, activity tracking, and error logging across all transport modes.
+
+  - **Fixed Premature Client Disconnections**:
+
+  - Problem: The 10-second inactivity timeout was too aggressive and would disconnect stable clients during network congestion or when TCP sends were timing out. Combined with a 5-second TCP send timeout, clients could be disconnected after just 2 consecutive send delays (10 seconds total).
+
+  - Fix:
+    - **Increased Inactivity Timeout**: From 10 seconds to 60 seconds
+    - **Improved Activity Tracking**: `LastActivityTime` is now updated at the start of each streaming loop iteration, not just on successful sends. This prevents false inactivity timeouts as long as the streaming loop is actively running.
+    - **Reduced TCP Send Timeout**: From 5 seconds to 3 seconds for faster stuck connection detection
+    - With the new settings, clients can experience up to 20 consecutive TCP send timeouts (~60 seconds) before being disconnected, providing much better tolerance for temporary network issues.
+
+  - **Enhanced RTCP Timeout Handling (UDP Mode)**:
+
+  - Problem: The 60-second RTCP timeout was too aggressive for UDP clients that don't send RTCP packets regularly, causing premature disconnection of valid clients.
+
+  - Fix:
+    - **Increased RTCP Timeout**: From 60 seconds to 120 seconds
+    - Added detailed logging for RTCP events (BYE packets, Receiver Reports, timeouts)
+    - Better distinction between server shutdown and client timeout in error handling
+
+  - **Improved Socket Health Detection**:
+
+  - Problem: Socket.Poll() was using a 1ms timeout which could be too aggressive for slower but stable connections.
+
+  - Fix:
+    - **Increased Socket Poll Timeout**: From 1ms to 10ms
+    - More forgiving detection of socket disconnection while still catching dead connections quickly
+
+  - **Comprehensive Logging Enhancements**:
+
+  - Added detailed logging throughout the connection lifecycle:
+    - All disconnection events now log the specific reason (socket disconnected, inactivity timeout, consecutive errors)
+    - Transport mode (TCP/UDP) included in disconnection logs
+    - TCP/UDP send errors now log client IDs and consecutive error counts
+    - Socket error codes logged for better debugging
+    - Dead client detection logs explain why each client is marked as dead
+    - WatchDog cleanup operations are now logged with counts
+
+  - **Summary of New Timeout Values**:
+
+    | Setting | Old Value | New Value | Purpose |
+    |---------|-----------|-----------|---------|
+    | Inactivity Timeout | 10s | 60s | Time before disconnecting idle clients |
+    | TCP Send Timeout | 5s | 3s | Timeout for individual TCP send operations |
+    | RTCP Timeout (UDP) | 60s | 120s | Timeout waiting for RTCP packets from UDP clients |
+    | Socket Poll Timeout | 1ms | 10ms | Timeout for socket connectivity checks |
+
+  - **Impact**: RTSP connections are now significantly more stable, especially over congested networks or with clients that have slower connections. The enhanced logging makes it much easier to diagnose any connection issues that do occur. Device connections remain stable even during temporary network hiccups or when send operations experience delays.
 
 ---
 

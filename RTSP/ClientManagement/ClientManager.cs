@@ -99,7 +99,35 @@ public class ClientManager : IClientManager
     /// <inheritdoc/>
     public List<Client> GetDeadClients()
     {
-        return _clients.Values.Where(p => !p.IsPlaying || !(p.Socket?.Connected ?? false)).ToList();
+        var gracePeriod = TimeSpan.FromSeconds(30);
+        var now = DateTime.UtcNow;
+
+        var deadClients = new List<Client>();
+
+        foreach (var client in _clients.Values)
+        {
+            // Socket disconnected = definitely dead
+            if (!(client.Socket?.Connected ?? false))
+            {
+                Log.Debug("[ClientManager]", $"Client {client.Id} marked as dead - socket disconnected");
+                deadClients.Add(client);
+                continue;
+            }
+
+            // If playing, check if still active (managed by streaming timeout)
+            if (client.IsPlaying)
+                continue;
+
+            // Non-playing clients get a grace period for RTSP handshake
+            var connectionAge = now - client.ConnectedAt;
+            if (connectionAge > gracePeriod)
+            {
+                Log.Debug("[ClientManager]", $"Client {client.Id} marked as dead - exceeded grace period ({connectionAge.TotalSeconds:F0}s > {gracePeriod.TotalSeconds}s, not playing)");
+                deadClients.Add(client);
+            }
+        }
+
+        return deadClients;
     }
 
     /// <inheritdoc/>
