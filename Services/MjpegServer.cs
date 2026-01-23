@@ -114,6 +114,7 @@ public class MjpegServer : IDisposable
     /// </summary>
     public void Dispose()
     {
+        Log.Warn("MJPEG SERVER", $"Dispose() called - stack trace: {Environment.StackTrace}");
         _cts?.Cancel();
         Server.OnNewBackFrame -= OnBackFrameAvailable;
         Server.OnNewFrontFrame -= OnFrontFrameAvailable;
@@ -149,10 +150,19 @@ public class MjpegServer : IDisposable
     }
     private async Task Watchdog()
     {
+        int statusCounter = 0;
         while (!_cts.IsCancellationRequested)
         {
             try
             {
+                // Log status every 5 seconds for debugging (visible in release mode)
+                statusCounter++;
+                if (statusCounter >= 5)
+                {
+                    statusCounter = 0;
+                    Log.Info("MJPEG SERVER", $"Watchdog status: IsListening={_listener.IsListening}, StreamStarted={_streamStarted}, Clients={ClientCount} (Back={BackClientCount}, Front={FrontClientCount})");
+                }
+
                 // NOTE: Camera restart disabled for continuous streaming to prevent interruptions
                 // Cameras will continue running even if frames are temporarily delayed
                 // This prevents stream cuts and ensures fluid streaming
@@ -162,16 +172,18 @@ public class MjpegServer : IDisposable
                     var timeSinceLastFrame = (DateTime.UtcNow - _lastFrame).TotalSeconds;
                     if (timeSinceLastFrame > WatchdogTimeoutSeconds)
                     {
-                        Log.Debug("MJPEG SERVER", $"Watchdog: No frames for {timeSinceLastFrame:F0}s (continuous mode - no restart)");
+                        Log.Info("MJPEG SERVER", $"Watchdog: No frames for {timeSinceLastFrame:F0}s (continuous mode - no restart)");
                     }
                 }
                 await Task.Delay(1000, _cts.Token);
             }
             catch (OperationCanceledException)
             {
+                Log.Warn("MJPEG SERVER", "Watchdog cancelled");
                 break;
             }
         }
+        Log.Warn("MJPEG SERVER", "Watchdog exited");
     }
     private void OnBackFrameAvailable(object? sender, FrameEventArgs arg)
     {
@@ -254,7 +266,7 @@ public class MjpegServer : IDisposable
         try
         {
             _listener.Start();
-            Log.Debug("MJPEG SERVER", "STARTING SERVER");
+            Log.Info("MJPEG SERVER", $"STARTING SERVER - StartWithoutStream={StartWithoutStream}");
             if (!StartWithoutStream)
             {
                 EventBuss.SendCommand(BussCommand.START_CAMERA_FRONT);
@@ -266,13 +278,13 @@ public class MjpegServer : IDisposable
                 _streamStarted = false;
             }
             _thread = Task.Run(ListenLoop, _cts.Token);
-            Log.Debug("MJPEG SERVER", "STARTED SERVER");
+            Log.Info("MJPEG SERVER", $"STARTED SERVER - IsListening={_listener.IsListening}");
         }
         catch (System.Exception ex)
         {
-            // Assuming that is already started
+            Log.Warn("MJPEG SERVER", $"Start() exception: {ex.Message}");
         }
-        
+
     }
 
     /// <summary>
@@ -280,6 +292,7 @@ public class MjpegServer : IDisposable
     /// </summary>
     public void Stop()
     {
+        Log.Warn("MJPEG SERVER", $"Stop() called - stack trace: {Environment.StackTrace}");
         _clientsBack.Clear();
         _clientsFront.Clear();
         EventBuss.SendCommand(BussCommand.STOP_CAMERA_BACK);
@@ -290,20 +303,23 @@ public class MjpegServer : IDisposable
 
     private async Task ListenLoop()
     {
+        Log.Info("MJPEG SERVER", "ListenLoop started");
         while (_listener.IsListening && !_cts.IsCancellationRequested)
         {
             try
             {
-                
                 Log.Debug("MJPEG SERVER", "WAITING CLIENT");
                 var ctx = await _listener.GetContextAsync();
                 _ = Task.Run(() => HandleClient(ctx), _cts.Token);
             }
-            catch
+            catch (System.Exception ex)
             {
-                // Listener was stopped or failed
+                // Listener was stopped or failed - log it in release mode
+                Log.Warn("MJPEG SERVER", $"ListenLoop exception: {ex.GetType().Name}: {ex.Message}");
             }
         }
+        // Log why we exited the loop
+        Log.Warn("MJPEG SERVER", $"ListenLoop EXITED - IsListening={_listener.IsListening}, IsCancelled={_cts.IsCancellationRequested}");
     }
 
     private async Task HandleClient(HttpListenerContext context)

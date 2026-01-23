@@ -54,6 +54,20 @@ The server has been configured for **continuous streaming mode** to eliminate st
 - Temporary delays (e.g., encoder catching up) shouldn't trigger restarts
 - Continuous operation ensures smooth streaming
 
+### 4. Disabled STOP_MJPEG_SERVER EventBus Command
+
+**Previous Behavior:**
+- `STOP_MJPEG_SERVER` command would stop and dispose the MJPEG server
+- External code could interrupt the MJPEG stream
+
+**New Behavior:**
+- STOP_MJPEG_SERVER command is logged but ignored
+- MJPEG server continues running once started
+
+**Reason:**
+- Prevents external code from interrupting MJPEG streams
+- Ensures MJPEG clients maintain uninterrupted connections
+
 ## How to Stop Cameras/Streaming
 
 Since automatic stops are disabled, you must manually control the server:
@@ -91,8 +105,9 @@ Cameras and encoders will stop when the application terminates.
 This is currently **hardcoded behavior**. If you need automatic stop functionality:
 
 1. **Restore WatchDog logic** in `RTSP/Server.cs` (lines ~544-577 in original)
-2. **Restore EventBus handlers** in `RTSP/Server.cs` (lines ~381-387, 402-408 in original)
+2. **Restore EventBus camera handlers** in `RTSP/Server.cs` (lines ~381-387, 402-408 in original)
 3. **Restore MJPEG watchdog** in `Services/MjpegServer.cs` (lines ~160-167 in original)
+4. **Restore STOP_MJPEG_SERVER handler** in `RTSP/Server.cs` (lines ~410-417 in original)
 
 Or add a configuration flag:
 ```csharp

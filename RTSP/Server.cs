@@ -287,6 +287,7 @@ public class Server : IDisposable
     /// </summary>
     public void Stop()
     {
+        Log.Warn("[RTSP Server]", $"Stop() called - stack trace: {Environment.StackTrace}");
         IsRunning = false;
         _cts?.Cancel();
         _cts = new();
@@ -302,6 +303,7 @@ public class Server : IDisposable
     /// </summary>
     public void Dispose()
     {
+        Log.Warn("[RTSP Server]", $"Dispose() called - stack trace: {Environment.StackTrace}");
         IsRunning = false;
         _mjpegServer?.Dispose();
         _jpegEncoder?.Dispose();
@@ -408,13 +410,9 @@ public class Server : IDisposable
                     }
                     break;
                 case BussCommand.STOP_MJPEG_SERVER:
-                    if (_mjpegServerEnabled)
-                    {
-                        _mjpegServerEnabled = false;
-                        _mjpegServer?.Stop();
-                        _mjpegServer?.Dispose();
-                        _mjpegServer = null;
-                    }
+                    // NOTE: MJPEG server stop disabled for continuous streaming to prevent interruptions
+                    // To stop the MJPEG server, use the explicit Stop() method or stop the RTSP server
+                    Log.Debug("[RTSP Server]", "STOP_MJPEG_SERVER command ignored - continuous streaming mode enabled");
                     break;
                 case BussCommand.SWITCH_CAMERA:
                     // Implementation unchanged
