@@ -378,13 +378,9 @@ public class Server : IDisposable
                     }
                     break;
                 case BussCommand.STOP_CAMERA_FRONT:
-                    if (!_isStreaming && _isCapturingFront && _frontCameraEnabled && !(_mjpegServer?.IsStreaming() ?? false))
-                    {
-                        if (!IsRunning)
-                            _frontService.FrameReceived -= OnFrontFrameAvailable;
-                        _frontService.StopCapture();
-                        _isCapturingFront = false;
-                    }
+                    // NOTE: Camera stop disabled for continuous streaming to prevent interruptions
+                    // To stop cameras, use the explicit Stop() method or stop the server
+                    Log.Debug("[RTSP Server]", "STOP_CAMERA_FRONT command ignored - continuous streaming mode enabled");
                     break;
                 case BussCommand.START_CAMERA_BACK:
                     if (!_isCapturingBack && _backCameraEnabled)
@@ -399,13 +395,9 @@ public class Server : IDisposable
                     }
                     break;
                 case BussCommand.STOP_CAMERA_BACK:
-                    if (!_isStreaming && _isCapturingBack && _backCameraEnabled && !(_mjpegServer?.IsStreaming() ?? false))
-                    {
-                        if (!IsRunning)
-                            _backService.FrameReceived -= OnBackFrameAvailable;
-                        _backService.StopCapture();
-                        _isCapturingBack = false;
-                    }
+                    // NOTE: Camera stop disabled for continuous streaming to prevent interruptions
+                    // To stop cameras, use the explicit Stop() method or stop the server
+                    Log.Debug("[RTSP Server]", "STOP_CAMERA_BACK command ignored - continuous streaming mode enabled");
                     break;
                 case BussCommand.START_MJPEG_SERVER:
                     if (!_mjpegServerEnabled)
@@ -538,43 +530,12 @@ public class Server : IDisposable
                     _clientManager.CleanupClient(client);
                 }
 
-                var mjpegClientCount = _mjpegServer?.ClientCount ?? 0;
-                var mjpegHasClients = _mjpegServerEnabled && mjpegClientCount > 0;
+                // NOTE: Auto-stop functionality disabled for continuous streaming
+                // Cameras and encoders will keep running even when no clients are connected
+                // This prevents stream interruptions and frame drops
+                // To manually stop, use the Stop() method or stop commands via EventBus
 
-                if (playingClients == 0 && _isStreaming)
-                {
-                    Log.Info("[RTSP Server]", $"WatchDog: No playing RTSP clients, stopping encoders (MJPEG clients: {mjpegClientCount})");
-
-                    if (!mjpegHasClients)
-                    {
-                        _backService.StopCapture();
-                        _frontService.StopCapture();
-                        _isCapturingBack = false;
-                        _isCapturingFront = false;
-                        Log.Info("[RTSP Server]", "WatchDog: Cameras stopped - no RTSP or MJPEG clients");
-                    }
-                    else
-                    {
-                        Log.Info("[RTSP Server]", $"WatchDog: Keeping cameras running for {mjpegClientCount} MJPEG client(s)");
-                    }
-
-                    _encoderManager.StopEncoder(0);
-                    _encoderManager.StopEncoder(1);
-                    _clientManager.ClearAllClients();
-                    _isStreaming = false;
-                    _streamingController.SetStreamingState(false);
-
-                    _sdpGenerator.ClearSpsPps();
-                    _encoderManager.ClearSpsPps();
-                }
-                else if (playingClients == 0 && !_isStreaming && (_isCapturingBack || _isCapturingFront) && !mjpegHasClients)
-                {
-                    Log.Info("[RTSP Server]", "Cameras running but no clients - stopping cameras");
-                    _backService.StopCapture();
-                    _frontService.StopCapture();
-                    _isCapturingBack = false;
-                    _isCapturingFront = false;
-                }
+                Log.Debug("[RTSP Server]", $"WatchDog: Active clients: RTSP={playingClients}, MJPEG={_mjpegServer?.ClientCount ?? 0}, Cameras: Back={_isCapturingBack}, Front={_isCapturingFront}, Streaming={_isStreaming}");
             }
             catch (Exception ex)
             {

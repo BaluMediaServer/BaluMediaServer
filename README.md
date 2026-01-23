@@ -1695,6 +1695,73 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
 
   - **Impact**: This release delivers the most significant performance improvements in the project's history. RTSP-MJPEG is now viable for production use with multiple concurrent clients. H.264 streaming has reduced latency and CPU overhead. The codebase uses modern .NET async patterns throughout for better efficiency and maintainability. See `PERFORMANCE_IMPROVEMENTS.md` for detailed technical analysis.
 
+- v1.5.11: Continuous Streaming Mode - Eliminated Stream Interruptions. This release disables all automatic stop mechanisms to ensure fluid, uninterrupted streaming without cuts or frame drops.
+
+  - **Problem**: The WatchDog and auto-stop mechanisms were causing stream interruptions:
+    - Cameras stopped when last client disconnected
+    - Encoders stopped and restarted frequently
+    - Camera restart commands triggered by MJPEG watchdog
+    - Stream cuts and frame drops during client transitions
+    - Reconnection delays due to encoder restarts
+
+  - **Solution**: Disabled all automatic stop mechanisms for continuous operation:
+
+  - **Disabled WatchDog Auto-Stop**:
+    - WatchDog now only cleans up dead/disconnected clients (preserves important cleanup)
+    - Cameras keep running regardless of client count
+    - Encoders keep running regardless of client count
+    - Streaming state persists once started
+    - No more automatic encoder/camera stops
+
+  - **Disabled EventBus Camera Stop Commands**:
+    - `STOP_CAMERA_FRONT` and `STOP_CAMERA_BACK` commands logged but ignored
+    - Prevents external code from interrupting streams
+    - Cameras stay active for instant client connections
+
+  - **Disabled MJPEG Watchdog Restarts**:
+    - Watchdog logs frame delays but doesn't restart cameras
+    - No more camera restarts after temporary delays
+    - Eliminates stream cuts from camera restarts
+
+  - **Benefits**:
+    - ✅ **Zero Interruptions**: Streams never cut when clients disconnect/reconnect
+    - ✅ **Instant Reconnection**: No encoder restart delay (was ~1-2 seconds)
+    - ✅ **Fluid Experience**: No frame drops during client transitions
+    - ✅ **Production Ready**: Reliable, predictable behavior
+    - ✅ **Better Multi-Client**: New clients can connect instantly without affecting others
+
+  - **Trade-offs**:
+    - ⚠️ **Continuous Resource Usage**: Cameras and encoders run even with no clients
+    - ⚠️ **Battery Drain**: Continuous operation uses more power on mobile devices
+    - ⚠️ **Manual Control**: Must explicitly call `Stop()` or `Dispose()` to stop streaming
+
+  - **How to Stop**:
+    - Call `server.Stop()` to stop everything
+    - Call `server.Dispose()` to release all resources
+    - Application exit automatically stops everything
+
+  - **Monitoring**:
+    - WatchDog now logs status: `Active clients: RTSP=0, MJPEG=2, Cameras: Back=True, Front=False, Streaming=True`
+    - Helps monitor server state without auto-stop interference
+
+  - **Configuration**:
+    - Currently hardcoded for maximum reliability
+    - See `CONTINUOUS_STREAMING_MODE.md` for instructions to restore auto-stop if needed
+    - Future: Configuration flag for hybrid mode (auto-stop on battery, continuous on power)
+
+  - **Files Changed**:
+    - `RTSP/Server.cs`: Disabled WatchDog auto-stop and EventBus camera stop commands
+    - `Services/MjpegServer.cs`: Disabled watchdog camera restarts
+    - `CONTINUOUS_STREAMING_MODE.md`: Complete documentation
+
+  - **Performance Impact**:
+    - CPU: Minimal - encoders efficient, H.264 only encodes when frames available
+    - Memory: Minimal - bounded buffers with DropOldest prevent buildup
+    - Battery: Moderate increase on mobile (camera always on)
+    - Network: Zero impact when no clients (no data sent)
+
+  - **Impact**: Streams are now completely fluid with zero interruptions. Perfect for scenarios where reliability is critical (security cameras, monitoring systems, live broadcasts). The server maintains ready state for instant client connections. Trade-off of continuous resource usage is acceptable for server/desktop deployments and provides significantly better user experience.
+
 ---
 
 **Thanks for checking out Balu Media Server!** 

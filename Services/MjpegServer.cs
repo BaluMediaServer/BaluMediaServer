@@ -153,17 +153,16 @@ public class MjpegServer : IDisposable
         {
             try
             {
-                // Only restart cameras if stream was started and we have clients
-                // This prevents the watchdog from starting cameras when using StartWithoutStream mode
+                // NOTE: Camera restart disabled for continuous streaming to prevent interruptions
+                // Cameras will continue running even if frames are temporarily delayed
+                // This prevents stream cuts and ensures fluid streaming
+
                 if (_streamStarted && _listener.IsListening && ClientCount > 0)
                 {
-                    if ((DateTime.UtcNow - _lastFrame).TotalSeconds > WatchdogTimeoutSeconds)
+                    var timeSinceLastFrame = (DateTime.UtcNow - _lastFrame).TotalSeconds;
+                    if (timeSinceLastFrame > WatchdogTimeoutSeconds)
                     {
-                        Log.Debug("MJPEG SERVER", $"Watchdog: No frames received for {WatchdogTimeoutSeconds}s, restarting cameras");
-                        EventBuss.SendCommand(BussCommand.START_CAMERA_FRONT);
-                        EventBuss.SendCommand(BussCommand.START_CAMERA_BACK);
-                        await Task.Delay(5000, _cts.Token);
-                        continue;
+                        Log.Debug("MJPEG SERVER", $"Watchdog: No frames for {timeSinceLastFrame:F0}s (continuous mode - no restart)");
                     }
                 }
                 await Task.Delay(1000, _cts.Token);
