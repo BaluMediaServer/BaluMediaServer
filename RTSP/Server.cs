@@ -535,14 +535,19 @@ public class Server : IDisposable
                 // This prevents stream interruptions and frame drops
                 // To manually stop, use the Stop() method or stop commands via EventBus
 
-                Log.Debug("[RTSP Server]", $"WatchDog: Active clients: RTSP={playingClients}, MJPEG={_mjpegServer?.ClientCount ?? 0}, Cameras: Back={_isCapturingBack}, Front={_isCapturingFront}, Streaming={_isStreaming}");
+                var mjpegClientCount = _mjpegServer?.ClientCount ?? 0;
+                Log.Debug("[RTSP Server]", $"WatchDog: Active clients: RTSP={playingClients}, MJPEG={mjpegClientCount}, Cameras: Back={_isCapturingBack}, Front={_isCapturingFront}, Streaming={_isStreaming}");
             }
             catch (Exception ex)
             {
                 Log.Error("[RTSP Server]", $"WatchDog error: {ex.Message}");
             }
 
-            OnStreaming?.Invoke(this, _isStreaming);
+            // Report streaming state considering BOTH RTSP and MJPEG clients
+            // This prevents the "IDLE" state when only MJPEG clients are connected
+            var hasAnyClients = _isStreaming || (_mjpegServer?.ClientCount ?? 0) > 0;
+            var camerasRunning = _isCapturingBack || _isCapturingFront;
+            OnStreaming?.Invoke(this, hasAnyClients || camerasRunning);
             await Task.Delay(5000, _cts.Token).ConfigureAwait(false);
         }
     }
