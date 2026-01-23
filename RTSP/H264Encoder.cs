@@ -2,6 +2,7 @@ using Android.Media;
 using Android.OS;
 using Java.Nio;
 using System.Collections.Concurrent;
+using System.Threading.Channels;
 using Android.Util;
 using BaluMediaServer.Models;
 using System.Diagnostics;
@@ -12,6 +13,7 @@ namespace BaluMediaServer.Services;
 /// <summary>
 /// General-purpose H.264 hardware encoder with automatic encoder selection.
 /// Selects the best available encoder based on device capabilities and supports multiple vendors.
+/// Uses Channels for efficient frame queuing with automatic frame dropping.
 /// </summary>
 public class H264Encoder : IDisposable
 {
@@ -22,7 +24,7 @@ public class H264Encoder : IDisposable
     private readonly int _frameRate;
     private bool _isRunning;
     private Thread? _encoderThread;
-    private readonly ConcurrentQueue<FrameData> _frameQueue = new();
+    private readonly Channel<FrameData> _frameChannel;
     private readonly ArrayPool<byte> _bufferPool = ArrayPool<byte>.Create();
 
     private readonly object _lock = new();
@@ -90,6 +92,16 @@ public class H264Encoder : IDisposable
         _bitrate = bitrate;
         _frameRate = frameRate;
         _frameIntervalUs = 1_000_000L / frameRate; // e.g., 40000us for 25fps
+
+        // Create bounded channel with DropOldest to prevent latency buildup
+        _frameChannel = Channel.CreateBounded<FrameData>(
+            new BoundedChannelOptions(2)
+            {
+                FullMode = BoundedChannelFullMode.DropOldest,
+                SingleReader = true,
+                SingleWriter = false
+            });
+
         var codecList = new MediaCodecList(new());
         var codecInfos = codecList.GetCodecInfos();
 
@@ -551,16 +563,8 @@ public class H264Encoder : IDisposable
 
         _frameNumber++;
 
-        // Drop frames if queue is backing up (keep max 2 frames for lower latency)
-        while (_frameQueue.Count > 2)
-        {
-            if (_frameQueue.TryDequeue(out _))
-            {
-                Log.Debug("H264", "Dropped old frame to prevent latency");
-            }
-        }
-
-        _frameQueue.Enqueue(new() { Data = frameData, Timestamp = timestamp });
+        // Channel with DropOldest automatically handles frame dropping (keeps max 2 frames)
+        _frameChannel.Writer.TryWrite(new() { Data = frameData, Timestamp = timestamp });
     }
     
     private void EncodingLoop()
@@ -578,18 +582,18 @@ public class H264Encoder : IDisposable
             {
                 bool processedInput = false;
                 bool processedOutput = false;
-                
-                // Process input if available
-                if (_frameQueue.TryDequeue(out var frame))
+
+                // Try to read frame with short timeout (non-blocking)
+                if (_frameChannel.Reader.TryRead(out var frame))
                 {
                     FeedInputBuffer(frame);
                     processedInput = true;
                 }
-                
+
                 // Always try to drain output
                 processedOutput = DrainOutputBuffer(bufferInfo, ref sps, ref pps, ref gotFirstOutput);
-                
-                // Small sleep to prevent CPU spinning and allow encoder to work
+
+                // Small sleep to prevent CPU spinning only if nothing was processed
                 if (!processedInput && !processedOutput)
                 {
                     Thread.Sleep(1);

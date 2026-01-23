@@ -62,6 +62,7 @@ public class Server : IDisposable
     private readonly IRtpPacketBuilder _rtpBuilder;
     private readonly RtcpManager _rtcpManager;
     private readonly H264EncoderManager _encoderManager;
+    private readonly JpegEncoderService _jpegEncoder;
     private readonly StreamingController _streamingController;
     private readonly ClientManager _clientManager;
 
@@ -139,8 +140,9 @@ public class Server : IDisposable
         _rtpBuilder = new RtpPacketBuilder(_transportManager);
         _rtcpManager = new RtcpManager(_transportManager, _cts.Token);
         _encoderManager = new H264EncoderManager();
+        _jpegEncoder = new JpegEncoderService(quality: _mjpegServerQuality);
         _clientManager = new ClientManager(_transportManager);
-        _streamingController = new StreamingController(_encoderManager, _rtpBuilder, _transportManager, _clientManager);
+        _streamingController = new StreamingController(_encoderManager, _jpegEncoder, _rtpBuilder, _transportManager, _clientManager);
 
         // Wire up events
         _clientManager.OnClientsChange += clients => OnClientsChange?.Invoke(clients);
@@ -302,6 +304,7 @@ public class Server : IDisposable
     {
         IsRunning = false;
         _mjpegServer?.Dispose();
+        _jpegEncoder?.Dispose();
         _cts?.Cancel();
         _socket?.Dispose();
     }
@@ -445,6 +448,8 @@ public class Server : IDisposable
             {
                 _encoderManager.FeedFrame(0, arg);
             }
+            // Queue for JPEG encoding (used by MJPEG clients)
+            _jpegEncoder.QueueFrame(arg, 0);
         }
     }
 
@@ -461,6 +466,8 @@ public class Server : IDisposable
             {
                 _encoderManager.FeedFrame(1, arg);
             }
+            // Queue for JPEG encoding (used by MJPEG clients)
+            _jpegEncoder.QueueFrame(arg, 1);
         }
     }
 

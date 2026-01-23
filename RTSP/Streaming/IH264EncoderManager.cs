@@ -45,6 +45,15 @@ public interface IH264EncoderManager
     bool TryDequeueFrame(int cameraId, out H264FrameEventArgs? frame);
 
     /// <summary>
+    /// Asynchronously waits for and dequeues an encoded frame.
+    /// This is the preferred method over TryDequeueFrame as it eliminates polling overhead.
+    /// </summary>
+    /// <param name="cameraId">The camera ID.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The dequeued frame.</returns>
+    ValueTask<H264FrameEventArgs> DequeueFrameAsync(int cameraId, CancellationToken cancellationToken);
+
+    /// <summary>
     /// Gets the current SPS and PPS.
     /// </summary>
     /// <returns>Tuple of SPS and PPS.</returns>

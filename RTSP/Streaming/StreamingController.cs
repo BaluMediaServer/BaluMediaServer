@@ -12,6 +12,7 @@ namespace BaluMediaServer.RTSP.Streaming;
 public class StreamingController : IStreamingController
 {
     private readonly IH264EncoderManager _encoderManager;
+    private readonly JpegEncoderService _jpegEncoder;
     private readonly IRtpPacketBuilder _rtpBuilder;
     private readonly ITransportManager _transportManager;
     private readonly IClientManager _clientManager;
@@ -56,11 +57,13 @@ public class StreamingController : IStreamingController
     /// </summary>
     public StreamingController(
         IH264EncoderManager encoderManager,
+        JpegEncoderService jpegEncoder,
         IRtpPacketBuilder rtpBuilder,
         ITransportManager transportManager,
         IClientManager clientManager)
     {
         _encoderManager = encoderManager;
+        _jpegEncoder = jpegEncoder;
         _rtpBuilder = rtpBuilder;
         _transportManager = transportManager;
         _clientManager = clientManager;
@@ -152,10 +155,7 @@ public class StreamingController : IStreamingController
                 if (client.Codec == CodecType.H264)
                 {
                     frameSent = await StreamH264ToClientAsync(client, cancellationToken).ConfigureAwait(false);
-                    if (!frameSent)
-                    {
-                        await Task.Delay(H264PollIntervalMs, cancellationToken).ConfigureAwait(false);
-                    }
+                    // No polling needed - StreamH264ToClientAsync now waits for frames asynchronously
                 }
                 else
                 {
@@ -184,10 +184,20 @@ public class StreamingController : IStreamingController
     {
         FrameEventArgs? frame = null;
 
-        // Wait for first frame
+        // Wait for first frame with exponential backoff (should be fast)
+        int retries = 0;
+        const int maxRetries = 20;
+
         while ((frame = GetLatestFrame?.Invoke(client.CameraId)) == null || frame.Data == null)
         {
-            await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+            if (retries++ > maxRetries)
+            {
+                throw new TimeoutException($"Timeout waiting for first frame from camera {client.CameraId}");
+            }
+
+            // Exponential backoff: 10ms, 20ms, 40ms, 80ms, then cap at 100ms
+            int delayMs = Math.Min(10 * (1 << Math.Min(retries, 4)), 100);
+            await Task.Delay(delayMs, cancellationToken).ConfigureAwait(false);
         }
 
         // Use the reported dimensions from the camera
@@ -207,7 +217,19 @@ public class StreamingController : IStreamingController
 
     private async Task<bool> StreamH264ToClientAsync(Models.Client client, CancellationToken cancellationToken)
     {
-        if (!_encoderManager.TryDequeueFrame(client.CameraId, out var h264Frame) || h264Frame == null || h264Frame.NalUnits.Count == 0)
+        H264FrameEventArgs h264Frame;
+
+        try
+        {
+            // Asynchronously wait for next frame (no polling!)
+            h264Frame = await _encoderManager.DequeueFrameAsync(client.CameraId, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+
+        if (h264Frame == null || h264Frame.NalUnits.Count == 0)
         {
             return false;
         }
@@ -313,57 +335,34 @@ public class StreamingController : IStreamingController
 
     private async Task StreamMjpegToClientAsync(Models.Client client, CancellationToken cancellationToken)
     {
-        var frame = GetLatestFrame?.Invoke(client.CameraId);
-
-        if (frame != null && frame.Data != null && frame.Data.Length > 0)
-        {
-            try
-            {
-                var jpegData = EncodeToJpeg(frame.Data, frame.Width, frame.Height, Android.Graphics.ImageFormatType.Nv21, client.VideoProfile.Quality);
-
-                if (jpegData != null && jpegData.Length > 0)
-                {
-                    await _rtpBuilder.SendJpegAsRtpAsync(client, jpegData).ConfigureAwait(false);
-                }
-            }
-            catch (Exception ex)
-            {
-                Log.Error("[StreamingController]", $"MJPEG frame encoding error: {ex.Message}");
-            }
-        }
-    }
-
-    private static byte[] EncodeToJpeg(byte[] rawImageData, int width, int height, Android.Graphics.ImageFormatType format, int quality = 80)
-    {
         try
         {
-            using var outputStream = new MemoryStream();
-            if (format == Android.Graphics.ImageFormatType.Nv21 || format == Android.Graphics.ImageFormatType.Yuv420888)
+            // Consume pre-encoded JPEG frames from shared encoder service
+            var channel = client.CameraId == 1 ? _jpegEncoder.FrontCameraOutput : _jpegEncoder.BackCameraOutput;
+
+            // Try to read the latest frame with a short timeout
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(100); // 100ms timeout
+
+            if (await channel.WaitToReadAsync(timeoutCts.Token).ConfigureAwait(false))
             {
-                var yuvImage = new Android.Graphics.YuvImage(rawImageData, Android.Graphics.ImageFormatType.Nv21, width, height, null);
-                var rect = new Android.Graphics.Rect(0, 0, width, height);
-                yuvImage.CompressToJpeg(rect, quality, outputStream);
-            }
-            else
-            {
-                var bitmap = Android.Graphics.BitmapFactory.DecodeByteArray(rawImageData, 0, rawImageData.Length);
-                if (bitmap != null)
+                if (channel.TryRead(out var jpegFrame))
                 {
-                    bitmap.Compress(Android.Graphics.Bitmap.CompressFormat.Jpeg!, quality, outputStream);
-                    bitmap.Dispose();
-                }
-                else
-                {
-                    Log.Error("[StreamingController]", "Failed to decode image data");
-                    return Array.Empty<byte>();
+                    if (jpegFrame.Data != null && jpegFrame.Data.Length > 0)
+                    {
+                        await _rtpBuilder.SendJpegAsRtpAsync(client, jpegFrame.Data).ConfigureAwait(false);
+                    }
                 }
             }
-            return outputStream.ToArray();
+        }
+        catch (OperationCanceledException)
+        {
+            // Timeout is normal - no frame available
         }
         catch (Exception ex)
         {
-            Log.Error("[StreamingController]", $"JPEG encoding error: {ex.Message}");
-            return Array.Empty<byte>();
+            Log.Error("[StreamingController]", $"MJPEG streaming error: {ex.Message}");
         }
     }
+
 }
