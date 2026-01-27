@@ -1762,6 +1762,121 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
 
   - **Impact**: Streams are now completely fluid with zero interruptions. Perfect for scenarios where reliability is critical (security cameras, monitoring systems, live broadcasts). The server maintains ready state for instant client connections. Trade-off of continuous resource usage is acceptable for server/desktop deployments and provides significantly better user experience.
 
+- v1.5.12: Native Library Frame Delivery Fix - Resolved Stream Stopping Issue. This release fixes a critical bug in the native Android camera library that caused streams to stop completely after running for a short time.
+
+  - **Problem**: MJPEG streams would stop receiving frames after the native library's internal queue filled up:
+    - Logs showed: `Back camera queue backing up (81/100), dropping frame`
+    - After queue reached 80% capacity, ALL frames were dropped
+    - The queue was never consumed by any code (dead/unused feature)
+    - Once full, the queue stayed full forever, permanently blocking frame delivery
+    - Result: Stream worked initially, then stopped completely with no recovery
+
+  - **Root Cause Analysis**:
+    ```kotlin
+    // BEFORE (Broken) - in CameraFrameServicev2.kt
+    if (queueSize > queueCapacity * 0.8) {  // 80 frames
+        Log.w(TAG, "Back camera queue backing up...")
+        return  // ← DROPS FRAME ENTIRELY - never sent to callback!
+    }
+    backCameraCallback?.onFrameAvailable(frame)  // Only reached if queue < 80%
+    backCameraFrameQueue.offer(frame)  // Queue never consumed!
+    ```
+    The frame dropping check was placed BEFORE sending to callbacks. When the unused queue filled up, it blocked the primary frame delivery path.
+
+  - **Solution**: Restructured frame delivery to prioritize callbacks:
+    ```kotlin
+    // AFTER (Fixed)
+    // Send to callback FIRST - this is the primary consumer (MJPEG streaming)
+    backCameraCallback?.onFrameAvailable(frame)
+
+    // Queue is optional secondary storage - only add if there's room
+    if (!backCameraFrameQueue.offer(frame)) {
+        // Queue full - drop oldest, but callback already received the frame
+        val droppedFrame = backCameraFrameQueue.poll()
+        droppedFrame?.let { backBufferPool.release(it.data) }
+        backCameraFrameQueue.offer(frame)
+    }
+    ```
+
+  - **Files Changed**:
+    - `AndroidLib/camerastreamer/src/main/java/CameraFrameServicev2.kt`: Fixed frame delivery for both front and back cameras
+    - Native library version bumped to v2.0.1
+
+  - **How to Update**:
+    1. Rebuild the AndroidLib: `./gradlew :camerastreamer:assembleRelease`
+    2. Copy `camerastreamer-release.aar` to `BaluMediaServer/Jar/`
+    3. Rebuild your application
+
+  - **Impact**: This was the actual root cause of stream stopping issues. The fix ensures frames are always delivered to .NET regardless of internal queue state. Streams now run continuously without any frame drops or interruptions. The internal queue remains available for future use cases but no longer blocks primary frame delivery.
+
+- v1.5.13: MJPEG Streaming Smoothness Improvements. This release significantly improves MJPEG streaming smoothness with architectural improvements inspired by MauiJpegServer.
+
+  - **Problem**: MJPEG streaming could feel choppy or have inconsistent frame delivery:
+    - Encoder pushed frames to all clients synchronously
+    - No per-client frame rate limiting
+    - Clients could starve each other on slow networks
+    - No real-time FPS tracking for diagnostics
+
+  - **Solution**: New per-client streaming architecture:
+
+  - **SemaphoreSlim-Based Frame Signaling**:
+    - Each client has its own streaming task that waits on a semaphore
+    - When encoder produces a frame, it signals all waiting clients simultaneously
+    - More efficient than polling-based approaches
+    - Clients wake up exactly when frames are available
+
+  - **Per-Client Frame Rate Limiting**:
+    - Each client respects a configurable max frame rate (default 30 FPS)
+    - Prevents frame bursting that can cause network congestion
+    - Smoother, more consistent frame delivery
+    - New constructor parameter: `maxFrameRate`
+
+  - **Real-Time FPS Tracking**:
+    - Accurate FPS calculation using `Stopwatch`
+    - Watchdog logs FPS: `FPS: Back=29.8, Front=30.1`
+    - New properties: `BackCameraFps`, `FrontCameraFps`
+    - Total frame counters: `TotalBackFrames`, `TotalFrontFrames`
+
+  - **Per-Client Streaming Tasks**:
+    - Each client runs its own async streaming loop
+    - Clients are independent - slow client doesn't affect others
+    - Individual timeout and cleanup per client
+    - Better client lifecycle management with `ClientInfo` class
+
+  - **Latest Frame Access**:
+    - New methods: `GetLatestBackFrame()`, `GetLatestFrontFrame()`
+    - Useful for snapshot endpoints
+    - Instant frame access without waiting
+
+  - **API Changes**:
+    ```csharp
+    // New constructor parameter
+    var server = new MjpegServer(
+        port: 8089,
+        quality: 75,
+        maxFrameRate: 30  // NEW: Limit FPS per client
+    );
+
+    // New properties
+    double backFps = server.BackCameraFps;
+    double frontFps = server.FrontCameraFps;
+    long totalFrames = server.TotalBackFrames;
+
+    // New methods for snapshots
+    byte[]? latestFrame = server.GetLatestBackFrame();
+    ```
+
+  - **Files Changed**:
+    - `Services/MjpegServer.cs`: Complete rewrite of client streaming architecture
+
+  - **Performance Impact**:
+    - Smoother frame delivery with consistent intervals
+    - Reduced jitter on variable network conditions
+    - Better multi-client performance (clients don't block each other)
+    - Lower latency for responsive clients
+
+  - **Impact**: MJPEG streaming is now significantly smoother with consistent frame pacing. The new architecture ensures each client receives frames at a controlled rate, preventing the choppy playback that could occur with the previous push-based approach. Inspired by the clean architecture of MauiJpegServer while retaining BaluMediaServer's advanced features (authentication, HTTPS, etc.).
+
 ---
 
 **Thanks for checking out Balu Media Server!** 
