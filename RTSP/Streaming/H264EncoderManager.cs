@@ -318,7 +318,14 @@ public class H264EncoderManager : IH264EncoderManager
         // Write to channel (bounded channel with DropOldest automatically handles overflow)
         _h264FrameChannelFront.Writer.TryWrite(e);
 
-        FrameEncoded?.Invoke(this, e);
+        try
+        {
+            FrameEncoded?.Invoke(this, e);
+        }
+        catch (Exception ex)
+        {
+            Android.Util.Log.Error("H264EncoderManager", $"FrameEncoded subscriber error: {ex.Message}");
+        }
     }
 
     private void OnH264BackFrameEncoded(object? sender, H264FrameEventArgs e)
@@ -329,7 +336,14 @@ public class H264EncoderManager : IH264EncoderManager
         // Write to channel (bounded channel with DropOldest automatically handles overflow)
         _h264FrameChannelBack.Writer.TryWrite(e);
 
-        FrameEncoded?.Invoke(this, e);
+        try
+        {
+            FrameEncoded?.Invoke(this, e);
+        }
+        catch (Exception ex)
+        {
+            Android.Util.Log.Error("H264EncoderManager", $"FrameEncoded subscriber error: {ex.Message}");
+        }
     }
 
     private void UpdateSpsPpsCache(H264FrameEventArgs e)

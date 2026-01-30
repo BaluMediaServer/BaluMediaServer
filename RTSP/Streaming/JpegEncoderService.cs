@@ -20,6 +20,7 @@ public class JpegEncoderService : IDisposable
     private readonly Task _frontEncoderTask;
 
     private int _quality;
+    private volatile bool _disposed;  // Prevents JNI access after disposal
 
     /// <summary>
     /// Gets the output channel for back camera JPEG frames.
@@ -104,6 +105,7 @@ public class JpegEncoderService : IDisposable
 
     /// <summary>
     /// Background encoding loop that reads raw frames and writes JPEG frames.
+    /// Checks _disposed flag before JNI calls to prevent SIGSEGV on disposed Java objects.
     /// </summary>
     private async Task EncoderLoopAsync(ChannelReader<FrameEventArgs> input, ChannelWriter<EncodedJpegFrame> output, int cameraId)
     {
@@ -114,12 +116,25 @@ public class JpegEncoderService : IDisposable
         {
             await foreach (var frame in input.ReadAllAsync(_cts.Token))
             {
+                // Check disposed flag BEFORE any JNI calls to prevent SIGSEGV
+                if (_disposed)
+                {
+                    Log.Debug("[JpegEncoderService]", $"{cameraName} encoder loop exiting - service disposed");
+                    break;
+                }
+
                 try
                 {
+                    // Validate frame data before JNI encoding
+                    if (frame.Data == null || frame.Data.Length == 0 || frame.Width <= 0 || frame.Height <= 0)
+                    {
+                        continue;
+                    }
+
                     var jpegData = EncodeToJpeg(frame.Data, frame.Width, frame.Height,
                         Android.Graphics.ImageFormatType.Nv21, _quality);
 
-                    if (jpegData != null && jpegData.Length > 0)
+                    if (jpegData != null && jpegData.Length > 0 && !_disposed)
                     {
                         var encodedFrame = new EncodedJpegFrame
                         {
@@ -135,7 +150,10 @@ public class JpegEncoderService : IDisposable
                 }
                 catch (Exception ex)
                 {
-                    Log.Error("[JpegEncoderService]", $"{cameraName} encoding error: {ex.Message}");
+                    if (!_disposed) // Only log if not disposing
+                    {
+                        Log.Error("[JpegEncoderService]", $"{cameraName} encoding error: {ex.Message}");
+                    }
                 }
             }
         }
@@ -145,7 +163,10 @@ public class JpegEncoderService : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Error("[JpegEncoderService]", $"{cameraName} camera encoder loop error: {ex.Message}");
+            if (!_disposed)
+            {
+                Log.Error("[JpegEncoderService]", $"{cameraName} camera encoder loop error: {ex.Message}");
+            }
         }
         finally
         {
@@ -156,10 +177,21 @@ public class JpegEncoderService : IDisposable
 
     /// <summary>
     /// Encodes raw YUV frame data to JPEG format.
+    /// Explicitly disposes Java objects to prevent SIGSEGV on background threads.
     /// </summary>
     private static byte[] EncodeToJpeg(byte[] rawImageData, int width, int height,
         Android.Graphics.ImageFormatType format, int quality)
     {
+        // Validate input to prevent JNI crashes
+        if (rawImageData == null || rawImageData.Length == 0 || width <= 0 || height <= 0)
+        {
+            return Array.Empty<byte>();
+        }
+
+        Android.Graphics.YuvImage? yuvImage = null;
+        Android.Graphics.Rect? rect = null;
+        Android.Graphics.Bitmap? bitmap = null;
+
         try
         {
             using var outputStream = new MemoryStream();
@@ -167,18 +199,17 @@ public class JpegEncoderService : IDisposable
             if (format == Android.Graphics.ImageFormatType.Nv21 ||
                 format == Android.Graphics.ImageFormatType.Yuv420888)
             {
-                var yuvImage = new Android.Graphics.YuvImage(rawImageData,
+                yuvImage = new Android.Graphics.YuvImage(rawImageData,
                     Android.Graphics.ImageFormatType.Nv21, width, height, null);
-                var rect = new Android.Graphics.Rect(0, 0, width, height);
+                rect = new Android.Graphics.Rect(0, 0, width, height);
                 yuvImage.CompressToJpeg(rect, quality, outputStream);
             }
             else
             {
-                var bitmap = Android.Graphics.BitmapFactory.DecodeByteArray(rawImageData, 0, rawImageData.Length);
+                bitmap = Android.Graphics.BitmapFactory.DecodeByteArray(rawImageData, 0, rawImageData.Length);
                 if (bitmap != null)
                 {
                     bitmap.Compress(Android.Graphics.Bitmap.CompressFormat.Jpeg!, quality, outputStream);
-                    bitmap.Dispose();
                 }
                 else
                 {
@@ -194,13 +225,24 @@ public class JpegEncoderService : IDisposable
             Log.Error("[JpegEncoderService]", $"JPEG encoding error: {ex.Message}");
             return Array.Empty<byte>();
         }
+        finally
+        {
+            // Explicitly dispose Java objects to prevent JNI crashes
+            try { rect?.Dispose(); } catch { }
+            try { yuvImage?.Dispose(); } catch { }
+            try { bitmap?.Dispose(); } catch { }
+        }
     }
 
     /// <summary>
     /// Releases all resources used by the encoder service.
+    /// Sets _disposed flag FIRST to stop encoder loops before any JNI cleanup.
     /// </summary>
     public void Dispose()
     {
+        // Set disposed flag FIRST to stop encoder loops from accessing Java objects
+        _disposed = true;
+
         _cts?.Cancel();
 
         _backInputChannel.Writer.TryComplete();
@@ -208,9 +250,21 @@ public class JpegEncoderService : IDisposable
 
         try
         {
-            Task.WaitAll(new[] { _backEncoderTask, _frontEncoderTask }, TimeSpan.FromSeconds(2));
+            // Wait for encoder tasks to complete - give them time to exit cleanly
+            var tasks = new[] { _backEncoderTask, _frontEncoderTask };
+            if (!Task.WaitAll(tasks, TimeSpan.FromSeconds(5)))
+            {
+                Log.Warn("[JpegEncoderService]", "Encoder tasks did not complete within 5s timeout");
+            }
         }
-        catch { }
+        catch (AggregateException ex)
+        {
+            Log.Warn("[JpegEncoderService]", $"Encoder task errors during dispose: {ex.InnerException?.Message ?? ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            Log.Warn("[JpegEncoderService]", $"Dispose error: {ex.Message}");
+        }
 
         _cts?.Dispose();
         Log.Info("[JpegEncoderService]", "Disposed");

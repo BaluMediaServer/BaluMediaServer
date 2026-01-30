@@ -32,6 +32,29 @@ public class ClientManager : IClientManager
         _transportManager = transportManager;
     }
 
+    /// <summary>
+    /// Safely invokes client change events, catching any subscriber exceptions.
+    /// </summary>
+    private void SafeInvokeClientChange()
+    {
+        try
+        {
+            ClientCountChanged?.Invoke(this, _clients.Count);
+        }
+        catch (Exception ex)
+        {
+            Log.Error("[ClientManager]", $"ClientCountChanged subscriber error: {ex.Message}");
+        }
+        try
+        {
+            OnClientsChange?.Invoke(_clients.Values.ToList());
+        }
+        catch (Exception ex)
+        {
+            Log.Error("[ClientManager]", $"OnClientsChange subscriber error: {ex.Message}");
+        }
+    }
+
     /// <inheritdoc/>
     public int ClientCount => _clients.Count;
 
@@ -44,8 +67,7 @@ public class ClientManager : IClientManager
         var result = _clients.TryAdd(client.Id, client);
         if (result)
         {
-            ClientCountChanged?.Invoke(this, _clients.Count);
-            OnClientsChange?.Invoke(_clients.Values.ToList());
+            SafeInvokeClientChange();
         }
         return result;
     }
@@ -56,8 +78,7 @@ public class ClientManager : IClientManager
         var result = _clients.TryRemove(clientId, out _);
         if (result)
         {
-            ClientCountChanged?.Invoke(this, _clients.Count);
-            OnClientsChange?.Invoke(_clients.Values.ToList());
+            SafeInvokeClientChange();
         }
         return result;
     }
@@ -76,8 +97,7 @@ public class ClientManager : IClientManager
                 _clients.TryRemove(client.Id, out _);
                 client.Dispose();
             }
-            ClientCountChanged?.Invoke(this, _clients.Count);
-            OnClientsChange?.Invoke(_clients.Values.ToList());
+            SafeInvokeClientChange();
             Log.Debug("[ClientManager]", $"Client {client.Id} cleaned up");
         }
         catch (Exception ex)
@@ -135,14 +155,29 @@ public class ClientManager : IClientManager
     {
         foreach (var client in _clients.Values.ToList())
         {
-            CleanupClient(client);
+            try
+            {
+                // Cleanup without triggering events (we'll do it once at the end)
+                lock (client)
+                {
+                    _transportManager.ReleaseClientPorts(client);
+                    _clientSpsCache.Remove(client.Id);
+                    _clientPpsCache.Remove(client.Id);
+                    _clientPacers.TryRemove(client.Id, out _);
+                    _clients.TryRemove(client.Id, out _);
+                    client.Dispose();
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error("[ClientManager]", $"Error cleaning up client {client?.Id}: {ex.Message}");
+            }
         }
         _clients.Clear();
         _clientSpsCache.Clear();
         _clientPpsCache.Clear();
         _clientPacers.Clear();
-        ClientCountChanged?.Invoke(this, 0);
-        OnClientsChange?.Invoke(new List<Client>());
+        SafeInvokeClientChange();
     }
 
     /// <inheritdoc/>
@@ -177,6 +212,13 @@ public class ClientManager : IClientManager
     /// </summary>
     public void NotifyClientsChanged()
     {
-        OnClientsChange?.Invoke(_clients.Values.ToList());
+        try
+        {
+            OnClientsChange?.Invoke(_clients.Values.ToList());
+        }
+        catch (Exception ex)
+        {
+            Log.Error("[ClientManager]", $"NotifyClientsChanged subscriber error: {ex.Message}");
+        }
     }
 }

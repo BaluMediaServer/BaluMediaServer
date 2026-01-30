@@ -28,7 +28,8 @@ public class H264Encoder : IDisposable
     private readonly ArrayPool<byte> _bufferPool = ArrayPool<byte>.Create();
 
     private readonly object _lock = new();
-    
+    private volatile bool _disposed;  // Prevents JNI access after disposal
+
     // Color formats supported by your device
     private const int COLOR_FormatYUV420Planar = 19;
     private const int COLOR_FormatYUV420SemiPlanar = 21;  // NV12
@@ -573,9 +574,11 @@ public class H264Encoder : IDisposable
         byte[]? sps = null;
         byte[]? pps = null;
         bool gotFirstOutput = false;
-        
+        int consecutiveErrors = 0;
+        const int maxConsecutiveErrors = 10;
+
         Log.Debug("H264MTK", "Encoding loop started");
-        
+
         while (_isRunning)
         {
             try
@@ -598,13 +601,28 @@ public class H264Encoder : IDisposable
                 {
                     Thread.Sleep(1);
                 }
+
+                // Reset error counter on successful iteration
+                consecutiveErrors = 0;
             }
             catch (Exception ex)
             {
-                Log.Error("H264MTK", $"Encoding loop error: {ex.Message}");
+                consecutiveErrors++;
+                Log.Error("H264MTK", $"Encoding loop error ({consecutiveErrors}/{maxConsecutiveErrors}): {ex.Message}");
+
+                // Break out of loop if too many consecutive errors - encoder likely in bad state
+                if (consecutiveErrors >= maxConsecutiveErrors)
+                {
+                    Log.Error("H264MTK", "Too many consecutive errors - stopping encoder loop");
+                    _isRunning = false;
+                    break;
+                }
+
+                // Small delay before retrying to prevent CPU spinning on repeated errors
+                Thread.Sleep(10);
             }
         }
-        
+
         Log.Debug("H264MTK", "Encoding loop ended");
     }
     
@@ -615,7 +633,8 @@ public class H264Encoder : IDisposable
     /// <param name="frame">The frame data to encode.</param>
     public void FeedInputBuffer(FrameData frame)
     {
-        if (_encoder == null) return;
+        // Check disposed flag BEFORE any JNI calls to prevent SIGSEGV
+        if (_disposed || _encoder == null) return;
 
         try
         {
@@ -1017,19 +1036,30 @@ public class H264Encoder : IDisposable
         {
             _isRunning = false;
             //_frameQueue.CompleteAdding();
-            
+
             _encoderThread?.Join(1000);
-            
+
             try
             {
                 _encoder?.Stop();
-                _encoder?.Release();
+
+                // Release with timeout to prevent ANR on some devices (especially MediaTek)
+                var releaseTask = Task.Run(() =>
+                {
+                    try { _encoder?.Release(); }
+                    catch { }
+                });
+
+                if (!releaseTask.Wait(TimeSpan.FromSeconds(3)))
+                {
+                    Log.Warn("H264MTK", "Encoder.Release() timed out (3s) - may cause resource leak");
+                }
             }
             catch (Exception ex)
             {
                 Log.Error("H264MTK", $"Error stopping encoder: {ex.Message}");
             }
-            
+
             _encoder = null;
         }
     }

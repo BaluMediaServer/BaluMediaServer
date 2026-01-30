@@ -1877,6 +1877,65 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
 
   - **Impact**: MJPEG streaming is now significantly smoother with consistent frame pacing. The new architecture ensures each client receives frames at a controlled rate, preventing the choppy playback that could occur with the previous push-based approach. Inspired by the clean architecture of MauiJpegServer while retaining BaluMediaServer's advanced features (authentication, HTTPS, etc.).
 
+- v1.5.14: Client Reconnection Bug Fix. This release fixes a critical race condition that caused streams to crash when clients disconnected and reconnected.
+
+  - **Problem**: After a client disconnected and reconnected (or a new client connected), the stream would completely stop:
+    - Cameras appeared to crash (flashlight could be enabled, indicating camera release)
+    - New clients would block forever waiting for frames
+    - The issue occurred due to a semaphore race condition in the frame signaling mechanism
+
+  - **Root Cause Analysis**:
+    - The semaphore release logic only released N times where N = current client count
+    - When client disconnected, count dropped to 0, so encoder released 0 times
+    - New clients connecting between frames would call `WaitAsync()` but never receive a signal
+    - This created a deadlock where new clients could never receive frames
+    - Additionally, `_streamStarted` flag was never reset, preventing on-demand camera restart
+
+  - **Solution**: Two-part fix for robust client handling:
+
+  - **Semaphore Always Releases At Least Once**:
+    ```csharp
+    // Before (buggy):
+    var clientCount = _clientsBack.Count;  // Could be 0!
+
+    // After (fixed):
+    var clientCount = System.Math.Max(1, _clientsBack.Count);  // Always >= 1
+    ```
+    - Ensures new clients connecting between frames can acquire the semaphore
+    - Prevents deadlock when client count temporarily drops to zero
+    - `SemaphoreFullException` still prevents overflow
+
+  - **Reset Stream State on Last Client Disconnect**:
+    ```csharp
+    // In HandleClient finally block:
+    if (_clientsBack.Count == 0 && _clientsFront.Count == 0)
+    {
+        lock (_streamLock)
+        {
+            if (_clientsBack.Count == 0 && _clientsFront.Count == 0)
+            {
+                _streamStarted = false;  // Allow on-demand restart
+            }
+        }
+    }
+    ```
+    - Double-checked locking pattern for thread safety
+    - Allows cameras to restart on-demand when new clients connect
+    - Logs state change for debugging
+
+  - **Files Changed**:
+    - `Services/MjpegServer.cs`:
+      - Lines 371, 419: Changed `Math.Max(1, count)` for semaphore release
+      - Lines 657-668: Added `_streamStarted` reset in client cleanup
+
+  - **Testing**:
+    - Connect MJPEG client, verify streaming works
+    - Disconnect client, wait a few seconds
+    - Reconnect (same or different device) - stream should resume immediately
+    - Verify no "flashlight available" state (cameras stay ready or restart on-demand)
+
+  - **Impact**: Client reconnection now works reliably. The race condition that caused streams to appear "crashed" after disconnect/reconnect cycles is eliminated. This was a critical fix for production deployments where clients may frequently connect and disconnect.
+
 ---
 
 **Thanks for checking out Balu Media Server!** 

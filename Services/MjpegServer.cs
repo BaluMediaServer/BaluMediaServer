@@ -18,6 +18,10 @@ namespace BaluMediaServer.Services;
 /// HTTP server for MJPEG streaming, providing web browser-compatible video streams.
 /// Supports both front and back camera streams with optional HTTPS and Basic authentication.
 ///
+/// v1.5.14: Fixed client reconnection bug - semaphore now always releases at least once per frame
+/// to prevent new clients from blocking forever. Added _streamStarted reset on last client disconnect
+/// to ensure cameras restart on-demand when clients reconnect.
+///
 /// v1.5.13: Improved smoothness with SemaphoreSlim signaling and per-client frame rate limiting.
 /// Inspired by MauiJpegServer architecture for more efficient frame distribution.
 /// </summary>
@@ -33,6 +37,7 @@ public class MjpegServer : IDisposable
     private string _bindAddress;
     private bool _authEnabled = false;
     private volatile bool _streamStarted = true;  // volatile for thread-safe reads
+    private volatile bool _disposed;              // Prevents JNI access after disposal
     private readonly object _streamLock = new();
     private Dictionary<string, string> _users = new();
     private bool _useHttps = false;
@@ -160,49 +165,90 @@ public class MjpegServer : IDisposable
 
     /// <summary>
     /// Releases all resources used by the MJPEG server.
+    /// Sets _disposed flag FIRST to stop encoder loops before any JNI cleanup.
     /// </summary>
     public void Dispose()
     {
-        Log.Warn("MJPEG SERVER", $"Dispose() called - stack trace: {Environment.StackTrace}");
+        Log.Warn("MJPEG SERVER", $"Dispose() called");
+
+        // Set disposed flag FIRST to stop encoder loops from accessing Java objects
+        _disposed = true;
+
         _cts?.Cancel();
         Server.OnNewBackFrame -= OnBackFrameAvailable;
         Server.OnNewFrontFrame -= OnFrontFrameAvailable;
 
-        // Cancel all client streaming tasks
+        // Cancel all client streaming tasks with null safety
         foreach (var client in _clientsBack.Values)
-            client.Cts.Cancel();
+        {
+            try { client?.Cts?.Cancel(); }
+            catch (ObjectDisposedException) { }
+        }
         foreach (var client in _clientsFront.Values)
-            client.Cts.Cancel();
+        {
+            try { client?.Cts?.Cancel(); }
+            catch (ObjectDisposedException) { }
+        }
 
         // Complete frame queues to stop encoder tasks
         _backFrameQueue.Writer.TryComplete();
         _frontFrameQueue.Writer.TryComplete();
 
+        // Wait for encoder tasks to complete before disposing - prevents JNI SIGSEGV
+        try
+        {
+            var encoderTasks = new[] { _backEncoderTask, _frontEncoderTask };
+            if (!Task.WaitAll(encoderTasks.Where(t => t != null).ToArray()!, TimeSpan.FromSeconds(5)))
+            {
+                Log.Warn("MJPEG SERVER", "Encoder tasks did not complete within 5s timeout");
+            }
+        }
+        catch (System.Exception ex)
+        {
+            Log.Debug("MJPEG SERVER", $"Encoder tasks wait error: {ex.Message}");
+        }
+
         //EventBuss.Command -= OnCommandSend;
         _listener?.Close();
 
-        try
-        {
-            _thread?.Dispose();
-            _watchdog?.Dispose();
-            _backEncoderTask?.Dispose();
-            _frontEncoderTask?.Dispose();
-            _backFrameSemaphore?.Dispose();
-            _frontFrameSemaphore?.Dispose();
-        }
-        catch { }
+        try { _thread?.Dispose(); }
+        catch (System.Exception ex) { Log.Debug("MJPEG SERVER", $"Dispose _thread error: {ex.Message}"); }
+
+        try { _watchdog?.Dispose(); }
+        catch (System.Exception ex) { Log.Debug("MJPEG SERVER", $"Dispose _watchdog error: {ex.Message}"); }
+
+        try { _backEncoderTask?.Dispose(); }
+        catch (System.Exception ex) { Log.Debug("MJPEG SERVER", $"Dispose _backEncoderTask error: {ex.Message}"); }
+
+        try { _frontEncoderTask?.Dispose(); }
+        catch (System.Exception ex) { Log.Debug("MJPEG SERVER", $"Dispose _frontEncoderTask error: {ex.Message}"); }
+
+        try { _backFrameSemaphore?.Dispose(); }
+        catch (System.Exception ex) { Log.Debug("MJPEG SERVER", $"Dispose _backFrameSemaphore error: {ex.Message}"); }
+
+        try { _frontFrameSemaphore?.Dispose(); }
+        catch (System.Exception ex) { Log.Debug("MJPEG SERVER", $"Dispose _frontFrameSemaphore error: {ex.Message}"); }
+
         _cts?.Dispose();
+        Log.Info("MJPEG SERVER", "Disposed successfully");
     }
     private void OnCommandSend(BussCommand command)
     {
-        switch (command)
+        try
         {
-            case BussCommand.START_MJPEG_SERVER:
-                Start();
-                break;
-            case BussCommand.STOP_MJPEG_SERVER:
-                Stop();
-                break;
+            switch (command)
+            {
+                case BussCommand.START_MJPEG_SERVER:
+                    Start();
+                    break;
+                case BussCommand.STOP_MJPEG_SERVER:
+                    Stop();
+                    break;
+            }
+        }
+        catch (System.Exception ex)
+        {
+            Log.Error("MJPEG SERVER", $"OnCommandSend error: {ex.Message}");
         }
     }
     private async Task Watchdog()
@@ -341,16 +387,34 @@ public class MjpegServer : IDisposable
     /// <summary>
     /// Background task that encodes back camera frames and signals waiting clients.
     /// Uses SemaphoreSlim for efficient client notification (inspired by MauiJpegServer).
+    /// Always releases semaphore at least once per frame to prevent race condition where
+    /// new clients connecting between frames would block forever (v1.5.14 fix).
+    /// Checks _disposed flag before JNI calls to prevent SIGSEGV.
     /// </summary>
     private async Task BackEncoderLoopAsync()
     {
         await foreach (var arg in _backFrameQueue.Reader.ReadAllAsync(_cts.Token))
         {
+            // Check disposed flag BEFORE any JNI calls to prevent SIGSEGV
+            if (_disposed)
+            {
+                Log.Debug("MJPEG SERVER", "Back encoder loop exiting - server disposed");
+                break;
+            }
+
             try
             {
+                // Validate frame data before JNI encoding
+                if (arg.Data == null || arg.Data.Length == 0 || arg.Width <= 0 || arg.Height <= 0)
+                {
+                    continue;
+                }
+
                 // Always encode to keep latest frame available for new clients
                 var jpegData = Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height,
                     Android.Graphics.ImageFormatType.Nv21, _quality);
+
+                if (_disposed) break; // Check again after encoding
 
                 // Store latest frame for client consumption
                 _latestBackJpeg = jpegData;
@@ -367,12 +431,12 @@ public class MjpegServer : IDisposable
                 }
 
                 // Signal all waiting clients that a new frame is available
-                // Release as many times as there are clients to wake them all
-                var clientCount = _clientsBack.Count;
+                // Always release at least once so new clients connecting between frames can get notified
+                var clientCount = System.Math.Max(1, _clientsBack.Count);
                 for (int i = 0; i < clientCount; i++)
                 {
                     try { _backFrameSemaphore.Release(); }
-                    catch (SemaphoreFullException) { break; } // All clients notified
+                    catch (SemaphoreFullException) { break; } // Semaphore full, all clients notified
                 }
             }
             catch (OperationCanceledException)
@@ -381,7 +445,7 @@ public class MjpegServer : IDisposable
             }
             catch (System.Exception ex)
             {
-                Log.Debug("MJPEG SERVER", $"Back encoder error: {ex.Message}");
+                if (!_disposed) Log.Debug("MJPEG SERVER", $"Back encoder error: {ex.Message}");
             }
         }
     }
@@ -389,16 +453,34 @@ public class MjpegServer : IDisposable
     /// <summary>
     /// Background task that encodes front camera frames and signals waiting clients.
     /// Uses SemaphoreSlim for efficient client notification (inspired by MauiJpegServer).
+    /// Always releases semaphore at least once per frame to prevent race condition where
+    /// new clients connecting between frames would block forever (v1.5.14 fix).
+    /// Checks _disposed flag before JNI calls to prevent SIGSEGV.
     /// </summary>
     private async Task FrontEncoderLoopAsync()
     {
         await foreach (var arg in _frontFrameQueue.Reader.ReadAllAsync(_cts.Token))
         {
+            // Check disposed flag BEFORE any JNI calls to prevent SIGSEGV
+            if (_disposed)
+            {
+                Log.Debug("MJPEG SERVER", "Front encoder loop exiting - server disposed");
+                break;
+            }
+
             try
             {
+                // Validate frame data before JNI encoding
+                if (arg.Data == null || arg.Data.Length == 0 || arg.Width <= 0 || arg.Height <= 0)
+                {
+                    continue;
+                }
+
                 // Always encode to keep latest frame available for new clients
                 var jpegData = Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height,
                     Android.Graphics.ImageFormatType.Nv21, _quality);
+
+                if (_disposed) break; // Check again after encoding
 
                 // Store latest frame for client consumption
                 _latestFrontJpeg = jpegData;
@@ -415,11 +497,12 @@ public class MjpegServer : IDisposable
                 }
 
                 // Signal all waiting clients that a new frame is available
-                var clientCount = _clientsFront.Count;
+                // Always release at least once so new clients connecting between frames can get notified
+                var clientCount = System.Math.Max(1, _clientsFront.Count);
                 for (int i = 0; i < clientCount; i++)
                 {
                     try { _frontFrameSemaphore.Release(); }
-                    catch (SemaphoreFullException) { break; }
+                    catch (SemaphoreFullException) { break; } // Semaphore full, all clients notified
                 }
             }
             catch (OperationCanceledException)
@@ -428,7 +511,7 @@ public class MjpegServer : IDisposable
             }
             catch (System.Exception ex)
             {
-                Log.Debug("MJPEG SERVER", $"Front encoder error: {ex.Message}");
+                if (!_disposed) Log.Debug("MJPEG SERVER", $"Front encoder error: {ex.Message}");
             }
         }
     }
@@ -486,7 +569,17 @@ public class MjpegServer : IDisposable
             {
                 Log.Debug("MJPEG SERVER", "WAITING CLIENT");
                 var ctx = await _listener.GetContextAsync();
-                _ = Task.Run(() => HandleClient(ctx), _cts.Token);
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await HandleClient(ctx);
+                    }
+                    catch (System.Exception ex)
+                    {
+                        Log.Error("MJPEG SERVER", $"HandleClient unhandled error: {ex.Message}");
+                    }
+                }, _cts.Token);
             }
             catch (System.Exception ex)
             {
@@ -651,6 +744,19 @@ public class MjpegServer : IDisposable
             else
             {
                 _clientsFront.TryRemove(response, out _);
+            }
+
+            // Reset _streamStarted when last client disconnects so cameras restart on-demand
+            if (_clientsBack.Count == 0 && _clientsFront.Count == 0)
+            {
+                lock (_streamLock)
+                {
+                    if (_clientsBack.Count == 0 && _clientsFront.Count == 0)
+                    {
+                        _streamStarted = false;
+                        Log.Info("MJPEG SERVER", "Last client disconnected, reset stream state for on-demand restart");
+                    }
+                }
             }
 
             clientInfo.Cts.Dispose();

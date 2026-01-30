@@ -92,7 +92,7 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
         }
         catch (Exception ex)
         {
-            ErrorOccurred?.Invoke(this, $"Failed to start capture: {ex.Message}");
+            SafeInvokeError($"Failed to start capture: {ex.Message}");
         }
     }
 
@@ -109,7 +109,7 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
         }
         catch (Exception ex)
         {
-            ErrorOccurred?.Invoke(this, $"Failed to stop capture: {ex.Message}");
+            SafeInvokeError($"Failed to stop capture: {ex.Message}");
         }
     }
 
@@ -143,7 +143,7 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
         }
         catch (Exception ex)
         {
-            ErrorOccurred?.Invoke(this, $"Error processing frame: {ex.Message}");
+            SafeInvokeError($"Error processing frame: {ex.Message}");
             RecycleFrame(frame);
         }
     }
@@ -224,7 +224,23 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
     /// <param name="error">The error message to report.</param>
     public void OnError(string error)
     {
-        ErrorOccurred?.Invoke(this, error);
+        SafeInvokeError(error);
+    }
+
+    /// <summary>
+    /// Safely invokes the ErrorOccurred event, catching any subscriber exceptions
+    /// to prevent crashes in native callback contexts.
+    /// </summary>
+    private void SafeInvokeError(string error)
+    {
+        try
+        {
+            ErrorOccurred?.Invoke(this, error);
+        }
+        catch
+        {
+            // Swallow subscriber exceptions to prevent native callback crash
+        }
     }
 
     /// <summary>

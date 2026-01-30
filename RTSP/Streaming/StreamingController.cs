@@ -94,10 +94,24 @@ public class StreamingController : IStreamingController
         if (!_isStreaming)
         {
             // Request camera start
-            CameraStartRequested?.Invoke(this, client.CameraId);
+            try
+            {
+                CameraStartRequested?.Invoke(this, client.CameraId);
+            }
+            catch (Exception ex)
+            {
+                Log.Error("[StreamingController]", $"CameraStartRequested subscriber error: {ex.Message}");
+            }
 
             _isStreaming = true;
-            StreamingStateChanged?.Invoke(this, true);
+            try
+            {
+                StreamingStateChanged?.Invoke(this, true);
+            }
+            catch (Exception ex)
+            {
+                Log.Error("[StreamingController]", $"StreamingStateChanged subscriber error: {ex.Message}");
+            }
 
             if (client.Codec == CodecType.H264)
             {

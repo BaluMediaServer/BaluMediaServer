@@ -144,9 +144,17 @@ public class Server : IDisposable
         _clientManager = new ClientManager(_transportManager);
         _streamingController = new StreamingController(_encoderManager, _jpegEncoder, _rtpBuilder, _transportManager, _clientManager);
 
-        // Wire up events
-        _clientManager.OnClientsChange += clients => OnClientsChange?.Invoke(clients);
-        _streamingController.StreamingStateChanged += (_, streaming) => OnStreaming?.Invoke(this, streaming);
+        // Wire up events with exception safety
+        _clientManager.OnClientsChange += clients =>
+        {
+            try { OnClientsChange?.Invoke(clients); }
+            catch (Exception ex) { Log.Error("[RTSP Server]", $"OnClientsChange subscriber error: {ex.Message}"); }
+        };
+        _streamingController.StreamingStateChanged += (_, streaming) =>
+        {
+            try { OnStreaming?.Invoke(this, streaming); }
+            catch (Exception ex) { Log.Error("[RTSP Server]", $"OnStreaming subscriber error: {ex.Message}"); }
+        };
         _streamingController.CameraStartRequested += OnCameraStartRequested;
         _streamingController.GetLatestFrame = GetLatestFrame;
         _rtcpManager.ClientCleanupRequired += (_, client) => _clientManager.CleanupClient(client);
@@ -351,13 +359,22 @@ public class Server : IDisposable
             _socket.Bind(endpoint);
             _socket.Listen(_maxClients);
         }
-        catch
+        catch (Exception ex)
         {
-            _socket?.Close();
-            _socket?.Dispose();
-            _socket = CreateConfiguredSocket();
-            _socket.Bind(endpoint);
-            _socket.Listen(_maxClients);
+            Log.Warn("[RTSP Server]", $"Socket bind failed, retrying: {ex.Message}");
+            try
+            {
+                _socket?.Close();
+                _socket?.Dispose();
+                _socket = CreateConfiguredSocket();
+                _socket.Bind(endpoint);
+                _socket.Listen(_maxClients);
+            }
+            catch (Exception retryEx)
+            {
+                Log.Error("[RTSP Server]", $"Socket configuration failed: {retryEx.Message}");
+                throw; // Re-throw to caller - socket cannot be configured
+            }
         }
     }
 
@@ -429,7 +446,14 @@ public class Server : IDisposable
     {
         if (arg?.Data != null && arg.Data.Length > 0)
         {
-            OnNewBackFrame?.Invoke(this, arg);
+            try
+            {
+                OnNewBackFrame?.Invoke(this, arg);
+            }
+            catch (Exception ex)
+            {
+                Log.Error("[RTSP Server]", $"OnNewBackFrame subscriber error: {ex.Message}");
+            }
             lock (_frameBackLock)
             {
                 _latestBackFrame = arg;
@@ -447,7 +471,14 @@ public class Server : IDisposable
     {
         if (arg?.Data != null && arg.Data.Length > 0)
         {
-            OnNewFrontFrame?.Invoke(this, arg);
+            try
+            {
+                OnNewFrontFrame?.Invoke(this, arg);
+            }
+            catch (Exception ex)
+            {
+                Log.Error("[RTSP Server]", $"OnNewFrontFrame subscriber error: {ex.Message}");
+            }
             lock (_frameFrontLock)
             {
                 _latestFrontFrame = arg;
@@ -545,7 +576,14 @@ public class Server : IDisposable
             // This prevents the "IDLE" state when only MJPEG clients are connected
             var hasAnyClients = _isStreaming || (_mjpegServer?.ClientCount ?? 0) > 0;
             var camerasRunning = _isCapturingBack || _isCapturingFront;
-            OnStreaming?.Invoke(this, hasAnyClients || camerasRunning);
+            try
+            {
+                OnStreaming?.Invoke(this, hasAnyClients || camerasRunning);
+            }
+            catch (Exception ex)
+            {
+                Log.Error("[RTSP Server]", $"OnStreaming subscriber error: {ex.Message}");
+            }
             await Task.Delay(5000, _cts.Token).ConfigureAwait(false);
         }
     }
@@ -558,7 +596,17 @@ public class Server : IDisposable
             {
                 var client = await _socket.AcceptAsync(_cts.Token);
                 client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true);
-                _ = Task.Run(() => HandleClient(client), _cts.Token);
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await HandleClient(client);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Error("[RTSP Server]", $"HandleClient unhandled error: {ex.Message}");
+                    }
+                }, _cts.Token);
             }
             catch { }
         }
@@ -641,7 +689,17 @@ public class Server : IDisposable
                 if (await protocolHandler.HandlePlayAsync(writer, request, client).ConfigureAwait(false))
                 {
                     _isStreaming = true;
-                    _ = Task.Run(() => _streamingController.StreamToClientAsync(client, _cts.Token), _cts.Token);
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await _streamingController.StreamToClientAsync(client, _cts.Token);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Error("[RTSP Server]", $"StreamToClient unhandled error: {ex.Message}");
+                        }
+                    }, _cts.Token);
                 }
                 break;
             case "TEARDOWN":
@@ -655,6 +713,7 @@ public class Server : IDisposable
 
     /// <summary>
     /// Encodes raw image data to JPEG format.
+    /// Thread-safe: Creates and disposes Java objects within the same call to prevent JNI crashes.
     /// </summary>
     /// <param name="rawImageData">The raw image data.</param>
     /// <param name="width">The image width.</param>
@@ -664,22 +723,32 @@ public class Server : IDisposable
     /// <returns>The JPEG encoded data.</returns>
     public static byte[] EncodeToJpeg(byte[] rawImageData, int width, int height, Android.Graphics.ImageFormatType format, int quality = 80)
     {
+        // Validate input to prevent JNI crashes on invalid data
+        if (rawImageData == null || rawImageData.Length == 0 || width <= 0 || height <= 0)
+        {
+            return Array.Empty<byte>();
+        }
+
+        Android.Graphics.YuvImage? yuvImage = null;
+        Android.Graphics.Rect? rect = null;
+        Android.Graphics.Bitmap? bitmap = null;
+
         try
         {
             using var outputStream = new MemoryStream();
             if (format == Android.Graphics.ImageFormatType.Nv21 || format == Android.Graphics.ImageFormatType.Yuv420888)
             {
-                var yuvImage = new Android.Graphics.YuvImage(rawImageData, Android.Graphics.ImageFormatType.Nv21, width, height, null);
-                var rect = new Android.Graphics.Rect(0, 0, width, height);
+                // Create Java objects and immediately use them
+                yuvImage = new Android.Graphics.YuvImage(rawImageData, Android.Graphics.ImageFormatType.Nv21, width, height, null);
+                rect = new Android.Graphics.Rect(0, 0, width, height);
                 yuvImage.CompressToJpeg(rect, quality, outputStream);
             }
             else
             {
-                var bitmap = Android.Graphics.BitmapFactory.DecodeByteArray(rawImageData, 0, rawImageData.Length);
+                bitmap = Android.Graphics.BitmapFactory.DecodeByteArray(rawImageData, 0, rawImageData.Length);
                 if (bitmap != null)
                 {
                     bitmap.Compress(Android.Graphics.Bitmap.CompressFormat.Jpeg!, quality, outputStream);
-                    bitmap.Dispose();
                 }
                 else
                 {
@@ -693,6 +762,14 @@ public class Server : IDisposable
         {
             Log.Error("[RTSP]", $"JPEG encoding error: {ex.Message}");
             return Array.Empty<byte>();
+        }
+        finally
+        {
+            // Explicitly dispose Java objects to prevent JNI crashes on background threads
+            // Must dispose in finally block to ensure cleanup even on exceptions
+            try { rect?.Dispose(); } catch { }
+            try { yuvImage?.Dispose(); } catch { }
+            try { bitmap?.Dispose(); } catch { }
         }
     }
 }
