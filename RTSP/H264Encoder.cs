@@ -570,7 +570,7 @@ public class H264Encoder : IDisposable
     
     private void EncodingLoop()
     {
-        var bufferInfo = new MediaCodec.BufferInfo();
+        MediaCodec.BufferInfo? bufferInfo = null;
         byte[]? sps = null;
         byte[]? pps = null;
         bool gotFirstOutput = false;
@@ -579,48 +579,69 @@ public class H264Encoder : IDisposable
 
         Log.Debug("H264MTK", "Encoding loop started");
 
-        while (_isRunning)
+        try
         {
-            try
+            bufferInfo = new MediaCodec.BufferInfo();
+
+            // Check both _isRunning and _disposed to ensure clean shutdown
+            while (_isRunning && !_disposed)
             {
-                bool processedInput = false;
-                bool processedOutput = false;
-
-                // Try to read frame with short timeout (non-blocking)
-                if (_frameChannel.Reader.TryRead(out var frame))
+                try
                 {
-                    FeedInputBuffer(frame);
-                    processedInput = true;
+                    bool processedInput = false;
+                    bool processedOutput = false;
+
+                    // Check disposed before each operation
+                    if (_disposed) break;
+
+                    // Try to read frame with short timeout (non-blocking)
+                    if (_frameChannel.Reader.TryRead(out var frame))
+                    {
+                        FeedInputBuffer(frame);
+                        processedInput = true;
+                    }
+
+                    // Check disposed again before draining output
+                    if (_disposed) break;
+
+                    // Always try to drain output
+                    processedOutput = DrainOutputBuffer(bufferInfo, ref sps, ref pps, ref gotFirstOutput);
+
+                    // Small sleep to prevent CPU spinning only if nothing was processed
+                    if (!processedInput && !processedOutput)
+                    {
+                        Thread.Sleep(1);
+                    }
+
+                    // Reset error counter on successful iteration
+                    consecutiveErrors = 0;
                 }
-
-                // Always try to drain output
-                processedOutput = DrainOutputBuffer(bufferInfo, ref sps, ref pps, ref gotFirstOutput);
-
-                // Small sleep to prevent CPU spinning only if nothing was processed
-                if (!processedInput && !processedOutput)
+                catch (System.Exception ex)
                 {
-                    Thread.Sleep(1);
-                }
+                    // Don't log errors during disposal - they're expected
+                    if (_disposed) break;
 
-                // Reset error counter on successful iteration
-                consecutiveErrors = 0;
+                    consecutiveErrors++;
+                    Log.Error("H264MTK", $"Encoding loop error ({consecutiveErrors}/{maxConsecutiveErrors}): {ex.Message}");
+
+                    // Break out of loop if too many consecutive errors - encoder likely in bad state
+                    if (consecutiveErrors >= maxConsecutiveErrors)
+                    {
+                        Log.Error("H264MTK", "Too many consecutive errors - stopping encoder loop");
+                        _isRunning = false;
+                        break;
+                    }
+
+                    // Small delay before retrying to prevent CPU spinning on repeated errors
+                    Thread.Sleep(10);
+                }
             }
-            catch (Exception ex)
-            {
-                consecutiveErrors++;
-                Log.Error("H264MTK", $"Encoding loop error ({consecutiveErrors}/{maxConsecutiveErrors}): {ex.Message}");
-
-                // Break out of loop if too many consecutive errors - encoder likely in bad state
-                if (consecutiveErrors >= maxConsecutiveErrors)
-                {
-                    Log.Error("H264MTK", "Too many consecutive errors - stopping encoder loop");
-                    _isRunning = false;
-                    break;
-                }
-
-                // Small delay before retrying to prevent CPU spinning on repeated errors
-                Thread.Sleep(10);
-            }
+        }
+        finally
+        {
+            // Dispose Java object safely
+            try { bufferInfo?.Dispose(); }
+            catch { }
         }
 
         Log.Debug("H264MTK", "Encoding loop ended");
@@ -779,7 +800,8 @@ public class H264Encoder : IDisposable
     }
     private bool DrainOutputBuffer(MediaCodec.BufferInfo bufferInfo, ref byte[]? sps, ref byte[]? pps, ref bool gotFirstOutput)
     {
-        if (_encoder == null) return false;
+        // Check disposed flag BEFORE any JNI calls to prevent SIGSEGV
+        if (_disposed || _encoder == null) return false;
 
         try
         {
@@ -1029,16 +1051,30 @@ public class H264Encoder : IDisposable
     
     /// <summary>
     /// Stops the encoder and releases all resources.
+    /// Sets _disposed flag FIRST to stop encoder loop before any JNI cleanup.
     /// </summary>
     public void Stop()
     {
         lock (_lock)
         {
+            // Set disposed flag FIRST to stop encoder loop from accessing Java objects
+            _disposed = true;
             _isRunning = false;
-            //_frameQueue.CompleteAdding();
 
-            _encoderThread?.Join(1000);
+            // Complete the frame channel to unblock any waiting reads
+            _frameChannel.Writer.TryComplete();
 
+            // Wait for encoder thread to fully stop BEFORE touching MediaCodec
+            // This prevents SIGSEGV from encoder thread accessing disposed objects
+            if (_encoderThread != null && _encoderThread.IsAlive)
+            {
+                if (!_encoderThread.Join(3000))
+                {
+                    Log.Warn("H264MTK", "Encoder thread did not stop within 3s timeout");
+                }
+            }
+
+            // Now safe to stop and release MediaCodec - encoder thread has exited
             try
             {
                 _encoder?.Stop();
@@ -1055,12 +1091,13 @@ public class H264Encoder : IDisposable
                     Log.Warn("H264MTK", "Encoder.Release() timed out (3s) - may cause resource leak");
                 }
             }
-            catch (Exception ex)
+            catch (System.Exception ex)
             {
                 Log.Error("H264MTK", $"Error stopping encoder: {ex.Message}");
             }
 
             _encoder = null;
+            Log.Info("H264MTK", "Encoder stopped and disposed");
         }
     }
     

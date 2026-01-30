@@ -22,6 +22,7 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
     private Task? _thread;
     private DateTime _lastFrameTime;
     private readonly TimeSpan _minFrameInterval = TimeSpan.FromMilliseconds(22); // +- 45 fps
+    private volatile bool _disposed;  // Prevents JNI access after disposal
 
     /// <summary>
     /// Calculates the channel capacity based on resolution to limit memory usage.
@@ -122,29 +123,32 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
     {
         try
         {
-            // Check if channel exists (may be called before StartCapture)
-            if (_videoFrames == null)
+            // Check disposed flag FIRST to prevent JNI access after disposal
+            if (_disposed || _videoFrames == null)
             {
-                RecycleFrame(frame);
+                SafeRecycleFrame(frame);
                 return;
             }
 
             var now = DateTime.UtcNow;
             if (now - _lastFrameTime < _minFrameInterval)
             {
-                RecycleFrame(frame);
+                SafeRecycleFrame(frame);
                 return; // Drop immediately
             }
             _lastFrameTime = DateTime.UtcNow;
             if (!_videoFrames.Writer.TryWrite(frame))
             {
-                RecycleFrame(frame);
+                SafeRecycleFrame(frame);
             }
         }
         catch (Exception ex)
         {
-            SafeInvokeError($"Error processing frame: {ex.Message}");
-            RecycleFrame(frame);
+            if (!_disposed) // Only log if not disposing
+            {
+                SafeInvokeError($"Error processing frame: {ex.Message}");
+            }
+            SafeRecycleFrame(frame);
         }
     }
 
@@ -163,16 +167,46 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
         catch
         {
             // Fallback to dispose if recycle fails
-            frame.Dispose();
+            try { frame.Dispose(); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// Safely recycles or disposes a frame, catching all exceptions during disposal.
+    /// Used when service may be in the process of being disposed.
+    /// </summary>
+    /// <param name="frame">The video frame to safely recycle.</param>
+    private void SafeRecycleFrame(VideoFrame? frame)
+    {
+        if (frame == null) return;
+        try
+        {
+            if (!_disposed && _cameraCapture != null)
+            {
+                _cameraCapture.RecycleFrame(frame);
+            }
+            else
+            {
+                frame.Dispose();
+            }
+        }
+        catch
+        {
+            // Swallow all exceptions during frame cleanup
+            try { frame.Dispose(); } catch { }
         }
     }
 
     /// <summary>
     /// Processes a single video frame and raises the FrameReceived event.
+    /// Checks disposed flag before accessing VideoFrame JNI methods.
     /// </summary>
     /// <param name="frame">The video frame to process.</param>
     public void ProcessFrame(VideoFrame frame)
     {
+        // Check disposed BEFORE accessing VideoFrame JNI methods to prevent SIGSEGV
+        if (_disposed) return;
+
         var args = new FrameEventArgs
         {
             Data = frame.GetData()!,
@@ -182,38 +216,68 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
             Format = frame.Format,
             CameraId = frame.CameraId
         };
-        FrameReceived?.Invoke(this, args);
+
+        // Check disposed again before invoking event
+        if (_disposed) return;
+
+        try
+        {
+            FrameReceived?.Invoke(this, args);
+        }
+        catch
+        {
+            // Swallow subscriber exceptions
+        }
     }
 
     /// <summary>
     /// Continuously processes frames from the channel until cancelled.
+    /// Checks disposed flag to prevent JNI access after disposal.
     /// </summary>
     /// <returns>A task that represents the asynchronous frame processing operation.</returns>
     public async Task ProcessFramesAsync()
     {
-        while (!_cts.IsCancellationRequested && _threadRunning)
+        // Check both _threadRunning and _disposed for clean shutdown
+        while (!_cts.IsCancellationRequested && _threadRunning && !_disposed)
         {
             try
             {
+                // Check disposed before blocking read
+                if (_disposed) break;
+
                 // Use async read - this is blocking the thread currently
                 var frame = await _videoFrames.Reader.ReadAsync(_cts.Token).ConfigureAwait(false);
                 try
                 {
+                    // Check disposed after read completes, before JNI access
+                    if (_disposed)
+                    {
+                        SafeRecycleFrame(frame);
+                        break;
+                    }
                     ProcessFrame(frame);
                 }
                 finally
                 {
-                    // Recycle frame buffer back to native pool for reuse
-                    RecycleFrame(frame);
+                    // Safely recycle frame buffer
+                    SafeRecycleFrame(frame);
                 }
             }
             catch (OperationCanceledException)
             {
                 break; // Normal cancellation
             }
+            catch (ChannelClosedException)
+            {
+                break; // Channel completed during disposal
+            }
             catch (Exception ex)
             {
-                OnError(ex.Message);
+                // Don't log errors during disposal
+                if (!_disposed)
+                {
+                    OnError(ex.Message);
+                }
             }
         }
     }
@@ -245,27 +309,49 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
 
     /// <summary>
     /// Releases all resources used by the back camera service.
+    /// Sets _disposed flag FIRST to stop processing task before native cleanup.
     /// </summary>
     /// <param name="disposing">True to release both managed and unmanaged resources.</param>
     protected override void Dispose(bool disposing)
     {
         if (disposing)
         {
-            _cameraCapture?.StopBackCameraCapture();
+            // Set disposed flag FIRST to stop processing task from accessing JNI
+            _disposed = true;
             _threadRunning = false;
-            _cts?.Cancel();
+
+            // Signal channel completion and cancel token to unblock processing task
             _videoFrames?.Writer.TryComplete();
+            _cts?.Cancel();
+
+            // Wait for processing task to fully stop BEFORE touching native resources
             if (_thread != null)
             {
                 try
                 {
-                    _thread.Wait(TimeSpan.FromSeconds(5));
+                    if (!_thread.Wait(TimeSpan.FromSeconds(5)))
+                    {
+                        global::Android.Util.Log.Warn("[BackCameraService]", "Processing task did not stop within 5s timeout");
+                    }
                 }
                 catch { }
-                _thread.Dispose();
+                _thread = null;
             }
-            _cameraCapture?.Dispose();
+
+            // Now safe to stop camera - processing task has exited
+            try
+            {
+                _cameraCapture?.StopBackCameraCapture();
+            }
+            catch { }
+
+            try
+            {
+                _cameraCapture?.Dispose();
+            }
+            catch { }
             _cameraCapture = null;
+
             _cts?.Dispose();
         }
         base.Dispose(disposing);
