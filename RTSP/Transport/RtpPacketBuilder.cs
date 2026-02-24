@@ -27,13 +27,15 @@ public class RtpPacketBuilder : IRtpPacketBuilder
         packet[0] = 0x80; // V=2, P=0, X=0, CC=0
         packet[1] = (byte)(marker ? 0x80 | payloadType : payloadType);
 
-        // Sequence number (must be locked when reading)
+        // Atomically read and increment sequence number to prevent race conditions
         ushort seqNum;
         lock (client)
         {
-            seqNum = client.SequenceNumber;
-            // Track last RTP timestamp for RTCP Sender Reports
+            seqNum = client.SequenceNumber++;
+            // Track last RTP timestamp and packet/octet counts for RTCP Sender Reports
             client.LastRtpTimestampSent = timestamp;
+            client.PacketCount++;
+            client.OctetCount += (uint)payload.Length;
         }
         packet[2] = (byte)(seqNum >> 8);
         packet[3] = (byte)(seqNum & 0xFF);
@@ -79,13 +81,6 @@ public class RtpPacketBuilder : IRtpPacketBuilder
             var rtpPacket = CreateRtpPacket(client, payload, nalTimestamp, marker, 96);
 
             await _transportManager.SendDataAsync(client, rtpPacket).ConfigureAwait(false);
-
-            lock (client)
-            {
-                client.SequenceNumber++;
-                if (client.SequenceNumber > 65535)
-                    client.SequenceNumber = 0;
-            }
         }
         else
         {
@@ -114,12 +109,6 @@ public class RtpPacketBuilder : IRtpPacketBuilder
                 var rtpPacket = CreateRtpPacket(client, payload, nalTimestamp, marker, 96);
 
                 await _transportManager.SendDataAsync(client, rtpPacket).ConfigureAwait(false);
-                lock (client)
-                {
-                    client.SequenceNumber++;
-                    if (client.SequenceNumber > 65535)
-                        client.SequenceNumber = 0;
-                }
                 dataOffset += fragmentSize;
                 remainingData -= fragmentSize;
                 isFirstFragment = false;
@@ -200,11 +189,6 @@ public class RtpPacketBuilder : IRtpPacketBuilder
             // Send via appropriate transport
             await _transportManager.SendDataAsync(client, rtpPacket).ConfigureAwait(false);
 
-            lock (client)
-            {
-                client.SequenceNumber++;
-            }
-
             // Move offset by the amount of JPEG data we just sent
             offset += jpegDataSize;
         }
@@ -219,10 +203,15 @@ public class RtpPacketBuilder : IRtpPacketBuilder
         packet[0] = 0x80; // V=2, P=0, X=0, CC=0
         packet[1] = (byte)(marker ? 0x80 | payloadType : payloadType);
 
+        ushort seqNum;
         lock (client)
         {
-            packet[2] = (byte)(client.SequenceNumber >> 8);
-            packet[3] = (byte)(client.SequenceNumber & 0xFF);
+            seqNum = client.SequenceNumber++;
+            client.PacketCount++;
+            client.OctetCount += (uint)payload.Length;
+
+            packet[2] = (byte)(seqNum >> 8);
+            packet[3] = (byte)(seqNum & 0xFF);
 
             // Timestamp (client-specific)
             packet[4] = (byte)(client.RtpTimestamp >> 24);
@@ -249,11 +238,12 @@ public class RtpPacketBuilder : IRtpPacketBuilder
             if (client.BaseEncoderTimestamp == 0)
             {
                 client.BaseEncoderTimestamp = encoderTimestamp;
-                client.BaseRtpTimestamp = (uint)Random.Shared.Next(0, int.MaxValue);
+                // Use the RtpTimestamp already set in HandlePlayAsync so it matches the PLAY response RTP-Info header
+                client.BaseRtpTimestamp = client.RtpTimestamp;
                 return client.BaseRtpTimestamp;
             }
-            ulong delta_ns = encoderTimestamp - client.BaseEncoderTimestamp;
-            double seconds = delta_ns / 1_000_000_000.0;
+            ulong delta_us = encoderTimestamp - client.BaseEncoderTimestamp;
+            double seconds = delta_us / 1_000_000.0;
             ulong rtpAdd = (ulong)(seconds * 90000.0 + 0.5);
             return (uint)(client.BaseRtpTimestamp + rtpAdd);
         }

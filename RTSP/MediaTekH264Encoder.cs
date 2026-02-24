@@ -320,14 +320,14 @@ public class MediaTekH264Encoder : IDisposable
     {
         int ySize = _width * _height;
         int totalSize = ySize + (ySize / 2);
-        
+
         var nv12 = _bufferPool.Rent(totalSize);
-        
+
         try
         {
             // Y plane copy
             System.Buffer.BlockCopy(nv21, 0, nv12, 0, ySize);
-            
+
             // UV swap - vectorized if possible
             unsafe
             {
@@ -341,13 +341,15 @@ public class MediaTekH264Encoder : IDisposable
                     }
                 }
             }
-            
-            return nv12;
+
+            // Copy to exact-size array to avoid stale data from pooled buffer oversizing
+            var result = new byte[totalSize];
+            System.Buffer.BlockCopy(nv12, 0, result, 0, totalSize);
+            return result;
         }
-        catch
+        finally
         {
             _bufferPool.Return(nv12);
-            throw;
         }
     }
     private bool DrainOutputBuffer(MediaCodec.BufferInfo bufferInfo, ref byte[]? sps, ref byte[]? pps, ref bool gotFirstOutput)
@@ -390,9 +392,9 @@ public class MediaTekH264Encoder : IDisposable
                     }
                     else
                     {
-                        // Regular frame
-                        var nalUnits = new List<byte[]>();
-                        
+                        // Regular frame - split multi-NAL output buffers
+                        List<byte[]> nalUnits;
+
                         // MediaTek might not include start codes, so add them
                         if (!HasStartCode(data))
                         {
@@ -402,11 +404,12 @@ public class MediaTekH264Encoder : IDisposable
                             withStartCode[2] = 0;
                             withStartCode[3] = 1;
                             Array.Copy(data, 0, withStartCode, 4, data.Length);
-                            nalUnits.Add(withStartCode);
+                            nalUnits = new List<byte[]> { withStartCode };
                         }
                         else
                         {
-                            nalUnits.Add(data);
+                            // Split buffer into individual NAL units (encoder may output multiple NALs)
+                            nalUnits = ExtractNalUnits(data);
                         }
                         
                         var frameEvent = new H264FrameEventArgs
@@ -462,9 +465,16 @@ public class MediaTekH264Encoder : IDisposable
         var nalUnits = ExtractNalUnits(data);
         foreach (var nal in nalUnits)
         {
-            if (nal.Length >= 5)
+            // Determine start code length (3 or 4 bytes)
+            int offset = 0;
+            if (nal.Length >= 4 && nal[0] == 0 && nal[1] == 0 && nal[2] == 0 && nal[3] == 1)
+                offset = 4;
+            else if (nal.Length >= 3 && nal[0] == 0 && nal[1] == 0 && nal[2] == 1)
+                offset = 3;
+
+            if (offset > 0 && nal.Length > offset)
             {
-                var nalType = nal[4] & 0x1F;
+                var nalType = nal[offset] & 0x1F;
                 if (nalType == 7) sps = nal;
                 else if (nalType == 8) pps = nal;
             }
@@ -521,19 +531,38 @@ public class MediaTekH264Encoder : IDisposable
     {
         try
         {
-            // Try csd-0 and csd-1
+            // Try csd-0 (may contain SPS only, or SPS+PPS concatenated on some devices)
             if (format.ContainsKey("csd-0"))
             {
-                var spsBuffer = format.GetByteBuffer("csd-0");
-                if (spsBuffer != null)
+                var csd0Buffer = format.GetByteBuffer("csd-0");
+                if (csd0Buffer != null)
                 {
-                    sps = new byte[spsBuffer.Remaining()];
-                    spsBuffer.Get(sps);
-                    spsBuffer.Rewind();
-                    Log.Debug("H264MTK", $"Got SPS from format: {sps.Length} bytes");
+                    var csd0 = new byte[csd0Buffer.Remaining()];
+                    csd0Buffer.Get(csd0);
+                    csd0Buffer.Rewind();
+
+                    // Split in case csd-0 contains both SPS and PPS
+                    var nalUnits = ExtractNalUnits(csd0);
+                    foreach (var nal in nalUnits)
+                    {
+                        int offset = 0;
+                        if (nal.Length >= 4 && nal[0] == 0 && nal[1] == 0 && nal[2] == 0 && nal[3] == 1)
+                            offset = 4;
+                        else if (nal.Length >= 3 && nal[0] == 0 && nal[1] == 0 && nal[2] == 1)
+                            offset = 3;
+
+                        if (offset > 0 && nal.Length > offset)
+                        {
+                            int nalType = nal[offset] & 0x1F;
+                            if (nalType == 7) sps = nal;
+                            else if (nalType == 8) pps = nal;
+                        }
+                    }
+                    Log.Debug("H264MTK", $"Got SPS/PPS from csd-0: {csd0.Length} bytes, {nalUnits.Count} NAL(s)");
                 }
             }
-            
+
+            // Try csd-1 (dedicated PPS buffer, if present)
             if (format.ContainsKey("csd-1"))
             {
                 var ppsBuffer = format.GetByteBuffer("csd-1");
@@ -542,7 +571,7 @@ public class MediaTekH264Encoder : IDisposable
                     pps = new byte[ppsBuffer.Remaining()];
                     ppsBuffer.Get(pps);
                     ppsBuffer.Rewind();
-                    Log.Debug("H264MTK", $"Got PPS from format: {pps.Length} bytes");
+                    Log.Debug("H264MTK", $"Got PPS from csd-1: {pps.Length} bytes");
                 }
             }
         }

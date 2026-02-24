@@ -15,7 +15,7 @@ public interface IStreamingController
     Task StreamToClientAsync(Client client, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Gets or sets whether streaming is currently active.
+    /// Gets whether streaming is currently active.
     /// </summary>
     bool IsStreaming { get; }
 

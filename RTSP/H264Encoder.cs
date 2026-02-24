@@ -913,9 +913,16 @@ public class H264Encoder : IDisposable
         var nalUnits = ExtractNalUnits(data);
         foreach (var nal in nalUnits)
         {
-            if (nal.Length >= 5)
+            // Determine start code length (3 or 4 bytes)
+            int offset = 0;
+            if (nal.Length >= 4 && nal[0] == 0 && nal[1] == 0 && nal[2] == 0 && nal[3] == 1)
+                offset = 4;
+            else if (nal.Length >= 3 && nal[0] == 0 && nal[1] == 0 && nal[2] == 1)
+                offset = 3;
+
+            if (offset > 0 && nal.Length > offset)
             {
-                var nalType = nal[4] & 0x1F;
+                var nalType = nal[offset] & 0x1F;
                 if (nalType == 7) sps = nal;
                 else if (nalType == 8) pps = nal;
             }
@@ -989,19 +996,38 @@ public class H264Encoder : IDisposable
     {
         try
         {
-            // Try csd-0 and csd-1
+            // Try csd-0 (may contain SPS only, or SPS+PPS concatenated on some devices)
             if (format.ContainsKey("csd-0"))
             {
-                var spsBuffer = format.GetByteBuffer("csd-0");
-                if (spsBuffer != null)
+                var csd0Buffer = format.GetByteBuffer("csd-0");
+                if (csd0Buffer != null)
                 {
-                    sps = new byte[spsBuffer.Remaining()];
-                    spsBuffer.Get(sps);
-                    spsBuffer.Rewind();
-                    Log.Debug("H264MTK", $"Got SPS from format: {sps.Length} bytes");
+                    var csd0 = new byte[csd0Buffer.Remaining()];
+                    csd0Buffer.Get(csd0);
+                    csd0Buffer.Rewind();
+
+                    // Split in case csd-0 contains both SPS and PPS
+                    var nalUnits = ExtractNalUnits(csd0);
+                    foreach (var nal in nalUnits)
+                    {
+                        int offset = 0;
+                        if (nal.Length >= 4 && nal[0] == 0 && nal[1] == 0 && nal[2] == 0 && nal[3] == 1)
+                            offset = 4;
+                        else if (nal.Length >= 3 && nal[0] == 0 && nal[1] == 0 && nal[2] == 1)
+                            offset = 3;
+
+                        if (offset > 0 && nal.Length > offset)
+                        {
+                            int nalType = nal[offset] & 0x1F;
+                            if (nalType == 7) sps = nal;
+                            else if (nalType == 8) pps = nal;
+                        }
+                    }
+                    Log.Debug("H264Encoder", $"Got SPS/PPS from csd-0: {csd0.Length} bytes, {nalUnits.Count} NAL(s)");
                 }
             }
 
+            // Try csd-1 (dedicated PPS buffer, if present)
             if (format.ContainsKey("csd-1"))
             {
                 var ppsBuffer = format.GetByteBuffer("csd-1");
@@ -1010,13 +1036,13 @@ public class H264Encoder : IDisposable
                     pps = new byte[ppsBuffer.Remaining()];
                     ppsBuffer.Get(pps);
                     ppsBuffer.Rewind();
-                    Log.Debug("H264MTK", $"Got PPS from format: {pps.Length} bytes");
+                    Log.Debug("H264Encoder", $"Got PPS from csd-1: {pps.Length} bytes");
                 }
             }
         }
         catch (Exception ex)
         {
-            Log.Error("H264MTK", $"Error extracting parameter sets: {ex.Message}");
+            Log.Error("H264Encoder", $"Error extracting parameter sets: {ex.Message}");
         }
     }
     

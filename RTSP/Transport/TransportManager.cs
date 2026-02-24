@@ -30,15 +30,25 @@ public class TransportManager : ITransportManager
     /// <inheritdoc/>
     public async Task<bool> SendDataAsync(Client client, byte[] data)
     {
-        if (client.Transport == TransportMode.UDP)
+        // Serialize all sends per-client to prevent TCP interleaved framing corruption
+        // and UDP out-of-order delivery from concurrent async sends
+        await client.SendLock.WaitAsync(_cts.Token).ConfigureAwait(false);
+        try
         {
-            return await SendUdpDataAsync(client, data, false).ConfigureAwait(false);
+            if (client.Transport == TransportMode.UDP)
+            {
+                return await SendUdpDataAsync(client, data, false).ConfigureAwait(false);
+            }
+            else if (client.Transport == TransportMode.TCPInterleaved)
+            {
+                return await SendInterleavedDataAsync(client.Socket, client.RtpChannel, data, client).ConfigureAwait(false);
+            }
+            return false;
         }
-        else if (client.Transport == TransportMode.TCPInterleaved)
+        finally
         {
-            return await SendInterleavedDataAsync(client.Socket, client.RtpChannel, data, client).ConfigureAwait(false);
+            client.SendLock.Release();
         }
-        return false;
     }
 
     /// <inheritdoc/>

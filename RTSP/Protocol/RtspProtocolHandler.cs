@@ -111,7 +111,7 @@ public class RtspProtocolHandler : IRtspProtocolHandler
 
         if (!string.IsNullOrEmpty(body))
         {
-            await writer.WriteLineAsync($"Content-Length: {body.Length}").ConfigureAwait(false);
+            await writer.WriteLineAsync($"Content-Length: {System.Text.Encoding.UTF8.GetByteCount(body)}").ConfigureAwait(false);
             await writer.WriteLineAsync($"Content-Type: application/sdp").ConfigureAwait(false);
         }
 
@@ -219,11 +219,26 @@ public class RtspProtocolHandler : IRtspProtocolHandler
 
             var serverRtpPort = _transportManager.GetAvailablePort();
             var serverRtcpPort = serverRtpPort + 1;
-            client.RtcpSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
 
+            // Bind RTP socket to the negotiated server port
+            client.UdpSocket.Bind(new IPEndPoint(IPAddress.Any, serverRtpPort));
+
+            client.RtcpSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
             IPEndPoint endPoint = new(IPAddress.Any, serverRtcpPort);
             client.RtcpSocket.Bind(endPoint);
             _ = Task.Run(() => _rtcpManager.ListenRtcpPortAsync(client), _cancellationToken);
+
+            // Set client dimensions based on camera configuration
+            if (client.CameraId == 1) // Front camera
+            {
+                client.Width = _frontCameraWidth;
+                client.Height = _frontCameraHeight;
+            }
+            else // Back camera
+            {
+                client.Width = _backCameraWidth;
+                client.Height = _backCameraHeight;
+            }
 
             responseHeaders["Transport"] = $"RTP/AVP/UDP;unicast;client_port={rtpPort}-{rtcpPort};server_port={serverRtpPort}-{serverRtcpPort}";
         }
@@ -243,6 +258,14 @@ public class RtspProtocolHandler : IRtspProtocolHandler
         {
             await SendResponseAsync(writer, 454, "Session Not Found", request.CSeq).ConfigureAwait(false);
             return false;
+        }
+
+        // Initialize RTP state before sending PLAY response so RTP-Info matches actual first packets
+        lock (client)
+        {
+            client.SequenceNumber = (ushort)Random.Shared.Next(0, ushort.MaxValue);
+            client.RtpTimestamp = (uint)Random.Shared.Next(0, int.MaxValue);
+            client.LastRtpTime = DateTime.UtcNow;
         }
 
         var responseHeaders = new Dictionary<string, string>

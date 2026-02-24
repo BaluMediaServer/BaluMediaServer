@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Threading.Channels;
 using Android.Util;
 using BaluMediaServer.Models;
@@ -43,7 +42,7 @@ public class H264EncoderManager : IH264EncoderManager
             new BoundedChannelOptions(MaxH264QueueSize)
             {
                 FullMode = BoundedChannelFullMode.DropOldest,
-                SingleReader = true,
+                SingleReader = false,
                 SingleWriter = false
             });
 
@@ -51,7 +50,7 @@ public class H264EncoderManager : IH264EncoderManager
             new BoundedChannelOptions(MaxH264QueueSize)
             {
                 FullMode = BoundedChannelFullMode.DropOldest,
-                SingleReader = true,
+                SingleReader = false,
                 SingleWriter = false
             });
     }
@@ -356,32 +355,6 @@ public class H264EncoderManager : IH264EncoderManager
                 if (e.Pps != null) _currentPps = e.Pps;
             }
         }
-    }
-
-    /// <summary>
-    /// Tries to drop the newest non-keyframe from the queue.
-    /// </summary>
-    private static bool TryDropNonKeyFrame(ConcurrentQueue<H264FrameEventArgs> queue)
-    {
-        var frames = new List<H264FrameEventArgs>();
-        while (queue.TryDequeue(out var frame))
-        {
-            frames.Add(frame);
-        }
-
-        // Find LAST (newest) non-keyframe to drop
-        int dropIndex = frames.FindLastIndex(f => !f.IsKeyFrame);
-        if (dropIndex >= 0)
-        {
-            frames.RemoveAt(dropIndex);
-            foreach (var f in frames) queue.Enqueue(f);
-            Log.Debug("[EncoderManager]", "Dropped newest non-keyframe to maintain queue depth");
-            return true;
-        }
-
-        // No non-keyframe found, restore queue
-        foreach (var f in frames) queue.Enqueue(f);
-        return false;
     }
 
     /// <summary>

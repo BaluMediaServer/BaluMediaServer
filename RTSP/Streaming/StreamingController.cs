@@ -20,7 +20,8 @@ public class StreamingController : IStreamingController
     private bool _isStreaming;
 
     /// <summary>
-    /// Polling interval in milliseconds for checking H.264 frame availability.
+    /// Fallback interval in milliseconds used when H.264 frame delivery needs a brief wait.
+    /// Primary frame delivery is event-driven via async channel reads (DequeueFrameAsync).
     /// </summary>
     private const int H264PollIntervalMs = 10;
 
@@ -48,7 +49,7 @@ public class StreamingController : IStreamingController
     public event EventHandler<int>? CameraStartRequested;
 
     /// <summary>
-    /// Event to get latest frame.
+    /// Delegate to retrieve the latest raw frame for a given camera ID.
     /// </summary>
     public Func<int, FrameEventArgs?>? GetLatestFrame { get; set; }
 
@@ -120,13 +121,7 @@ public class StreamingController : IStreamingController
             }
         }
 
-        // Initialize RTP timestamp with random value
-        lock (client)
-        {
-            client.RtpTimestamp = (uint)Random.Shared.Next(0, int.MaxValue);
-            client.SequenceNumber = (ushort)Random.Shared.Next(0, ushort.MaxValue);
-            client.LastRtpTime = DateTime.UtcNow;
-        }
+        // RTP seq/rtptime are initialized in HandlePlayAsync to match the PLAY response RTP-Info header
 
         const int frameIntervalMs = 22; // ~45fps
 

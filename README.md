@@ -78,6 +78,7 @@ RTSP/
 ├── Streaming/
 │   ├── StreamingController.cs   # Main streaming orchestration
 │   ├── H264EncoderManager.cs    # H.264 encoder lifecycle management
+│   ├── JpegEncoderService.cs    # Shared JPEG encoding for MJPEG clients
 │   └── FramePacer.cs            # Frame delivery timing control
 ├── Security/
 │   └── AuthenticationManager.cs # Digest/Basic authentication
@@ -102,7 +103,7 @@ RTSP/
 
 ### NuGet Package
 ```xml
-<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.8" />
+<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.7" />
 ```
 
 ### Manual Installation
@@ -181,7 +182,7 @@ public class MainPage : ContentPage
 
 ```csharp
 using BaluMediaServer.Services;
-using BaluMediaServer.Repositories;
+using BaluMediaServer.RTSP;
 
 public class StreamingPage : ContentPage
 {
@@ -214,7 +215,7 @@ public class StreamingPage : ContentPage
 
 ```csharp
 using BaluMediaServer.Services;
-using BaluMediaServer.Repositories;
+using BaluMediaServer.RTSP;
 using BaluMediaServer.Models;
 
 public partial class MainPage : ContentPage
@@ -531,17 +532,40 @@ public MjpegServer(
     Dictionary<string, string>? users = null,    // Authentication users
     bool useHttps = false,                        // Enable HTTPS
     string? certificatePath = null,              // Path to SSL certificate
-    string? certificatePassword = null           // Certificate password
+    string? certificatePassword = null,          // Certificate password
+    int maxFrameRate = 30                         // Maximum FPS per client (frame rate limiting)
 )
 ```
 
 #### Methods
 ```csharp
 // Start the MJPEG HTTP server
-public void Start()
+public void Start(bool StartWithoutStream = false)
 
 // Stop the server
 public void Stop()
+
+// Get latest back camera JPEG frame (for snapshot endpoints)
+public byte[]? GetLatestBackFrame()
+
+// Get latest front camera JPEG frame (for snapshot endpoints)
+public byte[]? GetLatestFrontFrame()
+```
+
+#### Properties
+```csharp
+// Connected client counts
+public int ClientCount { get; }       // Total connected clients
+public int BackClientCount { get; }   // Back camera clients
+public int FrontClientCount { get; }  // Front camera clients
+
+// Real-time FPS tracking
+public double BackCameraFps { get; }  // Current back camera FPS
+public double FrontCameraFps { get; } // Current front camera FPS
+
+// Total frame counters
+public long TotalBackFrames { get; }  // Total back camera frames processed
+public long TotalFrontFrames { get; } // Total front camera frames processed
 ```
 
 #### Endpoints
@@ -996,7 +1020,7 @@ Unit tests cover pure C# components. Android-dependent classes (camera services,
 
 ## 🛣️ Roadmap
 
-### Completed (v1.1-v1.5.8)
+### Completed (v1.1-v1.5.14)
 - ✅ Fix H.264 stream stutter issues
 - ✅ Add support for multiple profiles/routes (`/live/front`, `/live/back`)
 - ✅ Add user/password control panel
@@ -1014,6 +1038,12 @@ Unit tests cover pure C# components. Android-dependent classes (camera services,
 - ✅ **Automatic encoder resolution validation and fallback**
 - ✅ **Dynamic memory-optimized buffer management**
 - ✅ **Modular RTSP server architecture refactoring**
+- ✅ **Connection stability and timeout improvements** (v1.5.9)
+- ✅ **Event-driven architecture and shared JPEG encoding** (v1.5.10)
+- ✅ **Continuous streaming mode** (v1.5.11)
+- ✅ **Native library frame delivery fix** (v1.5.12)
+- ✅ **MJPEG streaming smoothness with per-client frame pacing** (v1.5.13)
+- ✅ **Client reconnection bug fix** (v1.5.14)
 
 ### Planned (v1.6+)
 - ⬜ Fix image rotation on some devices

@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 
 namespace BaluMediaServer.Models;
 
@@ -201,6 +202,11 @@ public class Client : IDisposable
     public int ConsecutiveSendErrors { get; set; } = 0;
 
     /// <summary>
+    /// Serializes all RTP/RTCP sends for this client to prevent interleaved TCP framing corruption.
+    /// </summary>
+    public SemaphoreSlim SendLock { get; } = new SemaphoreSlim(1, 1);
+
+    /// <summary>
     /// Releases all resources used by this client including sockets.
     /// </summary>
     public void Dispose()
@@ -213,6 +219,7 @@ public class Client : IDisposable
         this.RtcpSocket?.Dispose();
         this.RtcpSocket = null;
         this.UdpSocket = null;
+        this.SendLock?.Dispose();
     }
 }
 
