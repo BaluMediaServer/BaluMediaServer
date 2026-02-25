@@ -266,11 +266,11 @@ public class H264EncoderManager : IH264EncoderManager
     {
         if (cameraId == 1) // Front camera
         {
-            _h264FrontEncoder?.FeedInputBuffer(new H264Encoder.FrameData { Data = frame.Data, Timestamp = frame.Timestamp });
+            _h264FrontEncoder?.QueueFrame(frame.Data, frame.Timestamp);
         }
         else // Back camera
         {
-            _h264BackEncoder?.FeedInputBuffer(new H264Encoder.FrameData { Data = frame.Data, Timestamp = frame.Timestamp });
+            _h264BackEncoder?.QueueFrame(frame.Data, frame.Timestamp);
         }
     }
 

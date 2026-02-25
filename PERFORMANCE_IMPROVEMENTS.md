@@ -50,17 +50,20 @@ This document summarizes the performance optimizations implemented based on the 
 **Problem**: `H264Encoder` used `ConcurrentQueue` with manual frame dropping logic.
 
 **Solution**: Replaced with `System.Threading.Channels.Channel`:
-- Bounded channel with capacity of 2 frames
+- Bounded channel with capacity of 5 frames (increased from 2 for better buffering headroom)
 - `DropOldest` policy automatically handles overflow
 - Cleaner, more efficient code
+- **Thread safety enforcement (v1.5.15)**: `FeedFrame()` now routes frames through `_frameChannel` instead of calling `FeedInputBuffer()` directly. This ensures all MediaCodec JNI access (`FeedInputBuffer()` and `DrainOutputBuffer()`) is serialized on the encoder thread, fixing a critical concurrency bug that caused the encoder to stall after ~2 frames.
 
 **Files Changed**:
-- `RTSP/H264Encoder.cs` - replaced ConcurrentQueue with Channel
+- `RTSP/H264Encoder.cs` - replaced ConcurrentQueue with Channel; serialized all MediaCodec access on encoder thread
 
 **Impact**:
 - ✅ Simplified code (removed manual frame dropping logic)
 - ✅ More efficient frame buffering
 - ✅ Better handling of encoder backpressure
+- ✅ Eliminated concurrent JNI calls that caused H.264 encoder freeze (v1.5.15)
+- ✅ Increased channel capacity (2 → 5) for better buffering headroom (v1.5.15)
 
 ## Performance Metrics
 

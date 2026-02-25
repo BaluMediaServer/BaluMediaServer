@@ -1020,7 +1020,7 @@ Unit tests cover pure C# components. Android-dependent classes (camera services,
 
 ## 🛣️ Roadmap
 
-### Completed (v1.1-v1.5.14)
+### Completed (v1.1-v1.5.15)
 - ✅ Fix H.264 stream stutter issues
 - ✅ Add support for multiple profiles/routes (`/live/front`, `/live/back`)
 - ✅ Add user/password control panel
@@ -1044,6 +1044,7 @@ Unit tests cover pure C# components. Android-dependent classes (camera services,
 - ✅ **Native library frame delivery fix** (v1.5.12)
 - ✅ **MJPEG streaming smoothness with per-client frame pacing** (v1.5.13)
 - ✅ **Client reconnection bug fix** (v1.5.14)
+- ✅ **H.264 thread safety fix and connection stability** (v1.5.15)
 
 ### Planned (v1.6+)
 - ⬜ Fix image rotation on some devices
@@ -1965,6 +1966,50 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
     - Verify no "flashlight available" state (cameras stay ready or restart on-demand)
 
   - **Impact**: Client reconnection now works reliably. The race condition that caused streams to appear "crashed" after disconnect/reconnect cycles is eliminated. This was a critical fix for production deployments where clients may frequently connect and disconnect.
+
+- v1.5.15: H.264 Thread Safety Fix and Connection Stability. This release fixes a critical threading bug that caused H.264 streams to freeze after ~2 frames, along with several connection reliability improvements.
+
+  - **H.264 Streaming Freeze Fix (Thread Safety)**:
+
+  - Problem: `FeedFrame()` was calling `FeedInputBuffer()` directly on the camera callback thread while `DrainOutputBuffer()` ran on the encoder thread. These concurrent JNI calls to MediaCodec caused the encoder to stall after ~2 frames.
+
+  - Fix: `FeedFrame()` now routes frames through `_frameChannel` so that both `FeedInputBuffer()` and `DrainOutputBuffer()` are serialized on the encoder thread. This eliminates concurrent JNI access to MediaCodec.
+
+  - **Encoder Channel Capacity**:
+
+  - Fix: Increased `_frameChannel` bounded capacity from 2 to 5 frames, providing better buffering headroom and reducing frame drops during brief processing spikes.
+
+  - **TOCTOU Socket Race Fix**:
+
+  - Problem: The streaming loop called `IsSocketConnected` (using `Socket.Poll`) on the same RTSP socket that `HandleClient` was reading from. This created a time-of-check-to-time-of-use race where the poll would consume data intended for the RTSP reader, causing false disconnection detection.
+
+  - Fix: Removed `IsSocketConnected` from the streaming loop. Connection health is now determined solely by send error counting, which is inherently race-free.
+
+  - **SPS/PPS Deduplication**:
+
+  - Problem: SPS/PPS NAL units were being sent redundantly — both as separate parameter sets before keyframes and embedded within the keyframe data itself.
+
+  - Fix: Added deduplication logic to skip SPS/PPS NAL units when they have already been sent separately before the keyframe, reducing bandwidth waste.
+
+  - **Transport SendLock Timeout**:
+
+  - Problem: The `_sendLock` in `TransportManager` used a CancellationToken-linked timeout. During server lifecycle events (shutdown, restart), the CTS could be cancelled, causing sends to fail silently instead of timing out normally.
+
+  - Fix: Changed to a fixed 3-second timeout (`TimeSpan.FromSeconds(3)`) that is independent of the server CancellationTokenSource.
+
+  - **Standalone Send CTS**:
+
+  - Problem: The send CancellationTokenSource was coupled to the server CTS, meaning server shutdown would immediately cancel in-flight sends without allowing graceful client cleanup.
+
+  - Fix: Decoupled the send timeout CTS from the server CTS, allowing in-progress sends to complete or timeout naturally during shutdown.
+
+  - **Files Changed**:
+    - `RTSP/H264Encoder.cs`: Thread safety fix — `FeedFrame()` routes through channel; channel capacity increased to 5
+    - `RTSP/Streaming/H264EncoderManager.cs`: SPS/PPS deduplication logic
+    - `RTSP/Streaming/StreamingController.cs`: Removed `IsSocketConnected` TOCTOU race; standalone send CTS
+    - `RTSP/Transport/TransportManager.cs`: Fixed `_sendLock` timeout to 3 seconds
+
+  - **Impact**: H.264 streaming is now stable and no longer freezes after the first few frames. The thread safety fix resolves the root cause of MediaCodec JNI contention. Connection detection is more reliable without the TOCTOU race, and transport timeouts behave correctly during server lifecycle events.
 
 ---
 

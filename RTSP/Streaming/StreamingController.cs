@@ -130,28 +130,16 @@ public class StreamingController : IStreamingController
             while (client.IsPlaying && !cancellationToken.IsCancellationRequested)
             {
                 // Update activity time at start of each streaming attempt
-                // This prevents timeout as long as the streaming loop is active
                 lock (client)
                 {
                     client.LastActivityTime = DateTime.UtcNow;
                 }
 
-                // Check socket health
-                if (!_transportManager.IsSocketConnected(client.Socket))
-                {
-                    Log.Warn("[StreamingController]", $"Client {client.Id} disconnecting - socket no longer connected (transport: {client.Transport})");
-                    break;
-                }
-
-                // Check for inactivity timeout (should rarely trigger now)
-                var timeSinceLastActivity = (DateTime.UtcNow - client.LastActivityTime).TotalSeconds;
-                if (timeSinceLastActivity > InactivityTimeoutSeconds)
-                {
-                    Log.Warn("[StreamingController]", $"Client {client.Id} inactive for {timeSinceLastActivity:F0}s (timeout: {InactivityTimeoutSeconds}s), disconnecting due to inactivity");
-                    break;
-                }
-
-                // Check for too many consecutive errors
+                // Check for too many consecutive errors (fast, no blocking)
+                // Socket disconnection is detected reliably via send errors in TransportManager.
+                // We do NOT use IsSocketConnected(Poll+Available) here because the HandleClient
+                // reader loop competes on the same RTSP socket, causing a TOCTOU race that
+                // falsely detects disconnection and breaks the streaming loop.
                 if (client.ConsecutiveSendErrors >= 10)
                 {
                     Log.Warn("[StreamingController]", $"Client {client.Id} disconnecting - {client.ConsecutiveSendErrors} consecutive send errors (transport: {client.Transport})");
@@ -164,7 +152,6 @@ public class StreamingController : IStreamingController
                 if (client.Codec == CodecType.H264)
                 {
                     frameSent = await StreamH264ToClientAsync(client, cancellationToken).ConfigureAwait(false);
-                    // No polling needed - StreamH264ToClientAsync now waits for frames asynchronously
                 }
                 else
                 {
@@ -305,6 +292,9 @@ public class StreamingController : IStreamingController
             }
 
             // Filter and send NAL units
+            // SPS (7) and PPS (8) are already sent above when needsSpsPps is true,
+            // so skip them here to avoid sending duplicate parameter sets.
+            bool spsPpsSentSeparately = needsSpsPps && h264Frame.Sps != null && h264Frame.Pps != null;
             var nalUnitsToSend = new List<byte[]>();
             foreach (var nal in h264Frame.NalUnits)
             {
@@ -319,6 +309,8 @@ public class StreamingController : IStreamingController
                         int nalType = nal[offset] & 0x1F;
                         // Skip AUD (9), filler (12)
                         if (nalType == 9 || nalType == 12) continue;
+                        // Skip SPS (7), PPS (8) if already sent separately
+                        if (spsPpsSentSeparately && (nalType == 7 || nalType == 8)) continue;
                     }
                 }
                 nalUnitsToSend.Add(nal);

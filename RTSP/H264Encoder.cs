@@ -94,9 +94,13 @@ public class H264Encoder : IDisposable
         _frameRate = frameRate;
         _frameIntervalUs = 1_000_000L / frameRate; // e.g., 40000us for 25fps
 
-        // Create bounded channel with DropOldest to prevent latency buildup
+        // Create bounded channel with DropOldest to prevent latency buildup.
+        // All frame input MUST go through this channel so that FeedInputBuffer()
+        // and DrainOutputBuffer() run on the same thread (EncodingLoop).
+        // Concurrent JNI calls to MediaCodec from different threads can cause
+        // vendor-specific stalls (especially on MediaTek).
         _frameChannel = Channel.CreateBounded<FrameData>(
-            new BoundedChannelOptions(2)
+            new BoundedChannelOptions(5)
             {
                 FullMode = BoundedChannelFullMode.DropOldest,
                 SingleReader = true,
@@ -527,7 +531,21 @@ public class H264Encoder : IDisposable
         }
     }
     /// <summary>
-    /// Queues a raw YUV frame for encoding.
+    /// Queues a raw YUV frame for encoding with the caller-provided timestamp.
+    /// The frame will be processed by the EncodingLoop thread, ensuring all
+    /// MediaCodec access is serialized on a single thread.
+    /// </summary>
+    /// <param name="frameData">The raw YUV420 frame data.</param>
+    /// <param name="timestamp">The presentation timestamp in microseconds.</param>
+    public void QueueFrame(byte[] frameData, long timestamp)
+    {
+        if (!_isRunning) return;
+
+        _frameChannel.Writer.TryWrite(new() { Data = frameData, Timestamp = timestamp });
+    }
+
+    /// <summary>
+    /// Queues a raw YUV frame for encoding with a synthetic timestamp.
     /// Older frames are dropped if the queue backs up to prevent latency.
     /// </summary>
     /// <param name="frameData">The raw YUV420 frame data.</param>
@@ -564,7 +582,7 @@ public class H264Encoder : IDisposable
 
         _frameNumber++;
 
-        // Channel with DropOldest automatically handles frame dropping (keeps max 2 frames)
+        // Channel with DropOldest automatically handles frame dropping
         _frameChannel.Writer.TryWrite(new() { Data = frameData, Timestamp = timestamp });
     }
     

@@ -31,8 +31,13 @@ public class TransportManager : ITransportManager
     public async Task<bool> SendDataAsync(Client client, byte[] data)
     {
         // Serialize all sends per-client to prevent TCP interleaved framing corruption
-        // and UDP out-of-order delivery from concurrent async sends
-        await client.SendLock.WaitAsync(_cts.Token).ConfigureAwait(false);
+        // and UDP out-of-order delivery from concurrent async sends.
+        // Use a timeout instead of the server CTS to avoid silent failures
+        // if the CTS is cancelled during server lifecycle events.
+        if (!await client.SendLock.WaitAsync(3000).ConfigureAwait(false))
+        {
+            return false; // Lock timeout — skip this packet rather than blocking
+        }
         try
         {
             if (client.Transport == TransportMode.UDP)
@@ -65,11 +70,10 @@ public class TransportManager : ITransportManager
         {
             if (socket?.Connected ?? false)
             {
-                // Use a timeout for the send operation to detect stuck connections
-                // Reduced from 5s to 3s for faster detection, with improved error counting
-                // Allows up to 10 consecutive timeouts before disconnect (~30 seconds total)
-                using var sendCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
-                sendCts.CancelAfter(3000);
+                // Use a standalone timeout (not linked to server CTS) to detect stuck connections.
+                // Linking to _cts.Token would cause all sends to fail during server lifecycle events
+                // (e.g., Stop/Dispose), preventing graceful client cleanup.
+                using var sendCts = new CancellationTokenSource(3000);
 
                 await socket.SendAsync(frame, SocketFlags.None, sendCts.Token).ConfigureAwait(false);
 
@@ -83,6 +87,19 @@ public class TransportManager : ITransportManager
                     }
                 }
                 return true;
+            }
+
+            // Socket not connected — track the error so the streaming loop can detect it
+            if (client != null)
+            {
+                lock (client)
+                {
+                    client.ConsecutiveSendErrors++;
+                    if (client.ConsecutiveSendErrors >= 10)
+                    {
+                        client.IsPlaying = false;
+                    }
+                }
             }
             return false;
         }
