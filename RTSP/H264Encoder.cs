@@ -2,6 +2,7 @@ using Android.Media;
 using Android.OS;
 using Java.Nio;
 using System.Collections.Concurrent;
+using System.Threading.Channels;
 using Android.Util;
 using BaluMediaServer.Models;
 using System.Diagnostics;
@@ -9,20 +10,26 @@ using System.Buffers;
 
 namespace BaluMediaServer.Services;
 
+/// <summary>
+/// General-purpose H.264 hardware encoder with automatic encoder selection.
+/// Selects the best available encoder based on device capabilities and supports multiple vendors.
+/// Uses Channels for efficient frame queuing with automatic frame dropping.
+/// </summary>
 public class H264Encoder : IDisposable
 {
     private MediaCodec? _encoder;
-    private readonly int _width;
-    private readonly int _height;
+    private int _width;
+    private int _height;
     private int _bitrate;
     private readonly int _frameRate;
     private bool _isRunning;
     private Thread? _encoderThread;
-    private readonly ConcurrentQueue<FrameData> _frameQueue = new();
+    private readonly Channel<FrameData> _frameChannel;
     private readonly ArrayPool<byte> _bufferPool = ArrayPool<byte>.Create();
 
     private readonly object _lock = new();
-    
+    private volatile bool _disposed;  // Prevents JNI access after disposal
+
     // Color formats supported by your device
     private const int COLOR_FormatYUV420Planar = 19;
     private const int COLOR_FormatYUV420SemiPlanar = 21;  // NV12
@@ -34,20 +41,72 @@ public class H264Encoder : IDisposable
     private readonly EncoderInfo _bestEncoder = new();
     private readonly Stopwatch _stopwatch = new();
     private int _selectedColorFormat = COLOR_FormatYUV420SemiPlanar;
+
+    // Frame-rate synchronized timestamp management
+    private long _frameNumber = 0;
+    private long _frameIntervalUs; // Microseconds per frame based on target FPS
+    private long _baseTimestamp = -1;
+
+    /// <summary>
+    /// Event raised when a frame has been encoded and is ready for streaming.
+    /// </summary>
     public event EventHandler<H264FrameEventArgs>? FrameEncoded;
-    
+
+    /// <summary>
+    /// Gets the actual width being used by the encoder after any resolution fallback.
+    /// </summary>
+    public int ActualWidth => _width;
+
+    /// <summary>
+    /// Gets the actual height being used by the encoder after any resolution fallback.
+    /// </summary>
+    public int ActualHeight => _height;
+
+    /// <summary>
+    /// Represents frame data waiting to be encoded.
+    /// </summary>
     public class FrameData
     {
+        /// <summary>
+        /// Gets or sets the raw YUV frame data.
+        /// </summary>
         public byte[] Data { get; set; } = Array.Empty<byte>();
+
+        /// <summary>
+        /// Gets or sets the presentation timestamp in microseconds.
+        /// </summary>
         public long Timestamp { get; set; }
     }
 
+    /// <summary>
+    /// Initializes a new instance of the <see cref="H264Encoder"/> class.
+    /// Automatically selects the best available hardware encoder.
+    /// </summary>
+    /// <param name="width">The video width in pixels.</param>
+    /// <param name="height">The video height in pixels.</param>
+    /// <param name="bitrate">The target bitrate in bits per second. Default is 2,000,000.</param>
+    /// <param name="frameRate">The target frame rate. Default is 30.</param>
     public H264Encoder(int width, int height, int bitrate = 2000000, int frameRate = 30)
     {
         _width = width;
         _height = height;
         _bitrate = bitrate;
         _frameRate = frameRate;
+        _frameIntervalUs = 1_000_000L / frameRate; // e.g., 40000us for 25fps
+
+        // Create bounded channel with DropOldest to prevent latency buildup.
+        // All frame input MUST go through this channel so that FeedInputBuffer()
+        // and DrainOutputBuffer() run on the same thread (EncodingLoop).
+        // Concurrent JNI calls to MediaCodec from different threads can cause
+        // vendor-specific stalls (especially on MediaTek).
+        _frameChannel = Channel.CreateBounded<FrameData>(
+            new BoundedChannelOptions(5)
+            {
+                FullMode = BoundedChannelFullMode.DropOldest,
+                SingleReader = true,
+                SingleWriter = false
+            });
+
         var codecList = new MediaCodecList(new());
         var codecInfos = codecList.GetCodecInfos();
 
@@ -81,6 +140,11 @@ public class H264Encoder : IDisposable
         "2130706688"   // COLOR_FormatYUV420Flexible
     };
 
+    /// <summary>
+    /// Selects the best H.264 encoder from available codecs based on capabilities and vendor priority.
+    /// </summary>
+    /// <param name="codecInfos">Array of available codec information.</param>
+    /// <returns>The <see cref="EncoderInfo"/> for the best available encoder.</returns>
     public static EncoderInfo SelectBestEncoder(MediaCodecInfo[] codecInfos)
     {
         var encoders = new List<EncoderInfo>();
@@ -205,6 +269,18 @@ public class H264Encoder : IDisposable
                 }
             }
 
+            // 4b. Check video capabilities for supported resolutions
+            var videoCaps = caps.VideoCapabilities;
+            if (videoCaps != null)
+            {
+                encoderInfo.MaxSupportedWidth = (int)videoCaps.SupportedWidths.Upper;
+                encoderInfo.MaxSupportedHeight = (int)videoCaps.SupportedHeights.Upper;
+                encoderInfo.Supports4K = videoCaps.IsSizeSupported(3840, 2160);
+                encoderInfo.SupportsQHD = videoCaps.IsSizeSupported(2560, 1440);
+                encoderInfo.SupportsFullHD = videoCaps.IsSizeSupported(1920, 1080);
+                encoderInfo.SupportsHD = videoCaps.IsSizeSupported(1280, 720);
+            }
+
             // 5. Check profile/level support
             if (caps.ProfileLevels != null && caps.ProfileLevels.Count > 0)
             {
@@ -241,7 +317,56 @@ public class H264Encoder : IDisposable
             return null!;
         }
     }
-    
+
+    /// <summary>
+    /// Checks if the specified resolution is supported by the encoder.
+    /// </summary>
+    /// <param name="width">The width in pixels.</param>
+    /// <param name="height">The height in pixels.</param>
+    /// <returns><c>true</c> if the resolution is supported; otherwise, <c>false</c>.</returns>
+    private bool IsResolutionSupported(int width, int height)
+    {
+        if (_bestEncoder?.Capabilities?.VideoCapabilities == null) return true;
+        return _bestEncoder.Capabilities.VideoCapabilities.IsSizeSupported(width, height);
+    }
+
+    /// <summary>
+    /// Gets the nearest supported resolution that fits within the requested dimensions.
+    /// </summary>
+    /// <param name="width">The requested width in pixels.</param>
+    /// <param name="height">The requested height in pixels.</param>
+    /// <returns>A tuple containing the nearest supported width and height.</returns>
+    private (int width, int height) GetNearestSupportedResolution(int width, int height)
+    {
+        var videoCaps = _bestEncoder?.Capabilities?.VideoCapabilities;
+        if (videoCaps == null) return (width, height);
+
+        // Try common resolutions in descending order (including 4K and high-res)
+        var resolutions = new[] {
+            (3840, 2160), // 4K UHD
+            (3200, 1800), // QHD+
+            (2560, 1440), // QHD/2K
+            (1920, 1440), // FHD+ (4:3)
+            (1920, 1080), // FHD
+            (1280, 720),  // HD
+            (800, 600),
+            (640, 480),   // VGA
+            (480, 360),
+            (320, 240)
+        };
+
+        foreach (var (w, h) in resolutions)
+        {
+            if (w <= width && h <= height && videoCaps.IsSizeSupported(w, h))
+                return (w, h);
+        }
+        return (640, 480); // Safe fallback
+    }
+
+    /// <summary>
+    /// Starts the H.264 encoder and begins the encoding loop.
+    /// </summary>
+    /// <returns><c>true</c> if the encoder started successfully; otherwise, <c>false</c>.</returns>
     public bool Start()
     {
         lock (_lock)
@@ -250,6 +375,15 @@ public class H264Encoder : IDisposable
 
             try
             {
+                // Check resolution support and fall back if necessary
+                if (!IsResolutionSupported(_width, _height))
+                {
+                    var (newW, newH) = GetNearestSupportedResolution(_width, _height);
+                    Log.Warn("H264", $"Resolution {_width}x{_height} not supported, falling back to {newW}x{newH}");
+                    _width = newW;
+                    _height = newH;
+                }
+
                 // Create format with encoder's supported color format
                 var format = MediaFormat.CreateVideoFormat(MediaFormat.MimetypeVideoAvc, _width, _height);
 
@@ -274,7 +408,11 @@ public class H264Encoder : IDisposable
                 format.SetInteger(MediaFormat.KeyColorFormat, _selectedColorFormat);
                 format.SetInteger(MediaFormat.KeyBitRate, _bitrate);
                 format.SetInteger(MediaFormat.KeyFrameRate, _frameRate);
-                format.SetInteger(MediaFormat.KeyIFrameInterval, 1); // 1 second between keyframes for lower latency
+                // Use SetInteger (not SetFloat) — MediaTek MT6768 misinterprets sub-second float
+                // values as 0, causing EVERY frame to be an IDR keyframe, which exhausts the
+                // encoder's internal buffers and causes it to stall after ~1000 frames.
+                // Value of 1 = IDR every 1 second (~25 frames at 25fps).
+                format.SetInteger(MediaFormat.KeyIFrameInterval, 1);
                 
                 // Set profile and level for better compatibility
                 format.SetInteger(MediaFormat.KeyProfile, (int)MediaCodecProfileType.Avcprofilebaseline);
@@ -366,12 +504,16 @@ public class H264Encoder : IDisposable
         }
     }
 
+    /// <summary>
+    /// Updates the encoder bitrate dynamically without restarting.
+    /// </summary>
+    /// <param name="newBitrate">The new bitrate in bits per second.</param>
     public void UpdateBitrate(int newBitrate)
     {
         lock (_lock)
         {
             if (!_isRunning || _encoder == null) return;
-            
+
             try
             {
                 // Create a Bundle with the new bitrate
@@ -392,6 +534,25 @@ public class H264Encoder : IDisposable
             }
         }
     }
+    /// <summary>
+    /// Queues a raw YUV frame for encoding with the caller-provided timestamp.
+    /// The frame will be processed by the EncodingLoop thread, ensuring all
+    /// MediaCodec access is serialized on a single thread.
+    /// </summary>
+    /// <param name="frameData">The raw YUV420 frame data.</param>
+    /// <param name="timestamp">The presentation timestamp in microseconds.</param>
+    public void QueueFrame(byte[] frameData, long timestamp)
+    {
+        if (!_isRunning) return;
+
+        _frameChannel.Writer.TryWrite(new() { Data = frameData, Timestamp = timestamp });
+    }
+
+    /// <summary>
+    /// Queues a raw YUV frame for encoding with a synthetic timestamp.
+    /// Older frames are dropped if the queue backs up to prevent latency.
+    /// </summary>
+    /// <param name="frameData">The raw YUV420 frame data.</param>
     public void QueueFrame(byte[] frameData)
     {
         if (!_isRunning) return;
@@ -404,75 +565,131 @@ public class H264Encoder : IDisposable
             return;
         }
 
-        // Use actual time for timestamps to prevent stuttering
-        if (!_stopwatch.IsRunning)
+        // Initialize timing on first frame
+        if (_baseTimestamp < 0)
         {
-            _stopwatch.Start();
+            _stopwatch.Restart();
+            _baseTimestamp = 0;
+            _frameNumber = 0;
         }
 
-        var timestamp = _stopwatch.ElapsedTicks * 1000000L / Stopwatch.Frequency;
+        // Frame-rate synchronized timestamp calculation
+        // Use ideal timestamp based on frame number to prevent drift
+        long idealTimestamp = _baseTimestamp + (_frameNumber * _frameIntervalUs);
 
-        // Drop frames if queue is backing up (keep max 3 frames for smooth playback)
-        while (_frameQueue.Count > 3)
-        {
-            if (_frameQueue.TryDequeue(out _))
-            {
-                Log.Debug("H264", "Dropped old frame to prevent latency");
-            }
-        }
+        // Get actual elapsed time for bounds checking
+        long actualTimestamp = _stopwatch.ElapsedTicks * 1_000_000L / Stopwatch.Frequency;
 
-        _frameQueue.Enqueue(new() { Data = frameData, Timestamp = timestamp });
+        // Hybrid approach: use ideal timestamp but bound by actual time
+        // This prevents drift while handling encoding delays
+        long timestamp = Math.Min(idealTimestamp, actualTimestamp + _frameIntervalUs);
+
+        _frameNumber++;
+
+        // Channel with DropOldest automatically handles frame dropping
+        _frameChannel.Writer.TryWrite(new() { Data = frameData, Timestamp = timestamp });
     }
-    
+
+    /// <summary>
+    /// Main encoding loop running on a dedicated thread. Drains encoder output
+    /// buffers BEFORE feeding new input to prevent input buffer starvation when
+    /// the encoder's internal queue is full. Exits on disposal, stop, or after
+    /// 10 consecutive errors.
+    /// </summary>
     private void EncodingLoop()
     {
-        var bufferInfo = new MediaCodec.BufferInfo();
+        MediaCodec.BufferInfo? bufferInfo = null;
         byte[]? sps = null;
         byte[]? pps = null;
         bool gotFirstOutput = false;
-        
+        int consecutiveErrors = 0;
+        const int maxConsecutiveErrors = 10;
+
         Log.Debug("H264MTK", "Encoding loop started");
-        
-        while (_isRunning)
+
+        try
         {
-            try
+            bufferInfo = new MediaCodec.BufferInfo();
+
+            // Check both _isRunning and _disposed to ensure clean shutdown
+            while (_isRunning && !_disposed)
             {
-                bool processedInput = false;
-                bool processedOutput = false;
-                
-                // Process input if available
-                if (_frameQueue.TryDequeue(out var frame))
+                try
                 {
-                    FeedInputBuffer(frame);
-                    processedInput = true;
+                    bool processedInput = false;
+                    bool processedOutput = false;
+
+                    // Check disposed before each operation
+                    if (_disposed) break;
+
+                    // Drain output FIRST to free encoder buffers before feeding new input.
+                    // This prevents input buffer starvation when the encoder's internal queue is full.
+                    processedOutput = DrainOutputBuffer(bufferInfo, ref sps, ref pps, ref gotFirstOutput);
+
+                    // Check disposed again before feeding input
+                    if (_disposed) break;
+
+                    // Try to read frame and feed to encoder
+                    if (_frameChannel.Reader.TryRead(out var frame))
+                    {
+                        FeedInputBuffer(frame);
+                        processedInput = true;
+                    }
+
+                    // Small sleep to prevent CPU spinning only if nothing was processed
+                    if (!processedInput && !processedOutput)
+                    {
+                        Thread.Sleep(1);
+                    }
+
+                    // Reset error counter on successful iteration
+                    consecutiveErrors = 0;
                 }
-                
-                // Always try to drain output
-                processedOutput = DrainOutputBuffer(bufferInfo, ref sps, ref pps, ref gotFirstOutput);
-                
-                // Small sleep to prevent CPU spinning and allow encoder to work
-                if (!processedInput && !processedOutput)
+                catch (System.Exception ex)
                 {
-                    Thread.Sleep(1);
+                    // Don't log errors during disposal - they're expected
+                    if (_disposed) break;
+
+                    consecutiveErrors++;
+                    Log.Error("H264MTK", $"Encoding loop error ({consecutiveErrors}/{maxConsecutiveErrors}): {ex.Message}");
+
+                    // Break out of loop if too many consecutive errors - encoder likely in bad state
+                    if (consecutiveErrors >= maxConsecutiveErrors)
+                    {
+                        Log.Error("H264MTK", "Too many consecutive errors - stopping encoder loop");
+                        _isRunning = false;
+                        break;
+                    }
+
+                    // Small delay before retrying to prevent CPU spinning on repeated errors
+                    Thread.Sleep(10);
                 }
-            }
-            catch (Exception ex)
-            {
-                Log.Error("H264MTK", $"Encoding loop error: {ex.Message}");
             }
         }
-        
+        finally
+        {
+            // Dispose Java object safely
+            try { bufferInfo?.Dispose(); }
+            catch { }
+        }
+
         Log.Debug("H264MTK", "Encoding loop ended");
     }
     
+    /// <summary>
+    /// Feeds a frame into the encoder's input buffer.
+    /// Handles color format conversion and stride padding as needed.
+    /// </summary>
+    /// <param name="frame">The frame data to encode.</param>
     public void FeedInputBuffer(FrameData frame)
     {
-        if (_encoder == null) return;
-        
+        // Check disposed flag BEFORE any JNI calls to prevent SIGSEGV
+        if (_disposed || _encoder == null) return;
+
         try
         {
-            // Wait up to 10ms for an input buffer (balances latency vs reliability)
-            var inputIndex = _encoder.DequeueInputBuffer(10000);
+            // Wait up to 5ms for an input buffer (reduced for lower latency)
+            var inputIndex = _encoder.DequeueInputBuffer(5000);
             
             if (inputIndex >= 0)
             {
@@ -612,12 +829,13 @@ public class H264Encoder : IDisposable
     }
     private bool DrainOutputBuffer(MediaCodec.BufferInfo bufferInfo, ref byte[]? sps, ref byte[]? pps, ref bool gotFirstOutput)
     {
-        if (_encoder == null) return false;
+        // Check disposed flag BEFORE any JNI calls to prevent SIGSEGV
+        if (_disposed || _encoder == null) return false;
 
         try
         {
-            // Wait up to 10ms for output (balances latency vs smooth playback)
-            var outputIndex = _encoder.DequeueOutputBuffer(bufferInfo, 10000);
+            // Wait up to 5ms for output (reduced for lower latency)
+            var outputIndex = _encoder.DequeueOutputBuffer(bufferInfo, 5000);
             
             if (outputIndex >= 0)
             {
@@ -724,9 +942,16 @@ public class H264Encoder : IDisposable
         var nalUnits = ExtractNalUnits(data);
         foreach (var nal in nalUnits)
         {
-            if (nal.Length >= 5)
+            // Determine start code length (3 or 4 bytes)
+            int offset = 0;
+            if (nal.Length >= 4 && nal[0] == 0 && nal[1] == 0 && nal[2] == 0 && nal[3] == 1)
+                offset = 4;
+            else if (nal.Length >= 3 && nal[0] == 0 && nal[1] == 0 && nal[2] == 1)
+                offset = 3;
+
+            if (offset > 0 && nal.Length > offset)
             {
-                var nalType = nal[4] & 0x1F;
+                var nalType = nal[offset] & 0x1F;
                 if (nalType == 7) sps = nal;
                 else if (nalType == 8) pps = nal;
             }
@@ -800,19 +1025,38 @@ public class H264Encoder : IDisposable
     {
         try
         {
-            // Try csd-0 and csd-1
+            // Try csd-0 (may contain SPS only, or SPS+PPS concatenated on some devices)
             if (format.ContainsKey("csd-0"))
             {
-                var spsBuffer = format.GetByteBuffer("csd-0");
-                if (spsBuffer != null)
+                var csd0Buffer = format.GetByteBuffer("csd-0");
+                if (csd0Buffer != null)
                 {
-                    sps = new byte[spsBuffer.Remaining()];
-                    spsBuffer.Get(sps);
-                    spsBuffer.Rewind();
-                    Log.Debug("H264MTK", $"Got SPS from format: {sps.Length} bytes");
+                    var csd0 = new byte[csd0Buffer.Remaining()];
+                    csd0Buffer.Get(csd0);
+                    csd0Buffer.Rewind();
+
+                    // Split in case csd-0 contains both SPS and PPS
+                    var nalUnits = ExtractNalUnits(csd0);
+                    foreach (var nal in nalUnits)
+                    {
+                        int offset = 0;
+                        if (nal.Length >= 4 && nal[0] == 0 && nal[1] == 0 && nal[2] == 0 && nal[3] == 1)
+                            offset = 4;
+                        else if (nal.Length >= 3 && nal[0] == 0 && nal[1] == 0 && nal[2] == 1)
+                            offset = 3;
+
+                        if (offset > 0 && nal.Length > offset)
+                        {
+                            int nalType = nal[offset] & 0x1F;
+                            if (nalType == 7) sps = nal;
+                            else if (nalType == 8) pps = nal;
+                        }
+                    }
+                    Log.Debug("H264Encoder", $"Got SPS/PPS from csd-0: {csd0.Length} bytes, {nalUnits.Count} NAL(s)");
                 }
             }
 
+            // Try csd-1 (dedicated PPS buffer, if present)
             if (format.ContainsKey("csd-1"))
             {
                 var ppsBuffer = format.GetByteBuffer("csd-1");
@@ -821,13 +1065,13 @@ public class H264Encoder : IDisposable
                     pps = new byte[ppsBuffer.Remaining()];
                     ppsBuffer.Get(pps);
                     ppsBuffer.Rewind();
-                    Log.Debug("H264MTK", $"Got PPS from format: {pps.Length} bytes");
+                    Log.Debug("H264Encoder", $"Got PPS from csd-1: {pps.Length} bytes");
                 }
             }
         }
         catch (Exception ex)
         {
-            Log.Error("H264MTK", $"Error extracting parameter sets: {ex.Message}");
+            Log.Error("H264Encoder", $"Error extracting parameter sets: {ex.Message}");
         }
     }
     
@@ -860,29 +1104,61 @@ public class H264Encoder : IDisposable
         return nv12;
     }
     
+    /// <summary>
+    /// Stops the encoder and releases all resources.
+    /// Sets _disposed flag FIRST to stop encoder loop before any JNI cleanup.
+    /// </summary>
     public void Stop()
     {
         lock (_lock)
         {
+            // Set disposed flag FIRST to stop encoder loop from accessing Java objects
+            _disposed = true;
             _isRunning = false;
-            //_frameQueue.CompleteAdding();
-            
-            _encoderThread?.Join(1000);
-            
+
+            // Complete the frame channel to unblock any waiting reads
+            _frameChannel.Writer.TryComplete();
+
+            // Wait for encoder thread to fully stop BEFORE touching MediaCodec
+            // This prevents SIGSEGV from encoder thread accessing disposed objects
+            if (_encoderThread != null && _encoderThread.IsAlive)
+            {
+                if (!_encoderThread.Join(3000))
+                {
+                    Log.Warn("H264MTK", "Encoder thread did not stop within 3s timeout");
+                }
+            }
+
+            // Now safe to stop and release MediaCodec - encoder thread has exited
             try
             {
                 _encoder?.Stop();
-                _encoder?.Release();
+
+                // Release with timeout to prevent ANR on some devices (especially MediaTek)
+                var releaseTask = Task.Run(() =>
+                {
+                    try { _encoder?.Release(); }
+                    catch { }
+                });
+
+                if (!releaseTask.Wait(TimeSpan.FromSeconds(3)))
+                {
+                    Log.Warn("H264MTK", "Encoder.Release() timed out (3s) - may cause resource leak");
+                }
             }
-            catch (Exception ex)
+            catch (System.Exception ex)
             {
                 Log.Error("H264MTK", $"Error stopping encoder: {ex.Message}");
             }
-            
+
             _encoder = null;
+            Log.Info("H264MTK", "Encoder stopped and disposed");
         }
     }
     
+    /// <summary>
+    /// Releases all resources used by the encoder.
+    /// </summary>
     public void Dispose()
     {
         Stop();

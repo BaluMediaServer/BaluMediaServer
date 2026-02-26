@@ -9,7 +9,7 @@
 		<!-- NuGet Package Properties -->
 		<GeneratePackageOnBuild>false</GeneratePackageOnBuild>
 		<PackageId>BaluMediaServer.CameraStreamer</PackageId>
-		<PackageVersion>1.5.0</PackageVersion>
+		<PackageVersion>1.5.7</PackageVersion>
 		<Authors>Nakano Miku 13</Authors>
 		<Company>Balu Media Server</Company>
 		<Product>Balu Media Camera Streamer</Product>
@@ -20,7 +20,7 @@
 		<RepositoryUrl>https://github.com/BaluMediaServer/BaluMediaServer</RepositoryUrl>
 		<RepositoryType>git</RepositoryType>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
-		<PackageReleaseNotes>Initial release with dual camera support</PackageReleaseNotes>
+		<PackageReleaseNotes>v1.5.7: Configurable Video Resolution - Added VideoResolution enum with presets (QVGA to Full HD), resolution configuration in ServerConfiguration and Server constructor, H.264 encoder bitrate recommendations per resolution</PackageReleaseNotes>
 		
 		<!-- Include symbols for debugging -->
 		<IncludeSymbols>true</IncludeSymbols>
@@ -30,6 +30,12 @@
 		<DevelopmentDependency>false</DevelopmentDependency>
 	</PropertyGroup>
 
+
+	<!-- Exclude test project folder from compilation -->
+	<ItemGroup>
+		<Compile Remove="BaluMediaServer.Tests\**" />
+		<None Remove="BaluMediaServer.Tests\**" />
+	</ItemGroup>
 
 	<ItemGroup>
 		<PackageReference Include="Microsoft.Maui.Essentials" Version="$(MauiVersion)" />
