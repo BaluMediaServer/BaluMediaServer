@@ -232,16 +232,20 @@ public class RtpPacketBuilder : IRtpPacketBuilder
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Uses wall-clock time (Stopwatch) instead of encoder timestamps for RTP clock
+    /// derivation. MediaTek MT6768 (and possibly other SoCs) report PresentationTimeUs
+    /// in units ~1000x larger than documented microseconds, causing RTP timestamp deltas
+    /// of ~3,000,000 per frame instead of the expected ~3,600 (at 25fps/90kHz).
+    /// Wall-clock based timestamps are robust regardless of encoder timestamp units.
+    /// BaseEncoderTimestamp is repurposed to store the Stopwatch start tick.
+    /// </remarks>
     public uint EncoderTimestampToRtp(ulong encoderTimestamp, ref Client client)
     {
         lock (client)
         {
             if (client.BaseEncoderTimestamp == 0)
             {
-                // Store wall-clock start time instead of encoder timestamp.
-                // MediaTek encoders report PresentationTimeUs in units ~1000x larger
-                // than microseconds, making encoder-based RTP timestamps wildly wrong.
-                // Using wall-clock time is robust regardless of encoder timestamp units.
                 client.BaseEncoderTimestamp = (ulong)Stopwatch.GetTimestamp();
                 client.BaseRtpTimestamp = client.RtpTimestamp;
                 return client.BaseRtpTimestamp;

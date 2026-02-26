@@ -157,8 +157,7 @@ public class Server : IDisposable
         };
         _streamingController.CameraStartRequested += OnCameraStartRequested;
         _streamingController.GetLatestFrame = GetLatestFrame;
-        // DEBUG MODE: RTCP cleanup disabled to prevent client disposal during streaming investigation
-        // _rtcpManager.ClientCleanupRequired += (_, client) => _clientManager.CleanupClient(client);
+        _rtcpManager.ClientCleanupRequired += (_, client) => _clientManager.CleanupClient(client);
         _rtcpManager.BitrateAdjustmentRequired += OnBitrateAdjustmentRequired;
         _encoderManager.FrameEncoded += OnEncoderFrameEncoded;
 
@@ -679,9 +678,12 @@ public class Server : IDisposable
         }
         finally
         {
-            // DEBUG MODE: Never close socket — let streaming continue uninterrupted.
-            // Socket cleanup is fully disabled to isolate streaming freeze issues.
-            Log.Info("[RTSP Server]", $"HandleClient exited for {client?.Id ?? "unknown"} — socket close DISABLED (debug mode), IsPlaying={client?.IsPlaying}");
+            // Only close the socket if the client is not actively streaming.
+            // The streaming task will handle socket cleanup when it finishes.
+            if (client != null && !client.IsPlaying)
+            {
+                socket?.Close();
+            }
         }
     }
 

@@ -32,10 +32,6 @@ public class H264EncoderManager : IH264EncoderManager
     // Maximum frames to buffer before dropping (prevents latency buildup)
     private const int MaxH264QueueSize = 10;
 
-    // DEBUG: Frame counters to track encoder output flow
-    private long _backFrameCount;
-    private long _frontFrameCount;
-
     /// <summary>
     /// Initializes a new instance of H264EncoderManager with bounded channels.
     /// </summary>
@@ -321,13 +317,6 @@ public class H264EncoderManager : IH264EncoderManager
         // Write to channel (bounded channel with DropOldest automatically handles overflow)
         _h264FrameChannelFront.Writer.TryWrite(e);
 
-        // DEBUG: Log every 50 frames to verify encoder is producing output
-        var count = Interlocked.Increment(ref _frontFrameCount);
-        if (count % 50 == 0)
-        {
-            Log.Info("[EncoderManager]", $"Front encoder output frame #{count} (NALs={e.NalUnits.Count}, key={e.IsKeyFrame}, channelItems≈{_h264FrameChannelFront.Reader.Count})");
-        }
-
         try
         {
             FrameEncoded?.Invoke(this, e);
@@ -345,13 +334,6 @@ public class H264EncoderManager : IH264EncoderManager
 
         // Write to channel (bounded channel with DropOldest automatically handles overflow)
         _h264FrameChannelBack.Writer.TryWrite(e);
-
-        // DEBUG: Log every 50 frames to verify encoder is producing output
-        var count = Interlocked.Increment(ref _backFrameCount);
-        if (count % 50 == 0)
-        {
-            Log.Info("[EncoderManager]", $"Back encoder output frame #{count} (NALs={e.NalUnits.Count}, key={e.IsKeyFrame}, channelItems≈{_h264FrameChannelBack.Reader.Count})");
-        }
 
         try
         {

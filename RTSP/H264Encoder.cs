@@ -589,7 +589,13 @@ public class H264Encoder : IDisposable
         // Channel with DropOldest automatically handles frame dropping
         _frameChannel.Writer.TryWrite(new() { Data = frameData, Timestamp = timestamp });
     }
-    
+
+    /// <summary>
+    /// Main encoding loop running on a dedicated thread. Drains encoder output
+    /// buffers BEFORE feeding new input to prevent input buffer starvation when
+    /// the encoder's internal queue is full. Exits on disposal, stop, or after
+    /// 10 consecutive errors.
+    /// </summary>
     private void EncodingLoop()
     {
         MediaCodec.BufferInfo? bufferInfo = null;

@@ -65,16 +65,63 @@ This document summarizes the performance optimizations implemented based on the 
 - ✅ Eliminated concurrent JNI calls that caused H.264 encoder freeze (v1.5.15)
 - ✅ Increased channel capacity (2 → 5) for better buffering headroom (v1.5.15)
 
+### H.264 Stream Freeze Fix (v1.5.14)
+
+**Problem**: H.264 RTSP stream started but froze after a few seconds, while MJPEG continued working. Root cause was a combination of three issues in the H.264 pipeline.
+
+**Issue 1 — Encoder stall from all-IDR output (PRIMARY)**
+
+`SetFloat(KeyIFrameInterval, 0.25f)` was misinterpreted by MediaTek MT6768 as `0`, causing every frame to be an IDR keyframe. After ~1000 frames, the encoder's internal buffers were exhausted and it stalled permanently.
+
+*Fix*: Changed to `SetInteger(KeyIFrameInterval, 1)`. Always use `SetInteger` for I-frame interval on Android MediaCodec — `SetFloat` with sub-second values is unreliable on many SoCs.
+
+**Issue 2 — RTP timestamps 1000x too fast (CRITICAL)**
+
+`EncoderTimestampToRtp` treated MediaCodec's `PresentationTimeUs` as microseconds, but the MT6768 reports values in units ~1000x larger. RTP timestamp delta was ~3,000,000 per frame instead of the expected ~3,600 (at 25fps/90kHz). Players saw frames timestamped 33 seconds apart and buffered forever.
+
+*Fix*: Replaced encoder-timestamp-based RTP derivation with `Stopwatch` wall-clock time, which is robust regardless of encoder timestamp units.
+
+**Issue 3 — Client lifecycle killing active streams**
+
+Multiple lifecycle mechanisms (WatchDog, HandleClient, RTCP, TransportManager) were prematurely terminating streaming clients due to Socket.Connected checks, single-error disconnection, and disposal race conditions.
+
+*Fixes*:
+- `GetDeadClients()` checks `IsPlaying` first — playing clients are never marked dead
+- `TransportManager` uses graduated error counting (10 threshold) instead of immediate disconnection
+- `CleanupClient` sets `IsPlaying=false` before `Dispose()` to prevent `ObjectDisposedException`
+- `HandleClient` uses `ReadLineAsync()` null detection instead of `Socket.Connected`
+- Frame dequeue timeout (2s) prevents blocking on encoder stalls
+- `FramePacer.ShouldDropFrame` fixed: drops fast-arriving frames, not slow ones
+- Encoding loop drains output before feeding input to prevent buffer starvation
+
+**Files Changed**:
+- `RTSP/H264Encoder.cs` — I-frame interval fix, encoding loop reorder
+- `RTSP/Transport/RtpPacketBuilder.cs` — wall-clock RTP timestamps
+- `RTSP/Transport/TransportManager.cs` — graduated error counting, SendLock timeout logging
+- `RTSP/Streaming/StreamingController.cs` — dequeue timeout, ObjectDisposedException/ChannelClosedException handling
+- `RTSP/Streaming/FramePacer.cs` — inverted drop logic fix
+- `RTSP/ClientManagement/ClientManager.cs` — safe cleanup ordering, IsPlaying-first dead client check
+- `RTSP/Server.cs` — HandleClient socket lifecycle fix
+
+**Impact**:
+- ✅ H.264 stream runs continuously without freezing
+- ✅ Encoder no longer stalls from all-IDR output
+- ✅ RTP timestamps correctly increment ~3,600 per frame at 25fps
+- ✅ Transient network errors no longer kill the stream
+- ✅ Clean client lifecycle with no disposal race conditions
+
 ## Performance Metrics
 
 ### Before Optimizations:
 - RTSP-MJPEG: ~5-10 FPS with high CPU usage
 - H.264: 10ms minimum latency from polling
+- H.264: Stream froze after a few seconds on MediaTek devices
 - Multiple MJPEG clients: CPU usage scaled linearly
 
 ### After Optimizations:
 - RTSP-MJPEG: ~25-30 FPS with lower CPU usage
 - H.264: Near-zero frame delivery latency
+- H.264: Continuous fluid streaming on MediaTek MT6768
 - Multiple MJPEG clients: Single encode shared across all clients
 
 ## Not Implemented (Future Work)

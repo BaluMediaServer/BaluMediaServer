@@ -84,14 +84,18 @@ public class ClientManager : IClientManager
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Sets IsPlaying=false BEFORE disposing to prevent ObjectDisposedException
+    /// in streaming tasks that may still be running on separate threads.
+    /// The streaming loop checks IsPlaying at the top of each iteration and
+    /// exits cleanly when it becomes false.
+    /// </remarks>
     public void CleanupClient(Client client)
     {
         try
         {
             lock (client)
             {
-                // Set IsPlaying=false FIRST so any running streaming loop exits
-                // before we dispose resources it depends on (SendLock, sockets, etc.)
                 client.IsPlaying = false;
 
                 _transportManager.ReleaseClientPorts(client);
@@ -123,9 +127,35 @@ public class ClientManager : IClientManager
     /// <inheritdoc/>
     public List<Client> GetDeadClients()
     {
-        // DEBUG MODE: Disable all client cleanup to isolate streaming issues.
-        // No clients are ever marked as dead — lifecycle management is fully disabled.
-        return new List<Client>();
+        var gracePeriod = TimeSpan.FromSeconds(30);
+        var now = DateTime.UtcNow;
+
+        var deadClients = new List<Client>();
+
+        foreach (var client in _clients.Values)
+        {
+            // If playing, leave it alone — streaming loop handles its own lifecycle
+            if (client.IsPlaying)
+                continue;
+
+            // Socket disconnected = definitely dead
+            if (!(client.Socket?.Connected ?? false))
+            {
+                Log.Debug("[ClientManager]", $"Client {client.Id} marked as dead - socket disconnected");
+                deadClients.Add(client);
+                continue;
+            }
+
+            // Non-playing clients get a grace period for RTSP handshake
+            var connectionAge = now - client.ConnectedAt;
+            if (connectionAge > gracePeriod)
+            {
+                Log.Debug("[ClientManager]", $"Client {client.Id} marked as dead - exceeded grace period ({connectionAge.TotalSeconds:F0}s > {gracePeriod.TotalSeconds}s, not playing)");
+                deadClients.Add(client);
+            }
+        }
+
+        return deadClients;
     }
 
     /// <inheritdoc/>

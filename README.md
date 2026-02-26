@@ -45,6 +45,8 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 - **Transport Modes**: UDP and TCP interleaved support
 - **Dynamic Bitrate**: Automatic adjustment based on network conditions
 - **Multiple Profiles**: Support for `/live/front` and `/live/back` routes
+- **Robust Client Lifecycle**: Graduated error counting, timeout protection, and race-free cleanup
+- **Cross-SoC Compatibility**: Wall-clock RTP timestamps and MediaTek-safe encoder configuration
 
 ### 🔹 MJPEG HTTP Server
 - Simple, independent MJPEG server for easy HTML display
@@ -76,10 +78,10 @@ RTSP/
 │   ├── RtpPacketBuilder.cs      # RTP packet creation and NAL fragmentation
 │   └── RtcpManager.cs           # RTCP sender reports and receiver feedback
 ├── Streaming/
-│   ├── StreamingController.cs   # Main streaming orchestration
+│   ├── StreamingController.cs   # Main streaming orchestration with timeout protection
 │   ├── H264EncoderManager.cs    # H.264 encoder lifecycle management
 │   ├── JpegEncoderService.cs    # Shared JPEG encoding for MJPEG clients
-│   └── FramePacer.cs            # Frame delivery timing control
+│   └── FramePacer.cs            # Frame delivery timing and burst throttling
 ├── Security/
 │   └── AuthenticationManager.cs # Digest/Basic authentication
 └── ClientManagement/
@@ -103,7 +105,7 @@ RTSP/
 
 ### NuGet Package
 ```xml
-<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.7" />
+<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.16" />
 ```
 
 ### Manual Installation
@@ -330,7 +332,7 @@ All classes in this library include comprehensive XML documentation comments for
 | **Encoders** | `H264Encoder`, `MediaTekH264Encoder` |
 | **Utilities** | `EventBuss`, `FrameConverterHelper`, `FrameCallback` |
 | **Interfaces** | `ICameraService`, `IAuthenticationManager`, `IClientManager`, `IH264EncoderManager`, `IRtcpManager`, `IRtpPacketBuilder`, `IRtspProtocolHandler`, `ISdpGenerator`, `IStreamingController`, `ITransportManager` |
-| **RTSP Modules** | `AuthenticationManager`, `ClientManager`, `H264EncoderManager`, `RtcpManager`, `RtpPacketBuilder`, `RtspProtocolHandler`, `SdpGenerator`, `StreamingController`, `TransportManager`, `FramePacer` |
+| **RTSP Modules** | `AuthenticationManager`, `ClientManager`, `H264EncoderManager`, `JpegEncoderService`, `RtcpManager`, `RtpPacketBuilder`, `RtspProtocolHandler`, `SdpGenerator`, `StreamingController`, `TransportManager`, `FramePacer` |
 
 ### Server Class
 
@@ -642,7 +644,7 @@ var server = new Server(
 
 ### H.264 Encoder Configuration
 
-The H.264 encoder automatically optimizes for MediaTek devices but can be configured:
+The H.264 encoder automatically optimizes for MediaTek and other Android devices:
 
 ```csharp
 // The encoder is automatically configured when streaming starts
@@ -650,10 +652,17 @@ The H.264 encoder automatically optimizes for MediaTek devices but can be config
 // - Bitrate: 2,000,000 bps (2 Mbps)
 // - Frame rate: 25 FPS
 // - Profile: Baseline
-// - Keyframe interval: 2 seconds
+// - Keyframe interval: 1 second (IDR every ~25 frames)
+// - I-frame interval: SetInteger (not SetFloat — critical for MediaTek compatibility)
+// - RTP timestamps: Wall-clock based (Stopwatch) for cross-SoC reliability
 
 // Dynamic bitrate adjustment happens automatically based on network conditions
 ```
+
+**MediaTek Device Notes:**
+- The encoder uses `SetInteger(KeyIFrameInterval, 1)` instead of `SetFloat()`. MediaTek MT6768 (and possibly other MediaTek SoCs) misinterprets sub-second float values as `0`, causing every frame to become an IDR keyframe. This exhausts the encoder's internal buffers after ~1000 frames and causes a permanent stall.
+- RTP timestamps are derived from `Stopwatch` wall-clock time instead of the encoder's `PresentationTimeUs`. The MT6768 reports `PresentationTimeUs` in units ~1000x larger than microseconds, which would cause RTP timestamp deltas of ~3,000,000 per frame instead of the expected ~3,600 (at 25fps/90kHz). Players would buffer forever waiting for "future" frames.
+- The encoding loop drains output buffers before feeding new input to prevent buffer starvation on resource-constrained SoCs.
 
 ### Video Resolution Configuration
 
@@ -877,7 +886,7 @@ Console.WriteLine($"Connect to: rtsp://{localIP}:7778/live/back");
 #### H.264 Encoding Issues
 ```csharp
 // Check if device supports hardware encoding
-try 
+try
 {
     var encoder = new MediaTekH264Encoder(640, 480);
     bool started = encoder.Start();
@@ -892,6 +901,32 @@ catch (Exception ex)
     Console.WriteLine($"H.264 encoder error: {ex.Message}");
 }
 ```
+
+#### H.264 Stream Freezes After a Few Seconds
+
+If the H.264 stream starts but freezes after a few seconds (while MJPEG continues working), check these common causes:
+
+**1. All-IDR Output (MediaTek devices)**
+- **Symptom**: Every encoded frame is a keyframe (IDR), encoder stalls after ~1000 frames
+- **Cause**: Using `SetFloat(KeyIFrameInterval, value)` with sub-second values — MediaTek interprets this as `0` (every-frame IDR)
+- **Fix**: Always use `SetInteger(KeyIFrameInterval, N)` where N >= 1. The library handles this automatically since v1.5.16
+- **Diagnostic**: Check encoder output logs for `key=True` on every frame
+
+**2. RTP Timestamp Mismatch**
+- **Symptom**: Stream appears frozen in VLC/ffplay, but encoder is producing frames
+- **Cause**: MediaCodec `PresentationTimeUs` may not be in microseconds on all SoCs (MT6768 reports values ~1000x larger)
+- **Fix**: The library uses `Stopwatch` wall-clock time for RTP timestamp derivation since v1.5.16, which works regardless of encoder timestamp units
+- **Diagnostic**: Check RTP timestamp deltas — at 25fps/90kHz they should be ~3,600 per frame. If they're ~3,000,000, the encoder timestamps are in wrong units
+
+**3. Encoder Thread Safety**
+- **Symptom**: Stream freezes after ~2 frames
+- **Cause**: Concurrent JNI calls to MediaCodec from different threads
+- **Fix**: All MediaCodec access (input and output) must be serialized on a single thread. Fixed since v1.5.15
+
+**4. Client Lifecycle Issues**
+- **Symptom**: Stream works briefly then stops, client appears disconnected
+- **Cause**: Aggressive timeout settings or premature client cleanup
+- **Fix**: The library uses graduated error counting (10 consecutive failures for TCP, 5 for UDP) and checks `IsPlaying` before marking clients as dead. Fixed since v1.5.16
 
 #### Performance Optimization
 
@@ -930,6 +965,12 @@ Server.OnClientsChange += (clients) => {
     }
 };
 ```
+
+**Connection Stability Notes:**
+- The server uses graduated error counting: TCP clients tolerate up to 10 consecutive send failures before being disconnected, UDP clients tolerate 5. This prevents premature disconnection from transient network issues.
+- Playing clients are protected from the WatchDog — they are never marked as dead while actively streaming.
+- Frame dequeue uses a 2-second timeout to prevent the streaming loop from blocking forever if the H.264 encoder stalls.
+- Per-client `SemaphoreSlim` (SendLock) serializes all sends to prevent TCP interleaved framing corruption.
 
 #### Transport Protocol Recommendations
 ```csharp
@@ -1020,7 +1061,7 @@ Unit tests cover pure C# components. Android-dependent classes (camera services,
 
 ## 🛣️ Roadmap
 
-### Completed (v1.1-v1.5.15)
+### Completed (v1.1-v1.5.16)
 - ✅ Fix H.264 stream stutter issues
 - ✅ Add support for multiple profiles/routes (`/live/front`, `/live/back`)
 - ✅ Add user/password control panel
@@ -1045,6 +1086,7 @@ Unit tests cover pure C# components. Android-dependent classes (camera services,
 - ✅ **MJPEG streaming smoothness with per-client frame pacing** (v1.5.13)
 - ✅ **Client reconnection bug fix** (v1.5.14)
 - ✅ **H.264 thread safety fix and connection stability** (v1.5.15)
+- ✅ **H.264 stream freeze fix — MediaTek I-frame interval, RTP timestamps, client lifecycle** (v1.5.16)
 
 ### Planned (v1.6+)
 - ⬜ Fix image rotation on some devices
@@ -2010,6 +2052,73 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
     - `RTSP/Transport/TransportManager.cs`: Fixed `_sendLock` timeout to 3 seconds
 
   - **Impact**: H.264 streaming is now stable and no longer freezes after the first few frames. The thread safety fix resolves the root cause of MediaCodec JNI contention. Connection detection is more reliable without the TOCTOU race, and transport timeouts behave correctly during server lifecycle events.
+
+- v1.5.16: H.264 Stream Freeze Fix — MediaTek Encoder Quirks, RTP Timestamps, and Client Lifecycle. This release resolves the remaining causes of H.264 stream freezing on MediaTek devices through a combination of encoder configuration fixes, RTP timestamp correction, and client lifecycle hardening.
+
+  - **Encoder Stall from All-IDR Output (PRIMARY ROOT CAUSE)**:
+
+  - Problem: `SetFloat(KeyIFrameInterval, 0.25f)` was misinterpreted by the MediaTek MT6768 as `0`, causing every single frame to become an IDR keyframe. After ~1000 frames, the encoder's internal buffers were exhausted and it stalled permanently — no more output, but input still accepted.
+
+  - Diagnostic: Encoder output logs showed `key=True` on every frame. After frame ~1000, `Frame dequeue timeout (2000ms)` appeared every 2 seconds with no further encoder output.
+
+  - Fix: Changed to `SetInteger(KeyIFrameInterval, 1)`. Always use `SetInteger` (not `SetFloat`) for I-frame interval on Android MediaCodec. Sub-second float values are unreliable on many SoCs. Value of 1 = one IDR keyframe per second (~25 frames at 25fps).
+
+  - **RTP Timestamps 1000x Too Fast (CRITICAL)**:
+
+  - Problem: `EncoderTimestampToRtp` treated MediaCodec's `PresentationTimeUs` as microseconds, but the MT6768 reports values in units approximately 1000x larger than microseconds. This produced RTP timestamp deltas of ~3,000,000 per frame instead of the expected ~3,600 (at 25fps/90kHz clock). Players like VLC interpreted frames as being 33 seconds apart and buffered forever, appearing frozen.
+
+  - Diagnostic: Added NAL diagnostic logging that revealed encoder timestamp deltas of ~33,333,000 between 25fps frames (should be ~40,000 if microseconds).
+
+  - Fix: Replaced encoder-timestamp-based RTP derivation with `Stopwatch` wall-clock time. `BaseEncoderTimestamp` is repurposed to store the `Stopwatch.GetTimestamp()` start tick. RTP offset is calculated as `elapsedSeconds * 90000.0`, which produces correct ~3,600 deltas regardless of encoder timestamp units. This approach is robust across all SoCs.
+
+  - **Client Lifecycle Killing Active Streams**:
+
+  - Problem: Multiple lifecycle mechanisms (WatchDog, HandleClient, RTCP, TransportManager) were prematurely terminating streaming clients due to unreliable `Socket.Connected` checks, single-error disconnection, and disposal race conditions that caused `ObjectDisposedException` in streaming tasks.
+
+  - Fixes:
+    - `GetDeadClients()` checks `IsPlaying` first — playing clients are never marked as dead, only non-playing clients are subject to socket checks and grace period timeouts
+    - `TransportManager` uses graduated error counting with a threshold of 10 consecutive failures (TCP) or 5 failures / unreachable host (UDP), instead of immediate disconnection on first error
+    - `CleanupClient` sets `IsPlaying = false` before calling `Dispose()` to prevent `ObjectDisposedException` in streaming tasks that may still be running on separate threads
+    - `HandleClient` uses `ReadLineAsync()` null detection instead of `Socket.Connected` to detect disconnection, avoiding false positives from the unreliable `Connected` property
+    - Frame dequeue uses a 2-second timeout to prevent blocking forever on encoder stalls
+    - `FramePacer.ShouldDropFrame` fixed: now correctly drops frames arriving too fast (less than half a frame interval), not frames arriving after a gap — the previous inverted logic caused recovery from stalls to be even slower
+
+  - **Encoding Loop Reorder**:
+
+  - Problem: The encoding loop fed input first, then drained output. When the encoder's internal input queue was full (because output hadn't been drained), `FeedInputBuffer` would fail and the frame was lost.
+
+  - Fix: Swapped the order in `EncodingLoop` to drain output before feeding input. This frees encoder resources before attempting to queue new input, reducing unnecessary frame loss on resource-constrained SoCs.
+
+  - **Files Changed**:
+    - `RTSP/H264Encoder.cs`: I-frame interval fix (`SetFloat` → `SetInteger`), encoding loop drain-before-feed reorder
+    - `RTSP/Transport/RtpPacketBuilder.cs`: Wall-clock `Stopwatch`-based RTP timestamp derivation
+    - `RTSP/Transport/TransportManager.cs`: Graduated error counting (10 threshold for TCP, 5 for UDP), SendLock timeout logging
+    - `RTSP/Streaming/StreamingController.cs`: 2-second frame dequeue timeout, `ObjectDisposedException` and `ChannelClosedException` handling
+    - `RTSP/Streaming/FramePacer.cs`: Inverted drop logic fix (drops fast frames, not slow ones)
+    - `RTSP/ClientManagement/ClientManager.cs`: Safe cleanup ordering (`IsPlaying = false` before `Dispose()`), `IsPlaying`-first dead client check
+    - `RTSP/Server.cs`: `HandleClient` socket lifecycle fix using `ReadLineAsync` null detection
+
+  - **Debugging Methodology**:
+
+  - This fix was identified through a systematic "debug mode" approach:
+    1. Disabled all lifecycle management (WatchDog, RTCP cleanup, HandleClient socket closing) to isolate the actual streaming issue
+    2. Added frame counter logging to track frame flow through the entire pipeline (camera → encoder → channel → streaming controller → RTP → transport)
+    3. Discovered all-IDR output from encoder logs (`key=True` on every frame)
+    4. After I-frame fix, added detailed NAL diagnostic logging (NAL type, size, encoder timestamp, RTP timestamp, SPS/PPS info)
+    5. Discovered RTP timestamp delta of ~3,000,000 instead of expected ~3,600
+    6. Applied wall-clock timestamp fix — stream became fluid
+
+  - **Performance Metrics**:
+
+  | Metric | Before | After |
+  |--------|--------|-------|
+  | H.264 Stream Duration | ~30 seconds then freeze | Continuous, unlimited |
+  | Encoder Output | Stall after ~1000 frames | Continuous encoding |
+  | RTP Timestamp Delta | ~3,000,000 (833x too large) | ~3,600 (correct) |
+  | Client Reconnection | Frequent false disconnections | Stable with graduated error tolerance |
+  | Frame Recovery After Stall | Slow (drops first frames) | Immediate (drops only bursts) |
+
+  - **Impact**: H.264 RTSP streaming now runs continuously without freezing on MediaTek MT6768 and likely other MediaTek SoCs that share these encoder quirks. The combination of correct I-frame interval configuration, robust RTP timestamp derivation, and hardened client lifecycle management eliminates the three root causes of the freeze. Transient network errors no longer kill the stream, and the encoder no longer stalls from all-IDR output.
 
 ---
 

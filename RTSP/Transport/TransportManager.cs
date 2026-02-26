@@ -28,6 +28,12 @@ public class TransportManager : ITransportManager
     public CancellationToken CancellationToken => _cts.Token;
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Uses a per-client SendLock (3s timeout) to serialize sends. Errors are tracked
+    /// via ConsecutiveSendErrors with graduated thresholds: the client is only marked
+    /// for cleanup after 10 consecutive failures (TCP) or 5 failures / unreachable (UDP),
+    /// preventing premature disconnection from transient network issues.
+    /// </remarks>
     public async Task<bool> SendDataAsync(Client client, byte[] data)
     {
         // Serialize all sends per-client to prevent TCP interleaved framing corruption
