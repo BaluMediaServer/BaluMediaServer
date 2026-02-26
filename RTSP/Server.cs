@@ -157,7 +157,8 @@ public class Server : IDisposable
         };
         _streamingController.CameraStartRequested += OnCameraStartRequested;
         _streamingController.GetLatestFrame = GetLatestFrame;
-        _rtcpManager.ClientCleanupRequired += (_, client) => _clientManager.CleanupClient(client);
+        // DEBUG MODE: RTCP cleanup disabled to prevent client disposal during streaming investigation
+        // _rtcpManager.ClientCleanupRequired += (_, client) => _clientManager.CleanupClient(client);
         _rtcpManager.BitrateAdjustmentRequired += OnBitrateAdjustmentRequired;
         _encoderManager.FrameEncoded += OnEncoderFrameEncoded;
 
@@ -614,9 +615,10 @@ public class Server : IDisposable
 
     private async Task HandleClient(Socket socket)
     {
+        Client? client = null;
         try
         {
-            var client = new Client
+            client = new Client
             {
                 Socket = socket,
                 Id = Guid.NewGuid().ToString(),
@@ -624,7 +626,7 @@ public class Server : IDisposable
             };
             _clientManager.AddClient(client);
 
-            using NetworkStream stream = new(socket, true);
+            using NetworkStream stream = new(socket, false); // ownsSocket=false: we manage socket lifetime
             using StreamReader reader = new(stream);
             using StreamWriter writer = new(stream) { AutoFlush = true };
 
@@ -642,9 +644,30 @@ public class Server : IDisposable
                 _frontCameraWidth,
                 _frontCameraHeight);
 
-            while (socket.Connected && !_cts.IsCancellationRequested)
+            while (!_cts.IsCancellationRequested)
             {
-                var requestLine = await reader.ReadLineAsync().ConfigureAwait(false) ?? string.Empty;
+                string? requestLine;
+                try
+                {
+                    requestLine = await reader.ReadLineAsync().ConfigureAwait(false);
+                }
+                catch (IOException)
+                {
+                    // Socket closed or reset by client
+                    break;
+                }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
+
+                // ReadLineAsync returns null when the stream is closed (client disconnected)
+                if (requestLine == null)
+                {
+                    Log.Info("[RTSP Server]", $"Client {client.Id} disconnected (end of stream)");
+                    break;
+                }
+
                 if (string.IsNullOrEmpty(requestLine)) continue;
 
                 Log.Debug("[RTSP Server]", requestLine);
@@ -656,7 +679,9 @@ public class Server : IDisposable
         }
         finally
         {
-            socket?.Close();
+            // DEBUG MODE: Never close socket — let streaming continue uninterrupted.
+            // Socket cleanup is fully disabled to isolate streaming freeze issues.
+            Log.Info("[RTSP Server]", $"HandleClient exited for {client?.Id ?? "unknown"} — socket close DISABLED (debug mode), IsPlaying={client?.IsPlaying}");
         }
     }
 

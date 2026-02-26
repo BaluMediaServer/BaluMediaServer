@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using BaluMediaServer.Models;
 
 namespace BaluMediaServer.RTSP.Transport;
@@ -237,13 +238,17 @@ public class RtpPacketBuilder : IRtpPacketBuilder
         {
             if (client.BaseEncoderTimestamp == 0)
             {
-                client.BaseEncoderTimestamp = encoderTimestamp;
-                // Use the RtpTimestamp already set in HandlePlayAsync so it matches the PLAY response RTP-Info header
+                // Store wall-clock start time instead of encoder timestamp.
+                // MediaTek encoders report PresentationTimeUs in units ~1000x larger
+                // than microseconds, making encoder-based RTP timestamps wildly wrong.
+                // Using wall-clock time is robust regardless of encoder timestamp units.
+                client.BaseEncoderTimestamp = (ulong)Stopwatch.GetTimestamp();
                 client.BaseRtpTimestamp = client.RtpTimestamp;
                 return client.BaseRtpTimestamp;
             }
-            ulong delta_us = encoderTimestamp - client.BaseEncoderTimestamp;
-            double seconds = delta_us / 1_000_000.0;
+
+            long elapsedTicks = Stopwatch.GetTimestamp() - (long)client.BaseEncoderTimestamp;
+            double seconds = (double)elapsedTicks / Stopwatch.Frequency;
             ulong rtpAdd = (ulong)(seconds * 90000.0 + 0.5);
             return (uint)(client.BaseRtpTimestamp + rtpAdd);
         }

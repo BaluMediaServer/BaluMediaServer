@@ -408,7 +408,11 @@ public class H264Encoder : IDisposable
                 format.SetInteger(MediaFormat.KeyColorFormat, _selectedColorFormat);
                 format.SetInteger(MediaFormat.KeyBitRate, _bitrate);
                 format.SetInteger(MediaFormat.KeyFrameRate, _frameRate);
-                format.SetFloat(MediaFormat.KeyIFrameInterval, 0.25f); // 0.25 seconds between keyframes for fast recovery
+                // Use SetInteger (not SetFloat) — MediaTek MT6768 misinterprets sub-second float
+                // values as 0, causing EVERY frame to be an IDR keyframe, which exhausts the
+                // encoder's internal buffers and causes it to stall after ~1000 frames.
+                // Value of 1 = IDR every 1 second (~25 frames at 25fps).
+                format.SetInteger(MediaFormat.KeyIFrameInterval, 1);
                 
                 // Set profile and level for better compatibility
                 format.SetInteger(MediaFormat.KeyProfile, (int)MediaCodecProfileType.Avcprofilebaseline);
@@ -612,18 +616,19 @@ public class H264Encoder : IDisposable
                     // Check disposed before each operation
                     if (_disposed) break;
 
-                    // Try to read frame with short timeout (non-blocking)
+                    // Drain output FIRST to free encoder buffers before feeding new input.
+                    // This prevents input buffer starvation when the encoder's internal queue is full.
+                    processedOutput = DrainOutputBuffer(bufferInfo, ref sps, ref pps, ref gotFirstOutput);
+
+                    // Check disposed again before feeding input
+                    if (_disposed) break;
+
+                    // Try to read frame and feed to encoder
                     if (_frameChannel.Reader.TryRead(out var frame))
                     {
                         FeedInputBuffer(frame);
                         processedInput = true;
                     }
-
-                    // Check disposed again before draining output
-                    if (_disposed) break;
-
-                    // Always try to drain output
-                    processedOutput = DrainOutputBuffer(bufferInfo, ref sps, ref pps, ref gotFirstOutput);
 
                     // Small sleep to prevent CPU spinning only if nothing was processed
                     if (!processedInput && !processedOutput)

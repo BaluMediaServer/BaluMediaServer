@@ -59,7 +59,7 @@ public class ClientManager : IClientManager
     public int ClientCount => _clients.Count;
 
     /// <inheritdoc/>
-    public int PlayingClientCount => _clients.Values.Count(p => p.IsPlaying && (p.Socket?.Connected ?? false));
+    public int PlayingClientCount => _clients.Values.Count(p => p.IsPlaying);
 
     /// <inheritdoc/>
     public bool AddClient(Client client)
@@ -90,6 +90,10 @@ public class ClientManager : IClientManager
         {
             lock (client)
             {
+                // Set IsPlaying=false FIRST so any running streaming loop exits
+                // before we dispose resources it depends on (SendLock, sockets, etc.)
+                client.IsPlaying = false;
+
                 _transportManager.ReleaseClientPorts(client);
                 _clientSpsCache.Remove(client.Id);
                 _clientPpsCache.Remove(client.Id);
@@ -98,7 +102,7 @@ public class ClientManager : IClientManager
                 client.Dispose();
             }
             SafeInvokeClientChange();
-            Log.Debug("[ClientManager]", $"Client {client.Id} cleaned up");
+            Log.Info("[ClientManager]", $"Client {client.Id} cleaned up");
         }
         catch (Exception ex)
         {
@@ -119,35 +123,9 @@ public class ClientManager : IClientManager
     /// <inheritdoc/>
     public List<Client> GetDeadClients()
     {
-        var gracePeriod = TimeSpan.FromSeconds(30);
-        var now = DateTime.UtcNow;
-
-        var deadClients = new List<Client>();
-
-        foreach (var client in _clients.Values)
-        {
-            // Socket disconnected = definitely dead
-            if (!(client.Socket?.Connected ?? false))
-            {
-                Log.Debug("[ClientManager]", $"Client {client.Id} marked as dead - socket disconnected");
-                deadClients.Add(client);
-                continue;
-            }
-
-            // If playing, check if still active (managed by streaming timeout)
-            if (client.IsPlaying)
-                continue;
-
-            // Non-playing clients get a grace period for RTSP handshake
-            var connectionAge = now - client.ConnectedAt;
-            if (connectionAge > gracePeriod)
-            {
-                Log.Debug("[ClientManager]", $"Client {client.Id} marked as dead - exceeded grace period ({connectionAge.TotalSeconds:F0}s > {gracePeriod.TotalSeconds}s, not playing)");
-                deadClients.Add(client);
-            }
-        }
-
-        return deadClients;
+        // DEBUG MODE: Disable all client cleanup to isolate streaming issues.
+        // No clients are ever marked as dead — lifecycle management is fully disabled.
+        return new List<Client>();
     }
 
     /// <inheritdoc/>

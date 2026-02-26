@@ -36,7 +36,8 @@ public class TransportManager : ITransportManager
         // if the CTS is cancelled during server lifecycle events.
         if (!await client.SendLock.WaitAsync(3000).ConfigureAwait(false))
         {
-            return false; // Lock timeout — skip this packet rather than blocking
+            Log.Warn("[TransportManager]", $"SendLock timeout (3s) for client {client.Id} - skipping packet");
+            return false;
         }
         try
         {
@@ -128,10 +129,15 @@ public class TransportManager : ITransportManager
         {
             if (client != null)
             {
-                Log.Error("[TransportManager]", $"TCP send socket error for client {client.Id}: {ex.SocketErrorCode} - {ex.Message}");
                 lock (client)
                 {
-                    client.IsPlaying = false; // Mark for cleanup on socket errors
+                    client.ConsecutiveSendErrors++;
+                    Log.Error("[TransportManager]", $"TCP send socket error for client {client.Id} (error count: {client.ConsecutiveSendErrors}): {ex.SocketErrorCode} - {ex.Message}");
+                    if (client.ConsecutiveSendErrors >= 10)
+                    {
+                        client.IsPlaying = false;
+                        Log.Error("[TransportManager]", $"Client {client.Id} marked for cleanup - too many socket errors");
+                    }
                 }
             }
             else

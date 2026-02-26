@@ -1,3 +1,4 @@
+using System.Threading.Channels;
 using Android.Util;
 using BaluMediaServer.Models;
 using BaluMediaServer.RTSP.ClientManagement;
@@ -127,6 +128,8 @@ public class StreamingController : IStreamingController
 
         try
         {
+            Log.Info("[StreamingController]", $"Entering streaming loop for client {client.Id} (codec={client.Codec}, transport={client.Transport}, isPlaying={client.IsPlaying})");
+
             while (client.IsPlaying && !cancellationToken.IsCancellationRequested)
             {
                 // Update activity time at start of each streaming attempt
@@ -165,14 +168,20 @@ public class StreamingController : IStreamingController
                     }
                 }
             }
+
+            // Log why we exited
+            Log.Info("[StreamingController]", $"Streaming loop exited for client {client.Id}: IsPlaying={client.IsPlaying}, Cancelled={cancellationToken.IsCancellationRequested}, SendErrors={client.ConsecutiveSendErrors}");
         }
         catch (Exception ex)
         {
-            Log.Error("[StreamingController]", $"Streaming error: {ex.Message}");
+            Log.Error("[StreamingController]", $"Streaming error for client {client.Id}: {ex.GetType().Name}: {ex.Message}");
         }
         finally
         {
-            _clientManager.CleanupClient(client);
+            // DEBUG MODE: Do NOT cleanup client on streaming exit.
+            // This prevents disposal of sockets/semaphores while we investigate the freeze.
+            // The client remains alive for potential reconnection or diagnostic inspection.
+            Log.Info("[StreamingController]", $"Streaming ended for client {client.Id} — cleanup DISABLED (debug mode)");
         }
     }
 
@@ -211,18 +220,41 @@ public class StreamingController : IStreamingController
         _encoderManager.StartEncoder(client.CameraId, reportedWidth, reportedHeight, frameSize);
     }
 
+    /// <summary>
+    /// Timeout for waiting on encoded frames. If the encoder stalls (no output for this duration),
+    /// the loop continues instead of blocking forever.
+    /// </summary>
+    private const int FrameDequeueTimeoutMs = 2000;
+
     private async Task<bool> StreamH264ToClientAsync(Models.Client client, CancellationToken cancellationToken)
     {
-        H264FrameEventArgs h264Frame;
+        H264FrameEventArgs? h264Frame;
 
-        try
+        // Try non-blocking dequeue first (zero allocation in the hot path)
+        if (!_encoderManager.TryDequeueFrame(client.CameraId, out h264Frame) || h264Frame == null)
         {
-            // Asynchronously wait for next frame (no polling!)
-            h264Frame = await _encoderManager.DequeueFrameAsync(client.CameraId, cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            return false;
+            // No frame ready — wait with a timeout to prevent blocking forever if encoder stalls
+            try
+            {
+                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                timeoutCts.CancelAfter(FrameDequeueTimeoutMs);
+                h264Frame = await _encoderManager.DequeueFrameAsync(client.CameraId, timeoutCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                // Timeout — encoder stalled, log and continue the loop
+                Log.Warn("[StreamingController]", $"Frame dequeue timeout ({FrameDequeueTimeoutMs}ms) - encoder may be stalled for camera {client.CameraId}");
+                return false;
+            }
+            catch (OperationCanceledException)
+            {
+                return false;
+            }
+            catch (ChannelClosedException)
+            {
+                Log.Warn("[StreamingController]", $"Frame channel closed for camera {client.CameraId} - encoder stopped");
+                return false;
+            }
         }
 
         if (h264Frame == null || h264Frame.NalUnits.Count == 0)
@@ -230,8 +262,10 @@ public class StreamingController : IStreamingController
             return false;
         }
 
-        // Check if this is a new frame
-        if (h264Frame.Timestamp <= client.LastH264FrameTimestamp)
+        // Skip frames with timestamps older than the last sent frame.
+        // Use strict less-than to allow frames with equal timestamps through,
+        // since MediaCodec on some SoCs can output consecutive frames with the same PTS.
+        if (h264Frame.Timestamp < client.LastH264FrameTimestamp)
         {
             return false;
         }
@@ -279,6 +313,22 @@ public class StreamingController : IStreamingController
             client.FrameCount++;
         }
 
+        // DEBUG: Log every 50 frames to track frame flow through the pipeline
+        if (client.FrameCount % 50 == 0 || client.FrameCount <= 3)
+        {
+            // For first 3 frames: detailed NAL diagnostics
+            var nalInfo = new System.Text.StringBuilder();
+            foreach (var nal in h264Frame.NalUnits)
+            {
+                int off = 0;
+                if (nal.Length >= 4 && nal[0] == 0 && nal[1] == 0 && nal[2] == 0 && nal[3] == 1) off = 4;
+                else if (nal.Length >= 3 && nal[0] == 0 && nal[1] == 0 && nal[2] == 1) off = 3;
+                int nalType = off > 0 && nal.Length > off ? (nal[off] & 0x1F) : -1;
+                nalInfo.Append($"[type={nalType},sz={nal.Length}]");
+            }
+            Log.Info("[StreamingController]", $"H264 frame #{client.FrameCount} client={client.Id} NALs={h264Frame.NalUnits.Count} IDR={isIdrFrame} encTS={h264Frame.Timestamp} rtpTS={frameRtpTimestamp} SPS={h264Frame.Sps?.Length ?? -1} PPS={h264Frame.Pps?.Length ?? -1} NALdetail={nalInfo}");
+        }
+
         try
         {
             // Send SPS/PPS before keyframes/IDR frames, first frame, or if not cached
@@ -289,6 +339,10 @@ public class StreamingController : IStreamingController
                 await _rtpBuilder.SendH264NalAsRtpAsync(client, h264Frame.Sps, frameRtpTimestamp, false).ConfigureAwait(false);
                 await _rtpBuilder.SendH264NalAsRtpAsync(client, h264Frame.Pps, frameRtpTimestamp, false).ConfigureAwait(false);
                 _clientManager.CacheSpsPps(client.Id, h264Frame.Sps, h264Frame.Pps);
+            }
+            else if (needsSpsPps)
+            {
+                Log.Warn("[StreamingController]", $"SPS/PPS needed but NULL for frame #{client.FrameCount} — SPS={h264Frame.Sps != null}, PPS={h264Frame.Pps != null}");
             }
 
             // Filter and send NAL units
@@ -316,6 +370,12 @@ public class StreamingController : IStreamingController
                 nalUnitsToSend.Add(nal);
             }
 
+            // DEBUG: Log if no NALs survive filtering
+            if (nalUnitsToSend.Count == 0 && client.FrameCount <= 10)
+            {
+                Log.Warn("[StreamingController]", $"Frame #{client.FrameCount} — ALL NALs filtered out! Original count={h264Frame.NalUnits.Count}");
+            }
+
             int nalCount = nalUnitsToSend.Count;
             for (int i = 0; i < nalCount; i++)
             {
@@ -326,6 +386,13 @@ public class StreamingController : IStreamingController
 
             pacer.MarkFrameSent();
             return true;
+        }
+        catch (ObjectDisposedException)
+        {
+            // Client was disposed (CleanupClient called) — stop streaming immediately
+            Log.Info("[StreamingController]", $"Client disposed, stopping H264 stream");
+            client.IsPlaying = false;
+            return false;
         }
         catch (Exception ex)
         {

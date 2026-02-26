@@ -74,9 +74,9 @@ public class FramePacer
         long currentTicks = _stopwatch.ElapsedTicks;
         double elapsedMs = (currentTicks - _lastFrameSentTicks) * 1000.0 / Stopwatch.Frequency;
 
-        // If we're more than 2 frames behind schedule, consider dropping
-        // This helps catch up without overwhelming the network
-        return elapsedMs > _frameIntervalMs * 2;
+        // Drop frames arriving too fast (less than half a frame interval since last send).
+        // This thins out bursts without creating gaps after stalls.
+        return elapsedMs < _frameIntervalMs * 0.5;
     }
 
     /// <summary>
