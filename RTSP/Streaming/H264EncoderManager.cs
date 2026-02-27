@@ -79,8 +79,9 @@ public class H264EncoderManager : IH264EncoderManager
             {
                 try
                 {
-                    Log.Debug("[EncoderManager]", $"Starting H264 encoder: {width}x{height}");
-                    _h264BackEncoder = new H264Encoder(width, height, bitrate: 2000000, frameRate: 25);
+                    int bitrate = CalculateBitrate(width, height);
+                    Log.Info("[EncoderManager]", $"Starting H264 encoder: {width}x{height}, bitrate: {bitrate}");
+                    _h264BackEncoder = new H264Encoder(width, height, bitrate: bitrate, frameRate: 25);
 
                     // Check if encoder fell back to different resolution
                     if (_h264BackEncoder.ActualWidth != width || _h264BackEncoder.ActualHeight != height)
@@ -119,8 +120,9 @@ public class H264EncoderManager : IH264EncoderManager
             {
                 try
                 {
-                    Log.Debug("[EncoderManager]", $"Starting H264 front encoder: {width}x{height}");
-                    _h264FrontEncoder = new H264Encoder(width, height, bitrate: 2000000, frameRate: 25);
+                    int bitrate = CalculateBitrate(width, height);
+                    Log.Info("[EncoderManager]", $"Starting H264 front encoder: {width}x{height}, bitrate: {bitrate}");
+                    _h264FrontEncoder = new H264Encoder(width, height, bitrate: bitrate, frameRate: 25);
 
                     // Check if encoder fell back to different resolution
                     if (_h264FrontEncoder.ActualWidth != width || _h264FrontEncoder.ActualHeight != height)
@@ -355,6 +357,52 @@ public class H264EncoderManager : IH264EncoderManager
                 if (e.Pps != null) _currentPps = e.Pps;
             }
         }
+    }
+
+    /// <summary>
+    /// Calculates an appropriate bitrate based on resolution using pixel-count interpolation.
+    /// Uses the recommended max bitrate values from VideoResolution presets as anchors.
+    /// RTCP-driven bitrate adjustment will lower it dynamically if the network can't keep up.
+    /// </summary>
+    private static int CalculateBitrate(int width, int height)
+    {
+        int pixels = width * height;
+
+        // Known resolution -> max bitrate anchor points (from VideoResolution)
+        // Using max recommended: starting higher is safe because RTCP adjusts down.
+        // Starting too low causes encoder stalls on MediaTek.
+        (int pixels, int bitrate)[] anchors =
+        [
+            (320 * 240,   500_000),    // QVGA
+            (480 * 360,   800_000),    // Low
+            (640 * 480,   2_000_000),  // VGA (matches original hardcoded value)
+            (800 * 600,   2_000_000),  // SVGA
+            (1280 * 720,  4_000_000),  // HD
+            (1920 * 1080, 8_000_000),  // FullHD
+            (2560 * 1440, 16_000_000), // QHD
+            (3840 * 2160, 30_000_000)  // UHD
+        ];
+
+        // Below smallest anchor
+        if (pixels <= anchors[0].pixels)
+            return anchors[0].bitrate;
+
+        // Above largest anchor
+        if (pixels >= anchors[^1].pixels)
+            return anchors[^1].bitrate;
+
+        // Interpolate between surrounding anchors
+        for (int i = 0; i < anchors.Length - 1; i++)
+        {
+            if (pixels >= anchors[i].pixels && pixels <= anchors[i + 1].pixels)
+            {
+                double t = (double)(pixels - anchors[i].pixels) / (anchors[i + 1].pixels - anchors[i].pixels);
+                return (int)(anchors[i].bitrate + t * (anchors[i + 1].bitrate - anchors[i].bitrate));
+            }
+        }
+
+        // Fallback (shouldn't reach here)
+        return 2_000_000;
     }
 
     /// <summary>

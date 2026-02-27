@@ -223,38 +223,58 @@ public class Server : IDisposable
 
     /// <summary>
     /// Sets the resolution for the back camera.
+    /// If the server is running and resolution changed, restarts the streaming pipeline.
     /// </summary>
     public void SetBackCameraResolution(VideoResolution resolution)
     {
+        var oldW = _backCameraWidth;
+        var oldH = _backCameraHeight;
         _backCameraWidth = resolution.GetWidth();
         _backCameraHeight = resolution.GetHeight();
+        if (IsRunning && _isCapturingBack && (oldW != _backCameraWidth || oldH != _backCameraHeight))
+            RestartStreaming($"Back camera resolution changed from {oldW}x{oldH} to {_backCameraWidth}x{_backCameraHeight}");
     }
 
     /// <summary>
     /// Sets a custom resolution for the back camera.
+    /// If the server is running and the camera is capturing, restarts the streaming pipeline.
     /// </summary>
     public void SetBackCameraResolution(int width, int height)
     {
+        var oldW = _backCameraWidth;
+        var oldH = _backCameraHeight;
         _backCameraWidth = width;
         _backCameraHeight = height;
+        if (IsRunning && _isCapturingBack && (oldW != _backCameraWidth || oldH != _backCameraHeight))
+            RestartStreaming($"Back camera resolution changed from {oldW}x{oldH} to {_backCameraWidth}x{_backCameraHeight}");
     }
 
     /// <summary>
     /// Sets the resolution for the front camera.
+    /// If the server is running and the camera is capturing, restarts the streaming pipeline.
     /// </summary>
     public void SetFrontCameraResolution(VideoResolution resolution)
     {
+        var oldW = _frontCameraWidth;
+        var oldH = _frontCameraHeight;
         _frontCameraWidth = resolution.GetWidth();
         _frontCameraHeight = resolution.GetHeight();
+        if (IsRunning && _isCapturingFront && (oldW != _frontCameraWidth || oldH != _frontCameraHeight))
+            RestartStreaming($"Front camera resolution changed from {oldW}x{oldH} to {_frontCameraWidth}x{_frontCameraHeight}");
     }
 
     /// <summary>
     /// Sets a custom resolution for the front camera.
+    /// If the server is running and the camera is capturing, restarts the streaming pipeline.
     /// </summary>
     public void SetFrontCameraResolution(int width, int height)
     {
+        var oldW = _frontCameraWidth;
+        var oldH = _frontCameraHeight;
         _frontCameraWidth = width;
         _frontCameraHeight = height;
+        if (IsRunning && _isCapturingFront && (oldW != _frontCameraWidth || oldH != _frontCameraHeight))
+            RestartStreaming($"Front camera resolution changed from {oldW}x{oldH} to {_frontCameraWidth}x{_frontCameraHeight}");
     }
 
     /// <summary>
@@ -304,6 +324,59 @@ public class Server : IDisposable
         _mjpegServer?.Stop();
         _socket.Close();
         _socket?.Dispose();
+    }
+
+    /// <summary>
+    /// Restarts the streaming pipeline (encoders, cameras, clients) without destroying the Server object.
+    /// Used when resolution changes to apply new dimensions immediately.
+    /// </summary>
+    private void RestartStreaming(string reason)
+    {
+        Log.Info("[RTSP Server]", $"RestartStreaming: {reason}");
+
+        // 1. Stop encoders
+        _encoderManager.StopEncoder(0);
+        _encoderManager.StopEncoder(1);
+        _encoderManager.ClearSpsPps();
+
+        // 2. Disconnect all clients (they need to reconnect at new resolution)
+        _clientManager.ClearAllClients();
+        _isStreaming = false;
+
+        // 3. Reset StreamingController state so the next client re-initializes the encoder.
+        // Without this, _isStreaming in StreamingController stays true and new clients
+        // skip WaitForFrameAndStartEncoder, leaving the encoder never started.
+        _streamingController.SetStreamingState(false);
+
+        // 4. Clear stale cached frames (old resolution) to prevent encoder dimension mismatch
+        lock (_frameBackLock) { _latestBackFrame = null; }
+        lock (_frameFrontLock) { _latestFrontFrame = null; }
+
+        // 5. Stop cameras
+        if (_isCapturingBack)
+        {
+            _backService.StopCapture();
+            _isCapturingBack = false;
+        }
+        if (_isCapturingFront)
+        {
+            _frontService.StopCapture();
+            _isCapturingFront = false;
+        }
+
+        // 6. Restart cameras with new dimensions
+        if (_backCameraEnabled)
+        {
+            _backService.StartCapture(_backCameraWidth, _backCameraHeight);
+            _isCapturingBack = true;
+        }
+        if (_frontCameraEnabled)
+        {
+            _frontService.StartCapture(_frontCameraWidth, _frontCameraHeight);
+            _isCapturingFront = true;
+        }
+
+        Log.Info("[RTSP Server]", $"RestartStreaming complete. Back: {_backCameraWidth}x{_backCameraHeight}, Front: {_frontCameraWidth}x{_frontCameraHeight}");
     }
 
     /// <summary>
