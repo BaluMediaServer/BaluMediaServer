@@ -20,7 +20,7 @@
 		<RepositoryUrl>https://github.com/BaluMediaServer/BaluMediaServer</RepositoryUrl>
 		<RepositoryType>git</RepositoryType>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
-		<PackageReleaseNotes>v1.5.7: Configurable Video Resolution - Added VideoResolution enum with presets (QVGA to Full HD), resolution configuration in ServerConfiguration and Server constructor, H.264 encoder bitrate recommendations per resolution</PackageReleaseNotes>
+		<PackageReleaseNotes>v1.5.16: H.264 Stream Freeze Fix — Fixed critical MediaTek encoder stall caused by SetFloat(KeyIFrameInterval) being misinterpreted as 0 (all-IDR output); replaced with SetInteger. Fixed RTP timestamps 1000x too fast due to MediaCodec PresentationTimeUs units varying across SoCs; now uses Stopwatch wall-clock time for cross-device reliability. Hardened client lifecycle with graduated error counting (10 TCP / 5 UDP threshold), IsPlaying-first dead client checks, safe cleanup ordering to prevent ObjectDisposedException, and 2-second frame dequeue timeout to prevent blocking on encoder stalls. Fixed FramePacer inverted drop logic (now correctly drops burst frames, not post-stall frames). Encoding loop reordered to drain output before feeding input, reducing frame loss on resource-constrained SoCs.</PackageReleaseNotes>
 		
 		<!-- Include symbols for debugging -->
 		<IncludeSymbols>true</IncludeSymbols>
