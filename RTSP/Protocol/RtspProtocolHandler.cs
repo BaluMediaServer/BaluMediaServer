@@ -144,7 +144,7 @@ public class RtspProtocolHandler : IRtspProtocolHandler
         var sdp = _sdpGenerator.GenerateSdp(client.Codec);
         var headers = new Dictionary<string, string>
         {
-            ["Content-Base"] = request.Uri
+            ["Content-Base"] = request.Uri.TrimEnd('/') + "/"
         };
 
         await SendResponseAsync(writer, 200, "OK", request.CSeq, headers, sdp).ConfigureAwait(false);
@@ -268,10 +268,12 @@ public class RtspProtocolHandler : IRtspProtocolHandler
             client.LastRtpTime = DateTime.UtcNow;
         }
 
+        var baseUri = request.Uri.TrimEnd('/') + "/";
         var responseHeaders = new Dictionary<string, string>
         {
             ["Session"] = $"{client.SessionId};timeout=60",
-            ["RTP-Info"] = $"url={request.Uri}/trackID=0;seq={client.SequenceNumber};rtptime={client.RtpTimestamp}"
+            ["Range"] = "npt=0.000-",
+            ["RTP-Info"] = $"url={baseUri}trackID=0;seq={client.SequenceNumber};rtptime={client.RtpTimestamp}"
         };
 
         await SendResponseAsync(writer, 200, "OK", request.CSeq, responseHeaders).ConfigureAwait(false);

@@ -24,7 +24,7 @@ public class RtspRequest
     /// <summary>
     /// Gets or sets the dictionary of request headers.
     /// </summary>
-    public Dictionary<string, string> Headers { get; set; } = new();
+    public Dictionary<string, string> Headers { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// Gets or sets the request body content.

@@ -223,58 +223,38 @@ public class Server : IDisposable
 
     /// <summary>
     /// Sets the resolution for the back camera.
-    /// If the server is running and resolution changed, restarts the streaming pipeline.
     /// </summary>
     public void SetBackCameraResolution(VideoResolution resolution)
     {
-        var oldW = _backCameraWidth;
-        var oldH = _backCameraHeight;
         _backCameraWidth = resolution.GetWidth();
         _backCameraHeight = resolution.GetHeight();
-        if (IsRunning && _isCapturingBack && (oldW != _backCameraWidth || oldH != _backCameraHeight))
-            RestartStreaming($"Back camera resolution changed from {oldW}x{oldH} to {_backCameraWidth}x{_backCameraHeight}");
     }
 
     /// <summary>
     /// Sets a custom resolution for the back camera.
-    /// If the server is running and the camera is capturing, restarts the streaming pipeline.
     /// </summary>
     public void SetBackCameraResolution(int width, int height)
     {
-        var oldW = _backCameraWidth;
-        var oldH = _backCameraHeight;
         _backCameraWidth = width;
         _backCameraHeight = height;
-        if (IsRunning && _isCapturingBack && (oldW != _backCameraWidth || oldH != _backCameraHeight))
-            RestartStreaming($"Back camera resolution changed from {oldW}x{oldH} to {_backCameraWidth}x{_backCameraHeight}");
     }
 
     /// <summary>
     /// Sets the resolution for the front camera.
-    /// If the server is running and the camera is capturing, restarts the streaming pipeline.
     /// </summary>
     public void SetFrontCameraResolution(VideoResolution resolution)
     {
-        var oldW = _frontCameraWidth;
-        var oldH = _frontCameraHeight;
         _frontCameraWidth = resolution.GetWidth();
         _frontCameraHeight = resolution.GetHeight();
-        if (IsRunning && _isCapturingFront && (oldW != _frontCameraWidth || oldH != _frontCameraHeight))
-            RestartStreaming($"Front camera resolution changed from {oldW}x{oldH} to {_frontCameraWidth}x{_frontCameraHeight}");
     }
 
     /// <summary>
     /// Sets a custom resolution for the front camera.
-    /// If the server is running and the camera is capturing, restarts the streaming pipeline.
     /// </summary>
     public void SetFrontCameraResolution(int width, int height)
     {
-        var oldW = _frontCameraWidth;
-        var oldH = _frontCameraHeight;
         _frontCameraWidth = width;
         _frontCameraHeight = height;
-        if (IsRunning && _isCapturingFront && (oldW != _frontCameraWidth || oldH != _frontCameraHeight))
-            RestartStreaming($"Front camera resolution changed from {oldW}x{oldH} to {_frontCameraWidth}x{_frontCameraHeight}");
     }
 
     /// <summary>
@@ -324,59 +304,6 @@ public class Server : IDisposable
         _mjpegServer?.Stop();
         _socket.Close();
         _socket?.Dispose();
-    }
-
-    /// <summary>
-    /// Restarts the streaming pipeline (encoders, cameras, clients) without destroying the Server object.
-    /// Used when resolution changes to apply new dimensions immediately.
-    /// </summary>
-    private void RestartStreaming(string reason)
-    {
-        Log.Info("[RTSP Server]", $"RestartStreaming: {reason}");
-
-        // 1. Stop encoders
-        _encoderManager.StopEncoder(0);
-        _encoderManager.StopEncoder(1);
-        _encoderManager.ClearSpsPps();
-
-        // 2. Disconnect all clients (they need to reconnect at new resolution)
-        _clientManager.ClearAllClients();
-        _isStreaming = false;
-
-        // 3. Reset StreamingController state so the next client re-initializes the encoder.
-        // Without this, _isStreaming in StreamingController stays true and new clients
-        // skip WaitForFrameAndStartEncoder, leaving the encoder never started.
-        _streamingController.SetStreamingState(false);
-
-        // 4. Clear stale cached frames (old resolution) to prevent encoder dimension mismatch
-        lock (_frameBackLock) { _latestBackFrame = null; }
-        lock (_frameFrontLock) { _latestFrontFrame = null; }
-
-        // 5. Stop cameras
-        if (_isCapturingBack)
-        {
-            _backService.StopCapture();
-            _isCapturingBack = false;
-        }
-        if (_isCapturingFront)
-        {
-            _frontService.StopCapture();
-            _isCapturingFront = false;
-        }
-
-        // 6. Restart cameras with new dimensions
-        if (_backCameraEnabled)
-        {
-            _backService.StartCapture(_backCameraWidth, _backCameraHeight);
-            _isCapturingBack = true;
-        }
-        if (_frontCameraEnabled)
-        {
-            _frontService.StartCapture(_frontCameraWidth, _frontCameraHeight);
-            _isCapturingFront = true;
-        }
-
-        Log.Info("[RTSP Server]", $"RestartStreaming complete. Back: {_backCameraWidth}x{_backCameraHeight}, Front: {_frontCameraWidth}x{_frontCameraHeight}");
     }
 
     /// <summary>
@@ -583,6 +510,65 @@ public class Server : IDisposable
         }
     }
 
+    /// <summary>
+    /// Pre-starts the camera and H.264 encoder during SETUP so they're ready
+    /// when PLAY arrives. Without this, the encoder warm-up (~500ms) causes
+    /// live555/VLC to timeout waiting for the first RTP packet on first connect.
+    /// </summary>
+    private void PreStartCameraAndEncoder(Client client)
+    {
+        // Start camera capture if not already running
+        if (client.CameraId == 0 && !_isCapturingBack && _backCameraEnabled)
+        {
+            _backService.StartCapture(_backCameraWidth, _backCameraHeight);
+            _isCapturingBack = true;
+            Log.Info("[RTSP Server]", "Pre-started back camera at SETUP time");
+        }
+        else if (client.CameraId == 1 && !_isCapturingFront && _frontCameraEnabled)
+        {
+            _frontService.StartCapture(_frontCameraWidth, _frontCameraHeight);
+            _isCapturingFront = true;
+            Log.Info("[RTSP Server]", "Pre-started front camera at SETUP time");
+        }
+
+        // Enable frame feeding to encoder
+        _isStreaming = true;
+        _streamingController.SetStreamingState(true);
+
+        // Pre-warm H.264 encoder in background (needs first frame for dimensions)
+        if (client.Codec == CodecType.H264 && !_encoderManager.IsEncoderRunning(client.CameraId))
+        {
+            var cameraId = client.CameraId;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    FrameEventArgs? frame = null;
+                    int retries = 0;
+                    const int maxRetries = 20;
+
+                    while ((frame = GetLatestFrame(cameraId)) == null || frame.Data == null)
+                    {
+                        if (retries++ > maxRetries)
+                        {
+                            Log.Warn("[RTSP Server]", $"Pre-warm timeout waiting for frame from camera {cameraId}");
+                            return;
+                        }
+                        int delayMs = Math.Min(10 * (1 << Math.Min(retries, 4)), 100);
+                        await Task.Delay(delayMs, _cts.Token).ConfigureAwait(false);
+                    }
+
+                    _encoderManager.StartEncoder(cameraId, frame.Width, frame.Height, frame.Data.Length);
+                    Log.Info("[RTSP Server]", $"Pre-warmed H264 encoder for camera {cameraId}: {frame.Width}x{frame.Height}");
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("[RTSP Server]", $"Pre-warm encoder error: {ex.Message}");
+                }
+            }, _cts.Token);
+        }
+    }
+
     private void OnCameraStartRequested(object? sender, int cameraId)
     {
         if (cameraId == 1 && !_isCapturingFront)
@@ -700,7 +686,7 @@ public class Server : IDisposable
 
             using NetworkStream stream = new(socket, false); // ownsSocket=false: we manage socket lifetime
             using StreamReader reader = new(stream);
-            using StreamWriter writer = new(stream) { AutoFlush = true };
+            using StreamWriter writer = new(stream) { AutoFlush = true, NewLine = "\r\n" };
 
             // Create protocol handler for this connection
             var protocolHandler = new RtspProtocolHandler(
@@ -762,6 +748,14 @@ public class Server : IDisposable
 
     private async Task ProcessRtspRequest(StreamWriter writer, RtspRequest request, Client client, RtspProtocolHandler protocolHandler)
     {
+        // OPTIONS must be handled before authentication — VLC sends OPTIONS
+        // as an unauthenticated capability probe per RFC 2326 §10.1
+        if (request.Method.Equals("OPTIONS", StringComparison.OrdinalIgnoreCase))
+        {
+            await protocolHandler.HandleOptionsAsync(writer, request).ConfigureAwait(false);
+            return;
+        }
+
         if (!_authManager.IsAuthenticated(request) && _authManager.RequireAuthentication)
         {
             await _authManager.SendAuthenticationRequiredAsync(writer, request.CSeq).ConfigureAwait(false);
@@ -776,14 +770,15 @@ public class Server : IDisposable
 
         switch (request.Method.ToUpper())
         {
-            case "OPTIONS":
-                await protocolHandler.HandleOptionsAsync(writer, request).ConfigureAwait(false);
-                break;
             case "DESCRIBE":
                 await protocolHandler.HandleDescribeAsync(writer, request, client).ConfigureAwait(false);
                 break;
             case "SETUP":
                 await protocolHandler.HandleSetupAsync(writer, request, client).ConfigureAwait(false);
+                // Pre-start camera and encoder during SETUP so they're warm by the time
+                // PLAY is received. This prevents live555/VLC timeout on first connect,
+                // since the encoder needs ~500ms to start producing frames.
+                PreStartCameraAndEncoder(client);
                 break;
             case "PLAY":
                 if (await protocolHandler.HandlePlayAsync(writer, request, client).ConfigureAwait(false))

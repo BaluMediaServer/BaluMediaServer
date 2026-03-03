@@ -23,6 +23,11 @@ public class H264Encoder : IDisposable
     private int _bitrate;
     private readonly int _frameRate;
     private bool _isRunning;
+
+    /// <summary>
+    /// Gets whether the encoder is currently running.
+    /// </summary>
+    public bool IsRunning => _isRunning;
     private Thread? _encoderThread;
     private readonly Channel<FrameData> _frameChannel;
     private readonly ArrayPool<byte> _bufferPool = ArrayPool<byte>.Create();
@@ -99,11 +104,8 @@ public class H264Encoder : IDisposable
         // and DrainOutputBuffer() run on the same thread (EncodingLoop).
         // Concurrent JNI calls to MediaCodec from different threads can cause
         // vendor-specific stalls (especially on MediaTek).
-        // Dynamic capacity: target ~8MB max buffer, scale down for high-res frames.
-        int frameSize = (width * height * 3) / 2;
-        int channelCapacity = Math.Clamp(8_000_000 / Math.Max(frameSize, 1), 2, 10);
         _frameChannel = Channel.CreateBounded<FrameData>(
-            new BoundedChannelOptions(channelCapacity)
+            new BoundedChannelOptions(5)
             {
                 FullMode = BoundedChannelFullMode.DropOldest,
                 SingleReader = true,

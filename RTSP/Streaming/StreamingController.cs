@@ -121,6 +121,12 @@ public class StreamingController : IStreamingController
                 await WaitForFrameAndStartEncoder(client, cancellationToken).ConfigureAwait(false);
             }
         }
+        else if (client.Codec == CodecType.H264 && !_encoderManager.IsEncoderRunning(client.CameraId))
+        {
+            // Encoder stalled since first client — restart it
+            Log.Info("[StreamingController]", $"Encoder stalled for camera {client.CameraId} — restarting");
+            await WaitForFrameAndStartEncoder(client, cancellationToken).ConfigureAwait(false);
+        }
 
         // RTP seq/rtptime are initialized in HandlePlayAsync to match the PLAY response RTP-Info header
 

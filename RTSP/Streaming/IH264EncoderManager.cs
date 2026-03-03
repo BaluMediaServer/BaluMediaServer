@@ -86,4 +86,9 @@ public interface IH264EncoderManager
     /// <param name="cameraId">The camera ID.</param>
     /// <returns>The expected frame size.</returns>
     int GetExpectedFrameSize(int cameraId);
+
+    /// <summary>
+    /// Checks if the encoder for the specified camera is currently running.
+    /// </summary>
+    bool IsEncoderRunning(int cameraId);
 }
