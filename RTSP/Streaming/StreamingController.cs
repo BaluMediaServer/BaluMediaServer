@@ -50,6 +50,12 @@ public class StreamingController : IStreamingController
     public event EventHandler<int>? CameraStartRequested;
 
     /// <summary>
+    /// Event raised when the encoder falls back to a different resolution than requested.
+    /// Args: (cameraId, actualWidth, actualHeight).
+    /// </summary>
+    public event EventHandler<(int cameraId, int width, int height)>? EncoderResolutionFallback;
+
+    /// <summary>
     /// Delegate to retrieve the latest raw frame for a given camera ID.
     /// </summary>
     public Func<int, FrameEventArgs?>? GetLatestFrame { get; set; }
@@ -131,6 +137,8 @@ public class StreamingController : IStreamingController
         // RTP seq/rtptime are initialized in HandlePlayAsync to match the PLAY response RTP-Info header
 
         const int frameIntervalMs = 22; // ~45fps
+        int consecutiveTimeouts = 0;
+        const int maxTimeoutsBeforeRestart = 3; // 3 × 2s = 6s of no frames triggers restart
 
         try
         {
@@ -161,6 +169,34 @@ public class StreamingController : IStreamingController
                 if (client.Codec == CodecType.H264)
                 {
                     frameSent = await StreamH264ToClientAsync(client, cancellationToken).ConfigureAwait(false);
+
+                    if (!frameSent)
+                    {
+                        consecutiveTimeouts++;
+
+                        // After enough timeouts, check if encoder died (stall detection triggered)
+                        // and attempt in-loop restart so the client doesn't have to reconnect
+                        if (consecutiveTimeouts >= maxTimeoutsBeforeRestart &&
+                            !_encoderManager.IsEncoderRunning(client.CameraId))
+                        {
+                            Log.Warn("[StreamingController]", $"Encoder dead for camera {client.CameraId} during active stream — restarting in-loop");
+                            try
+                            {
+                                await WaitForFrameAndStartEncoder(client, cancellationToken).ConfigureAwait(false);
+                                consecutiveTimeouts = 0;
+                                Log.Info("[StreamingController]", $"Encoder restarted successfully for camera {client.CameraId}");
+                            }
+                            catch (TimeoutException)
+                            {
+                                Log.Error("[StreamingController]", $"Encoder restart failed (no frames from camera {client.CameraId}) — disconnecting client");
+                                break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        consecutiveTimeouts = 0;
+                    }
                 }
                 else
                 {
@@ -199,9 +235,10 @@ public class StreamingController : IStreamingController
     {
         FrameEventArgs? frame = null;
 
-        // Wait for first frame with exponential backoff (should be fast)
+        // Wait for first frame with exponential backoff.
+        // Camera hardware init can take several seconds on MediaTek (especially after stop/start).
         int retries = 0;
-        const int maxRetries = 20;
+        const int maxRetries = 100; // ~10 seconds with 100ms cap
 
         while ((frame = GetLatestFrame?.Invoke(client.CameraId)) == null || frame.Data == null)
         {
@@ -228,6 +265,34 @@ public class StreamingController : IStreamingController
 
         Log.Info("[StreamingController]", $"Starting H264 encoder with {reportedWidth}x{reportedHeight}");
         _encoderManager.StartEncoder(client.CameraId, reportedWidth, reportedHeight, frameSize);
+
+        // Check if encoder fell back to a different resolution
+        var (actualW, actualH) = _encoderManager.GetActualResolution(client.CameraId);
+        if (actualW > 0 && actualH > 0 && (actualW != reportedWidth || actualH != reportedHeight))
+        {
+            Log.Warn("[StreamingController]", $"Encoder fell back to {actualW}x{actualH} — requesting camera restart");
+            // This stops the encoder and restarts the camera at the encoder's actual resolution
+            EncoderResolutionFallback?.Invoke(this, (client.CameraId, actualW, actualH));
+
+            // Wait for camera to produce frames at the new resolution, then restart encoder
+            Log.Info("[StreamingController]", $"Waiting for camera to produce {actualW}x{actualH} frames...");
+            frame = null;
+            retries = 0;
+            const int maxFallbackRetries = 50; // More retries — camera restart takes longer
+
+            while ((frame = GetLatestFrame?.Invoke(client.CameraId)) == null || frame.Data == null)
+            {
+                if (retries++ > maxFallbackRetries)
+                {
+                    throw new TimeoutException($"Timeout waiting for frame at {actualW}x{actualH} from camera {client.CameraId}");
+                }
+                int delayMs = Math.Min(10 * (1 << Math.Min(retries, 4)), 100);
+                await Task.Delay(delayMs, cancellationToken).ConfigureAwait(false);
+            }
+
+            Log.Info("[StreamingController]", $"Got frame at {frame.Width}x{frame.Height} after camera restart, starting encoder");
+            _encoderManager.StartEncoder(client.CameraId, frame.Width, frame.Height, frame.Data.Length);
+        }
     }
 
     /// <summary>

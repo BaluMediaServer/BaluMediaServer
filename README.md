@@ -47,6 +47,7 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 - **Multiple Profiles**: Support for `/live/front` and `/live/back` routes
 - **Robust Client Lifecycle**: Graduated error counting, timeout protection, and race-free cleanup
 - **Cross-SoC Compatibility**: Wall-clock RTP timestamps and MediaTek-safe encoder configuration
+- **VLC Compatible**: Full RFC 2326/4566 compliance — works with VLC, ffplay, OBS, and any standards-compliant RTSP client
 
 ### 🔹 MJPEG HTTP Server
 - Simple, independent MJPEG server for easy HTML display
@@ -105,7 +106,7 @@ RTSP/
 
 ### NuGet Package
 ```xml
-<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.16" />
+<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.17" />
 ```
 
 ### Manual Installation
@@ -805,10 +806,15 @@ private async void StartPeriodicSnapshots()
 ### Connecting with Popular Clients
 
 #### VLC Media Player
-1. Open VLC
+1. Open VLC (version 3.0+ with live555 support)
 2. Go to Media → Open Network Stream
 3. Enter: `rtsp://admin:password123@your-ip:7778/live/back`
 4. Click Play
+
+**VLC Tips:**
+- For best reliability, use TCP transport: Tools → Preferences → All → Input/Codecs → Network → set "RTP over RTSP (TCP)" to "Always"
+- On Linux, the snap version of VLC is recommended (`snap install vlc`) — some distro packages (Debian/Kali) are compiled without live555 RTSP support
+- Stream playback starts instantly on first connect thanks to encoder pre-warming at SETUP time
 
 #### FFmpeg
 ```bash
@@ -882,6 +888,23 @@ if (networkAccess != NetworkAccess.Internet)
 var localIP = server.GetLocalIpAddress();
 Console.WriteLine($"Connect to: rtsp://{localIP}:7778/live/back");
 ```
+
+#### VLC Cannot Connect or Shows No Video
+
+**1. VLC compiled without live555 (Linux)**
+- **Symptom**: VLC shows "satip" or "access_realrtsp" errors instead of connecting
+- **Cause**: Some Linux distro packages (Debian, Kali) compile VLC with `--disable-live555`
+- **Fix**: Install VLC via snap (`snap install vlc`) or download from [videolan.org](https://www.videolan.org/) which includes live555
+
+**2. Connection timeout on first connect**
+- **Symptom**: VLC says "unable to open MRL" on first attempt, works on retry
+- **Cause**: H.264 encoder warm-up delay exceeds live555 timeout
+- **Fix**: This is handled automatically since v1.5.17 — the encoder is pre-warmed at SETUP time. If you still experience this, ensure you're using the latest version
+
+**3. Video plays but is garbled or green**
+- **Symptom**: VLC connects and shows frames, but image is corrupted
+- **Cause**: SPS/PPS parameter sets not delivered before IDR frame
+- **Fix**: The server sends SPS/PPS before every keyframe and on first frame. Ensure your client requests a new DESCRIBE/SETUP/PLAY sequence rather than resuming a stale session
 
 #### H.264 Encoding Issues
 ```csharp
@@ -1087,6 +1110,7 @@ Unit tests cover pure C# components. Android-dependent classes (camera services,
 - ✅ **Client reconnection bug fix** (v1.5.14)
 - ✅ **H.264 thread safety fix and connection stability** (v1.5.15)
 - ✅ **H.264 stream freeze fix — MediaTek I-frame interval, RTP timestamps, client lifecycle** (v1.5.16)
+- ✅ **VLC compatibility — RFC-compliant RTSP/SDP, CRLF line endings, encoder pre-warming** (v1.5.17)
 
 ### Planned (v1.6+)
 - ⬜ Fix image rotation on some devices
@@ -1145,6 +1169,16 @@ There are few (if any) options to integrate RTSP servers with Android using C# a
 -- Adding a preview (WIP) for video profiles allowing to create custom paths for this new profiles, will allow to set a custom resolution, bitrate and more.
 
 - v1.1.4: Adding auth option into CTOR of Server class, to enable or disable auth on stream rtsp, adding feature to determina video quality into mjpeg server
+
+- v1.5.17: **VLC Compatibility Release** — Full RFC 2326/4566 compliance for standards-compliant RTSP clients.
+  - Case-insensitive RTSP header parsing (`StringComparer.OrdinalIgnoreCase`) — VLC may send headers with varying casing
+  - OPTIONS method handled before authentication per RFC 2326 §10.1 — VLC sends unauthenticated OPTIONS as capability probe
+  - CRLF (`\r\n`) line endings in all RTSP responses and SDP — `StreamWriter` on Android/Linux defaults to `\n`, but live555 strictly requires `\r\n`
+  - `Content-Base` header includes trailing slash for correct relative URL resolution of `trackID=N` per RFC 3986
+  - `Range: npt=0.000-` header in PLAY response — required by VLC to confirm playback position
+  - Proper `RTP-Info` URL format with base URI + trackID
+  - H.264 encoder pre-warming at SETUP time — prevents live555 timeout on first connect by having the encoder ready before PLAY
+  - Encoder stall recovery — automatically restarts stalled encoders when subsequent clients connect
 
 - v1.1.5: Fixing EventBuss command on Server class, if the server was started do not raise the flag into it, and sometimes make the app crash due to "Port already in use" or even using excesive CPU on multiple MJPEG servers.
 Adding to MJPEGServer preview of EventBuss to handle it by there, but needs sync with main server to avoid duplicate instances or commands.

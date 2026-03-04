@@ -51,6 +51,7 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
     public event EventHandler<string>? ErrorOccurred;
 
     private bool _threadRunning = false;
+    private bool _loggedFirstProcessedFrame = false;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="BackCameraService"/> class.
@@ -72,6 +73,14 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
     {
         try
         {
+            // Stop and release the old native camera BEFORE creating a new one.
+            // Without this, the old Camera2 device holds the camera lock and the
+            // new instance can't open it — causing zero frames for 10-30+ seconds
+            // until GC finalizes the orphaned session.
+            try { _cameraCapture?.StopBackCameraCapture(); } catch { }
+            try { _cameraCapture?.Dispose(); } catch { }
+            _cameraCapture = null;
+
             // Create channel BEFORE starting capture to avoid race condition
             // Use dynamic capacity based on resolution to limit memory usage
             int channelCapacity = GetChannelCapacity(width, height);
@@ -89,10 +98,13 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
             // Now start the camera - frames can safely arrive
             _cameraCapture = new(_context);
             _cameraCapture.SetBackCameraCallback(this);
+            _loggedFirstProcessedFrame = false;
             _cameraCapture?.StartBackCameraCapture(width, height);
+            global::Android.Util.Log.Info("[BackCameraService]", $"StartCapture({width}x{height}): camera started, channel capacity={channelCapacity}, cts cancelled={_cts.IsCancellationRequested}");
         }
         catch (Exception ex)
         {
+            global::Android.Util.Log.Error("[BackCameraService]", $"StartCapture({width}x{height}) FAILED: {ex.Message}");
             SafeInvokeError($"Failed to start capture: {ex.Message}");
         }
     }
@@ -219,6 +231,12 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
 
         // Check disposed again before invoking event
         if (_disposed) return;
+
+        if (!_loggedFirstProcessedFrame)
+        {
+            _loggedFirstProcessedFrame = true;
+            global::Android.Util.Log.Info("[BackCameraService]", $"First processed frame: {args.Width}x{args.Height}, {args.Data?.Length ?? 0} bytes, subscribers={FrameReceived?.GetInvocationList().Length ?? 0}");
+        }
 
         try
         {

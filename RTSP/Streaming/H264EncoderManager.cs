@@ -92,6 +92,9 @@ public class H264EncoderManager : IH264EncoderManager
                 _h264BackEncoder.FrameEncoded -= OnH264BackFrameEncoded;
                 try { _h264BackEncoder.Dispose(); } catch { }
                 _h264BackEncoder = null;
+
+                // Drain stale frames from the old encoder session
+                while (_h264FrameChannelBack.Reader.TryRead(out _)) { }
             }
 
             if (_h264BackEncoder == null)
@@ -141,6 +144,9 @@ public class H264EncoderManager : IH264EncoderManager
                 _h264FrontEncoder.FrameEncoded -= OnH264FrontFrameEncoded;
                 try { _h264FrontEncoder.Dispose(); } catch { }
                 _h264FrontEncoder = null;
+
+                // Drain stale frames from the old encoder session
+                while (_h264FrameChannelFront.Reader.TryRead(out _)) { }
             }
 
             if (_h264FrontEncoder == null)
@@ -204,9 +210,11 @@ public class H264EncoderManager : IH264EncoderManager
                 _h264BackEncoder = null;
                 _h264BackEncoderExpectedFrameSize = 0;
 
-                // No need to clear channel - bounded with DropOldest handles this
+                // Drain stale frames from the channel to prevent old-session frames
+                // from being delivered to clients after the encoder restarts
+                while (_h264FrameChannelBack.Reader.TryRead(out _)) { }
 
-                Log.Debug("[EncoderManager]", "H264 back encoder stopped");
+                Log.Info("[EncoderManager]", "H264 back encoder stopped and channel drained");
             }
         }
     }
@@ -223,9 +231,11 @@ public class H264EncoderManager : IH264EncoderManager
                 _h264FrontEncoder = null;
                 _h264FrontEncoderExpectedFrameSize = 0;
 
-                // No need to clear channel - bounded with DropOldest handles this
+                // Drain stale frames from the channel to prevent old-session frames
+                // from being delivered to clients after the encoder restarts
+                while (_h264FrameChannelFront.Reader.TryRead(out _)) { }
 
-                Log.Debug("[EncoderManager]", "H264 front encoder stopped");
+                Log.Info("[EncoderManager]", "H264 front encoder stopped and channel drained");
             }
         }
     }
@@ -294,11 +304,11 @@ public class H264EncoderManager : IH264EncoderManager
     {
         if (cameraId == 1) // Front camera
         {
-            _h264FrontEncoder?.QueueFrame(frame.Data, frame.Timestamp);
+            _h264FrontEncoder?.QueueFrame(frame.Data, frame.Timestamp, frame.Width, frame.Height);
         }
         else // Back camera
         {
-            _h264BackEncoder?.QueueFrame(frame.Data, frame.Timestamp);
+            _h264BackEncoder?.QueueFrame(frame.Data, frame.Timestamp, frame.Width, frame.Height);
         }
     }
 

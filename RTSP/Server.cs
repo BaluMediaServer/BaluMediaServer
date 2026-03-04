@@ -55,6 +55,10 @@ public class Server : IDisposable
     private readonly object _frameFrontLock = new();
     private readonly object _frameBackLock = new();
 
+    // Per-camera locks to prevent races between resolution changes and concurrent SETUP/PLAY
+    private readonly object _backCameraLock = new();
+    private readonly object _frontCameraLock = new();
+
     // Module dependencies
     private readonly IAuthenticationManager _authManager;
     private readonly SdpGenerator _sdpGenerator;
@@ -104,7 +108,6 @@ public class Server : IDisposable
         string? CertificatePassword = null, VideoResolution BackCameraResolution = VideoResolution.VGA_640x480,
         VideoResolution FrontCameraResolution = VideoResolution.VGA_640x480)
     {
-        EventBuss.Command += OnCommandSend;
         _enabled = true;
         _port = Port;
         _maxClients = MaxClients;
@@ -156,6 +159,7 @@ public class Server : IDisposable
             catch (Exception ex) { Log.Error("[RTSP Server]", $"OnStreaming subscriber error: {ex.Message}"); }
         };
         _streamingController.CameraStartRequested += OnCameraStartRequested;
+        _streamingController.EncoderResolutionFallback += OnEncoderResolutionFallback;
         _streamingController.GetLatestFrame = GetLatestFrame;
         _rtcpManager.ClientCleanupRequired += (_, client) => _clientManager.CleanupClient(client);
         _rtcpManager.BitrateAdjustmentRequired += OnBitrateAdjustmentRequired;
@@ -223,39 +227,31 @@ public class Server : IDisposable
 
     /// <summary>
     /// Sets the resolution for the back camera.
+    /// If the camera is running, restarts the full pipeline at the new resolution.
     /// </summary>
     public void SetBackCameraResolution(VideoResolution resolution)
-    {
-        _backCameraWidth = resolution.GetWidth();
-        _backCameraHeight = resolution.GetHeight();
-    }
+        => ApplyResolutionChange(0, resolution.GetWidth(), resolution.GetHeight());
 
     /// <summary>
     /// Sets a custom resolution for the back camera.
+    /// If the camera is running, restarts the full pipeline at the new resolution.
     /// </summary>
     public void SetBackCameraResolution(int width, int height)
-    {
-        _backCameraWidth = width;
-        _backCameraHeight = height;
-    }
+        => ApplyResolutionChange(0, width, height);
 
     /// <summary>
     /// Sets the resolution for the front camera.
+    /// If the camera is running, restarts the full pipeline at the new resolution.
     /// </summary>
     public void SetFrontCameraResolution(VideoResolution resolution)
-    {
-        _frontCameraWidth = resolution.GetWidth();
-        _frontCameraHeight = resolution.GetHeight();
-    }
+        => ApplyResolutionChange(1, resolution.GetWidth(), resolution.GetHeight());
 
     /// <summary>
     /// Sets a custom resolution for the front camera.
+    /// If the camera is running, restarts the full pipeline at the new resolution.
     /// </summary>
     public void SetFrontCameraResolution(int width, int height)
-    {
-        _frontCameraWidth = width;
-        _frontCameraHeight = height;
-    }
+        => ApplyResolutionChange(1, width, height);
 
     /// <summary>
     /// Gets the current back camera resolution.
@@ -279,8 +275,27 @@ public class Server : IDisposable
     {
         if (_enabled && !IsRunning)
         {
+            // Probe encoder-supported resolution BEFORE starting cameras.
+            // This avoids the costly double-start: camera at 1920x1080 → encoder falls back
+            // to 1280x720 → camera restarts at 1280x720 (adds 10-30s on MediaTek).
+            var (backW, backH) = H264Encoder.ProbeSupportedResolution(_backCameraWidth, _backCameraHeight);
+            if (backW != _backCameraWidth || backH != _backCameraHeight)
+            {
+                Log.Info("[RTSP Server]", $"Adjusting back camera resolution to encoder-supported {backW}x{backH} (was {_backCameraWidth}x{_backCameraHeight})");
+                _backCameraWidth = backW;
+                _backCameraHeight = backH;
+            }
+            var (frontW, frontH) = H264Encoder.ProbeSupportedResolution(_frontCameraWidth, _frontCameraHeight);
+            if (frontW != _frontCameraWidth || frontH != _frontCameraHeight)
+            {
+                Log.Info("[RTSP Server]", $"Adjusting front camera resolution to encoder-supported {frontW}x{frontH} (was {_frontCameraWidth}x{_frontCameraHeight})");
+                _frontCameraWidth = frontW;
+                _frontCameraHeight = frontH;
+            }
+
             ConfigureSocket();
             IsRunning = true;
+            EventBuss.Command += OnCommandSend;
             _backService.FrameReceived += OnBackFrameAvailable;
             _frontService.FrameReceived += OnFrontFrameAvailable;
             Task.Run(ListenAsync, _cts.Token);
@@ -297,6 +312,7 @@ public class Server : IDisposable
     {
         Log.Warn("[RTSP Server]", $"Stop() called - stack trace: {Environment.StackTrace}");
         IsRunning = false;
+        EventBuss.Command -= OnCommandSend;
         _cts?.Cancel();
         _cts = new();
         _backService.FrameReceived -= OnBackFrameAvailable;
@@ -313,6 +329,7 @@ public class Server : IDisposable
     {
         Log.Warn("[RTSP Server]", $"Dispose() called - stack trace: {Environment.StackTrace}");
         IsRunning = false;
+        EventBuss.Command -= OnCommandSend;
         _mjpegServer?.Dispose();
         _jpegEncoder?.Dispose();
         _cts?.Cancel();
@@ -385,15 +402,18 @@ public class Server : IDisposable
             switch (command)
             {
                 case BussCommand.START_CAMERA_FRONT:
-                    if (!_isCapturingFront && _frontCameraEnabled)
+                    lock (_frontCameraLock)
                     {
-                        if (!IsRunning)
+                        if (!_isCapturingFront && _frontCameraEnabled)
                         {
-                            _frontService = new();
-                            _frontService.FrameReceived += OnFrontFrameAvailable;
+                            if (!IsRunning)
+                            {
+                                _frontService = new();
+                                _frontService.FrameReceived += OnFrontFrameAvailable;
+                            }
+                            _frontService.StartCapture(_frontCameraWidth, _frontCameraHeight);
+                            _isCapturingFront = true;
                         }
-                        _frontService.StartCapture(_frontCameraWidth, _frontCameraHeight);
-                        _isCapturingFront = true;
                     }
                     break;
                 case BussCommand.STOP_CAMERA_FRONT:
@@ -402,15 +422,18 @@ public class Server : IDisposable
                     Log.Debug("[RTSP Server]", "STOP_CAMERA_FRONT command ignored - continuous streaming mode enabled");
                     break;
                 case BussCommand.START_CAMERA_BACK:
-                    if (!_isCapturingBack && _backCameraEnabled)
+                    lock (_backCameraLock)
                     {
-                        if (!IsRunning)
+                        if (!_isCapturingBack && _backCameraEnabled)
                         {
-                            _backService = new();
-                            _backService.FrameReceived += OnBackFrameAvailable;
+                            if (!IsRunning)
+                            {
+                                _backService = new();
+                                _backService.FrameReceived += OnBackFrameAvailable;
+                            }
+                            _backService.StartCapture(_backCameraWidth, _backCameraHeight);
+                            _isCapturingBack = true;
                         }
-                        _backService.StartCapture(_backCameraWidth, _backCameraHeight);
-                        _isCapturingBack = true;
                     }
                     break;
                 case BussCommand.STOP_CAMERA_BACK:
@@ -442,10 +465,17 @@ public class Server : IDisposable
         }
     }
 
+    private bool _loggedFirstBackFrame;
+    private int _getLatestFrameNullCount;
     private void OnBackFrameAvailable(object? sender, FrameEventArgs arg)
     {
         if (arg?.Data != null && arg.Data.Length > 0)
         {
+            if (!_loggedFirstBackFrame)
+            {
+                _loggedFirstBackFrame = true;
+                Log.Info("[RTSP Server]", $"First back frame received: {arg.Width}x{arg.Height}, {arg.Data.Length} bytes");
+            }
             try
             {
                 OnNewBackFrame?.Invoke(this, arg);
@@ -456,7 +486,12 @@ public class Server : IDisposable
             }
             lock (_frameBackLock)
             {
+                var wasNull = _latestBackFrame == null;
                 _latestBackFrame = arg;
+                if (wasNull && _getLatestFrameNullCount > 0)
+                {
+                    Log.Info("[RTSP Server]", $"Back frame restored after {_getLatestFrameNullCount} null reads: {arg.Width}x{arg.Height}, {arg.Data.Length} bytes");
+                }
             }
             if (_isStreaming)
             {
@@ -505,7 +540,20 @@ public class Server : IDisposable
         {
             lock (_frameBackLock)
             {
-                return _latestBackFrame;
+                var frame = _latestBackFrame;
+                if (frame == null)
+                {
+                    // Log only every 10th call to avoid flooding logcat
+                    if (++_getLatestFrameNullCount % 10 == 1)
+                    {
+                        Log.Info("[RTSP Server]", $"GetLatestFrame(back): null (x{_getLatestFrameNullCount}), isCapturing={_isCapturingBack}, isStreaming={_isStreaming}");
+                    }
+                }
+                else
+                {
+                    _getLatestFrameNullCount = 0;
+                }
+                return frame;
             }
         }
     }
@@ -517,18 +565,23 @@ public class Server : IDisposable
     /// </summary>
     private void PreStartCameraAndEncoder(Client client)
     {
-        // Start camera capture if not already running
-        if (client.CameraId == 0 && !_isCapturingBack && _backCameraEnabled)
+        var cameraLock = client.CameraId == 0 ? _backCameraLock : _frontCameraLock;
+
+        lock (cameraLock)
         {
-            _backService.StartCapture(_backCameraWidth, _backCameraHeight);
-            _isCapturingBack = true;
-            Log.Info("[RTSP Server]", "Pre-started back camera at SETUP time");
-        }
-        else if (client.CameraId == 1 && !_isCapturingFront && _frontCameraEnabled)
-        {
-            _frontService.StartCapture(_frontCameraWidth, _frontCameraHeight);
-            _isCapturingFront = true;
-            Log.Info("[RTSP Server]", "Pre-started front camera at SETUP time");
+            // Start camera capture if not already running
+            if (client.CameraId == 0 && !_isCapturingBack && _backCameraEnabled)
+            {
+                _backService.StartCapture(_backCameraWidth, _backCameraHeight);
+                _isCapturingBack = true;
+                Log.Info("[RTSP Server]", "Pre-started back camera at SETUP time");
+            }
+            else if (client.CameraId == 1 && !_isCapturingFront && _frontCameraEnabled)
+            {
+                _frontService.StartCapture(_frontCameraWidth, _frontCameraHeight);
+                _isCapturingFront = true;
+                Log.Info("[RTSP Server]", "Pre-started front camera at SETUP time");
+            }
         }
 
         // Enable frame feeding to encoder
@@ -538,49 +591,255 @@ public class Server : IDisposable
         // Pre-warm H.264 encoder in background (needs first frame for dimensions)
         if (client.Codec == CodecType.H264 && !_encoderManager.IsEncoderRunning(client.CameraId))
         {
-            var cameraId = client.CameraId;
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    FrameEventArgs? frame = null;
-                    int retries = 0;
-                    const int maxRetries = 20;
-
-                    while ((frame = GetLatestFrame(cameraId)) == null || frame.Data == null)
-                    {
-                        if (retries++ > maxRetries)
-                        {
-                            Log.Warn("[RTSP Server]", $"Pre-warm timeout waiting for frame from camera {cameraId}");
-                            return;
-                        }
-                        int delayMs = Math.Min(10 * (1 << Math.Min(retries, 4)), 100);
-                        await Task.Delay(delayMs, _cts.Token).ConfigureAwait(false);
-                    }
-
-                    _encoderManager.StartEncoder(cameraId, frame.Width, frame.Height, frame.Data.Length);
-                    Log.Info("[RTSP Server]", $"Pre-warmed H264 encoder for camera {cameraId}: {frame.Width}x{frame.Height}");
-                }
-                catch (Exception ex)
-                {
-                    Log.Error("[RTSP Server]", $"Pre-warm encoder error: {ex.Message}");
-                }
-            }, _cts.Token);
+            PreWarmEncoderAsync(client.CameraId);
         }
     }
 
     private void OnCameraStartRequested(object? sender, int cameraId)
     {
-        if (cameraId == 1 && !_isCapturingFront)
+        if (cameraId == 1)
         {
-            _frontService.StartCapture(_frontCameraWidth, _frontCameraHeight);
-            _isCapturingFront = true;
+            lock (_frontCameraLock)
+            {
+                if (!_isCapturingFront)
+                {
+                    _frontService.StartCapture(_frontCameraWidth, _frontCameraHeight);
+                    _isCapturingFront = true;
+                }
+            }
         }
-        else if (cameraId == 0 && !_isCapturingBack)
+        else if (cameraId == 0)
         {
-            _backService.StartCapture(_backCameraWidth, _backCameraHeight);
-            _isCapturingBack = true;
+            lock (_backCameraLock)
+            {
+                if (!_isCapturingBack)
+                {
+                    _backService.StartCapture(_backCameraWidth, _backCameraHeight);
+                    _isCapturingBack = true;
+                }
+            }
         }
+    }
+
+    private void OnEncoderResolutionFallback(object? sender, (int cameraId, int width, int height) args)
+    {
+        var (cameraId, actualW, actualH) = args;
+        var cameraLock = cameraId == 0 ? _backCameraLock : _frontCameraLock;
+
+        lock (cameraLock)
+        {
+            // Stop encoder and restart camera at the resolution the encoder actually supports.
+            // Do NOT pre-warm here — StreamingController will wait for the new frame and restart the encoder.
+            if (cameraId == 0)
+            {
+                if (_backCameraWidth == actualW && _backCameraHeight == actualH)
+                    return;
+                Log.Info("[RTSP Server]", $"Encoder fallback: restarting back camera {_backCameraWidth}x{_backCameraHeight} -> {actualW}x{actualH}");
+                _backCameraWidth = actualW;
+                _backCameraHeight = actualH;
+                _encoderManager.StopEncoder(cameraId);
+                _encoderManager.ClearSpsPps();
+                _sdpGenerator.ClearSpsPps();
+                lock (_frameBackLock) { _latestBackFrame = null; }
+                _loggedFirstBackFrame = false; // Reset so we see first frame after restart
+                _backService.StopCapture();
+                _isCapturingBack = false;
+                _backService.StartCapture(actualW, actualH);
+                _isCapturingBack = true;
+            }
+            else
+            {
+                if (_frontCameraWidth == actualW && _frontCameraHeight == actualH)
+                    return;
+                Log.Info("[RTSP Server]", $"Encoder fallback: restarting front camera {_frontCameraWidth}x{_frontCameraHeight} -> {actualW}x{actualH}");
+                _frontCameraWidth = actualW;
+                _frontCameraHeight = actualH;
+                _encoderManager.StopEncoder(cameraId);
+                _encoderManager.ClearSpsPps();
+                _sdpGenerator.ClearSpsPps();
+                _latestFrontFrame = null;
+                _frontService.StopCapture();
+                _isCapturingFront = false;
+                _frontService.StartCapture(actualW, actualH);
+                _isCapturingFront = true;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Applies a resolution change for the specified camera. If the camera is running,
+    /// restarts the full pipeline: encoder → SPS/PPS → camera → clients → pre-warm.
+    /// Thread-safe via per-camera locks.
+    /// </summary>
+    private void ApplyResolutionChange(int cameraId, int newWidth, int newHeight)
+    {
+        var cameraLock = cameraId == 0 ? _backCameraLock : _frontCameraLock;
+
+        lock (cameraLock)
+        {
+            // Read current dimensions
+            int oldWidth, oldHeight;
+            if (cameraId == 0)
+            {
+                oldWidth = _backCameraWidth;
+                oldHeight = _backCameraHeight;
+            }
+            else
+            {
+                oldWidth = _frontCameraWidth;
+                oldHeight = _frontCameraHeight;
+            }
+
+            // Skip if unchanged
+            if (oldWidth == newWidth && oldHeight == newHeight)
+                return;
+
+            Log.Info("[RTSP Server]", $"Resolution change for {(cameraId == 0 ? "back" : "front")} camera: {oldWidth}x{oldHeight} -> {newWidth}x{newHeight}");
+
+            // Update resolution fields
+            if (cameraId == 0)
+            {
+                _backCameraWidth = newWidth;
+                _backCameraHeight = newHeight;
+            }
+            else
+            {
+                _frontCameraWidth = newWidth;
+                _frontCameraHeight = newHeight;
+            }
+
+            // If camera not running, just update fields (resolution used on next start)
+            bool isCameraRunning = cameraId == 0 ? _isCapturingBack : _isCapturingFront;
+            if (!isCameraRunning)
+            {
+                Log.Info("[RTSP Server]", $"Camera {cameraId} not running, resolution will apply on next start");
+                return;
+            }
+
+            // Stop H.264 encoder
+            _encoderManager.StopEncoder(cameraId);
+            Log.Info("[RTSP Server]", $"Stopped H264 encoder for camera {cameraId}");
+
+            // Clear SPS/PPS caches (old resolution params are invalid)
+            _encoderManager.ClearSpsPps();
+            _sdpGenerator.ClearSpsPps();
+
+            // Stop camera capture
+            if (cameraId == 0)
+            {
+                _backService.StopCapture();
+                _isCapturingBack = false;
+            }
+            else
+            {
+                _frontService.StopCapture();
+                _isCapturingFront = false;
+            }
+
+            // Clear cached latest frame (prevents encoder pre-warm from picking up stale old-resolution frame)
+            if (cameraId == 0)
+            {
+                lock (_frameBackLock) { _latestBackFrame = null; }
+            }
+            else
+            {
+                lock (_frameFrontLock) { _latestFrontFrame = null; }
+            }
+
+            // Disconnect affected RTSP clients (only those watching this camera)
+            DisconnectClientsForCamera(cameraId);
+
+            // Restart camera at new resolution
+            if (cameraId == 0)
+            {
+                _backService.StartCapture(newWidth, newHeight);
+                _isCapturingBack = true;
+            }
+            else
+            {
+                _frontService.StartCapture(newWidth, newHeight);
+                _isCapturingFront = true;
+            }
+            Log.Info("[RTSP Server]", $"Restarted {(cameraId == 0 ? "back" : "front")} camera at {newWidth}x{newHeight}");
+
+            // Pre-warm encoder in background
+            PreWarmEncoderAsync(cameraId);
+        }
+    }
+
+    /// <summary>
+    /// Disconnects RTSP clients watching the specified camera.
+    /// MJPEG HTTP clients are NOT disconnected — MJPEG adapts automatically since each frame is independent.
+    /// </summary>
+    private void DisconnectClientsForCamera(int cameraId)
+    {
+        var clients = _clientManager.GetActiveClients();
+        int disconnected = 0;
+
+        foreach (var client in clients)
+        {
+            if (client.CameraId == cameraId)
+            {
+                _clientManager.CleanupClient(client);
+                disconnected++;
+            }
+        }
+
+        if (disconnected > 0)
+            Log.Info("[RTSP Server]", $"Disconnected {disconnected} RTSP client(s) for camera {cameraId}");
+    }
+
+    /// <summary>
+    /// Fire-and-forget background task that waits for the first new frame from the camera,
+    /// then starts the H.264 encoder. Uses more retries than initial pre-warm since
+    /// camera restart takes longer than initial start.
+    /// </summary>
+    private void PreWarmEncoderAsync(int cameraId)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                FrameEventArgs? frame = null;
+                int retries = 0;
+                const int maxRetries = 50;
+
+                while ((frame = GetLatestFrame(cameraId)) == null || frame.Data == null)
+                {
+                    if (retries++ > maxRetries)
+                    {
+                        Log.Warn("[RTSP Server]", $"Pre-warm timeout waiting for frame from camera {cameraId} after resolution change");
+                        return;
+                    }
+                    int delayMs = Math.Min(10 * (1 << Math.Min(retries, 4)), 100);
+                    await Task.Delay(delayMs, _cts.Token).ConfigureAwait(false);
+                }
+
+                _encoderManager.StartEncoder(cameraId, frame.Width, frame.Height, frame.Data.Length);
+
+                // Check if encoder fell back to a different resolution
+                var (actualW, actualH) = _encoderManager.GetActualResolution(cameraId);
+                if (actualW > 0 && actualH > 0 && (actualW != frame.Width || actualH != frame.Height))
+                {
+                    Log.Warn("[RTSP Server]", $"Pre-warm: encoder fell back to {actualW}x{actualH} (camera: {frame.Width}x{frame.Height}) — restarting camera");
+                    // Reuse the same fallback handler
+                    OnEncoderResolutionFallback(this, (cameraId, actualW, actualH));
+                    Log.Info("[RTSP Server]", $"Camera {cameraId} restarted at {actualW}x{actualH} — encoder will be started by StreamingController");
+                }
+                else
+                {
+                    Log.Info("[RTSP Server]", $"Pre-warmed H264 encoder for camera {cameraId}: {frame.Width}x{frame.Height}");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Server shutting down, ignore
+            }
+            catch (Exception ex)
+            {
+                Log.Error("[RTSP Server]", $"Pre-warm encoder error after resolution change: {ex.Message}");
+            }
+        }, _cts.Token);
     }
 
     private void OnBitrateAdjustmentRequired(object? sender, (Client client, int newBitrate) args)

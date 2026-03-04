@@ -54,6 +54,12 @@ public interface IH264EncoderManager
     ValueTask<H264FrameEventArgs> DequeueFrameAsync(int cameraId, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Clears the cached SPS/PPS values.
+    /// Should be called when the encoder is restarted with new dimensions.
+    /// </summary>
+    void ClearSpsPps();
+
+    /// <summary>
     /// Gets the current SPS and PPS.
     /// </summary>
     /// <returns>Tuple of SPS and PPS.</returns>

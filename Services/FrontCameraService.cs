@@ -76,6 +76,14 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
     {
         try
         {
+            // Stop and release the old native camera BEFORE creating a new one.
+            // Without this, the old Camera2 device holds the camera lock and the
+            // new instance can't open it — causing zero frames for 10-30+ seconds
+            // until GC finalizes the orphaned session.
+            try { _cameraCapture?.StopFrontCameraCapture(); } catch { }
+            try { _cameraCapture?.Dispose(); } catch { }
+            _cameraCapture = null;
+
             // Create channel BEFORE starting capture to avoid race condition
             // Use dynamic capacity based on resolution to limit memory usage
             int channelCapacity = GetChannelCapacity(width, height);
@@ -90,6 +98,8 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
             _thread = Task.Run(ProcessFramesAsync, _cts.Token);
 
             // Now start the camera - frames can safely arrive
+            _cameraCapture = new(_context);
+            _cameraCapture.SetFrontCameraCallback(this);
             _cameraCapture?.StartFrontCameraCapture(width, height);
         }
         catch (Exception ex)
