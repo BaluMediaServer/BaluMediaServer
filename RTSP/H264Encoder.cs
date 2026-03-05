@@ -452,17 +452,18 @@ public class H264Encoder : IDisposable
                 // Create format with encoder's supported color format
                 var format = MediaFormat.CreateVideoFormat(MediaFormat.MimetypeVideoAvc, _width, _height);
 
-                // Use the best color format from the selected encoder
-                // Prefer YUV420Flexible as it handles stride/alignment automatically
-                if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420Flexible))
-                {
-                    _selectedColorFormat = COLOR_FormatYUV420Flexible;
-                    Log.Debug("H264", "Using COLOR_FormatYUV420Flexible");
-                }
-                else if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420SemiPlanar))
+                // Prefer NV12 (SemiPlanar) — it has a well-defined buffer layout for raw
+                // ByteBuffer writes. COLOR_FormatYUV420Flexible has undefined layout for
+                // raw writes and causes green corruption at higher resolutions.
+                if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420SemiPlanar))
                 {
                     _selectedColorFormat = COLOR_FormatYUV420SemiPlanar; // NV12
                     Log.Debug("H264", "Using COLOR_FormatYUV420SemiPlanar (NV12)");
+                }
+                else if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420Flexible))
+                {
+                    _selectedColorFormat = COLOR_FormatYUV420Flexible;
+                    Log.Warn("H264", "Using COLOR_FormatYUV420Flexible (NV12 unavailable)");
                 }
                 else
                 {
@@ -543,6 +544,11 @@ public class H264Encoder : IDisposable
                     {
                         _encoderStride = inputFormat.GetInteger(MediaFormat.KeyStride, _width);
                         _encoderSliceHeight = inputFormat.GetInteger(MediaFormat.KeySliceHeight, _height);
+
+                        // Some encoders return 0 meaning "same as configured"
+                        if (_encoderStride <= 0) _encoderStride = _width;
+                        if (_encoderSliceHeight <= 0) _encoderSliceHeight = _height;
+
                         Log.Info("H264", $"Encoder input: stride={_encoderStride}, sliceHeight={_encoderSliceHeight} (video={_width}x{_height})");
                     }
                 }
@@ -899,7 +905,7 @@ public class H264Encoder : IDisposable
             // Buffer is larger than expected — encoder likely has bigger sliceHeight
             // sliceHeight = bufferCapacity * 2 / (stride * 3)
             int deducedSlice = (inputBuffer.Capacity() * 2) / (stride * 3);
-            if (deducedSlice > _height && deducedSlice <= actualSrcHeight + 16)
+            if (deducedSlice > _height && (deducedSlice <= _height + 256 || deducedSlice <= actualSrcHeight + 16))
             {
                 sliceHeight = deducedSlice;
                 _encoderSliceHeight = sliceHeight;
