@@ -404,13 +404,16 @@ public class MjpegServer : IDisposable
 
             try
             {
+                // Skip encoding entirely when no clients are connected
+                if (_clientsBack.Count == 0)
+                    continue;
+
                 // Validate frame data before JNI encoding
                 if (arg.Data == null || arg.Data.Length == 0 || arg.Width <= 0 || arg.Height <= 0)
                 {
                     continue;
                 }
 
-                // Always encode to keep latest frame available for new clients
                 var jpegData = Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height,
                     Android.Graphics.ImageFormatType.Nv21, _quality);
 
@@ -431,8 +434,7 @@ public class MjpegServer : IDisposable
                 }
 
                 // Signal all waiting clients that a new frame is available
-                // Always release at least once so new clients connecting between frames can get notified
-                var clientCount = System.Math.Max(1, _clientsBack.Count);
+                var clientCount = _clientsBack.Count;
                 for (int i = 0; i < clientCount; i++)
                 {
                     try { _backFrameSemaphore.Release(); }
@@ -470,13 +472,16 @@ public class MjpegServer : IDisposable
 
             try
             {
+                // Skip encoding entirely when no clients are connected
+                if (_clientsFront.Count == 0)
+                    continue;
+
                 // Validate frame data before JNI encoding
                 if (arg.Data == null || arg.Data.Length == 0 || arg.Width <= 0 || arg.Height <= 0)
                 {
                     continue;
                 }
 
-                // Always encode to keep latest frame available for new clients
                 var jpegData = Server.EncodeToJpeg(arg.Data, arg.Width, arg.Height,
                     Android.Graphics.ImageFormatType.Nv21, _quality);
 
@@ -497,8 +502,7 @@ public class MjpegServer : IDisposable
                 }
 
                 // Signal all waiting clients that a new frame is available
-                // Always release at least once so new clients connecting between frames can get notified
-                var clientCount = System.Math.Max(1, _clientsFront.Count);
+                var clientCount = _clientsFront.Count;
                 for (int i = 0; i < clientCount; i++)
                 {
                     try { _frontFrameSemaphore.Release(); }

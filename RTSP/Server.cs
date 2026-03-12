@@ -497,8 +497,9 @@ public class Server : IDisposable
             {
                 _encoderManager.FeedFrame(0, arg);
             }
-            // Queue for JPEG encoding (used by MJPEG clients)
-            _jpegEncoder.QueueFrame(arg, 0);
+            // Queue for JPEG encoding only when RTSP-MJPEG clients exist
+            if (_clientManager.HasMjpegClients)
+                _jpegEncoder.QueueFrame(arg, 0);
         }
     }
 
@@ -522,8 +523,9 @@ public class Server : IDisposable
             {
                 _encoderManager.FeedFrame(1, arg);
             }
-            // Queue for JPEG encoding (used by MJPEG clients)
-            _jpegEncoder.QueueFrame(arg, 1);
+            // Queue for JPEG encoding only when RTSP-MJPEG clients exist
+            if (_clientManager.HasMjpegClients)
+                _jpegEncoder.QueueFrame(arg, 1);
         }
     }
 
@@ -1075,6 +1077,10 @@ public class Server : IDisposable
     /// <param name="format">The image format.</param>
     /// <param name="quality">The JPEG quality (0-100).</param>
     /// <returns>The JPEG encoded data.</returns>
+    // Per-thread reusable MemoryStream to reduce GC pressure from JPEG encoding
+    [ThreadStatic]
+    private static MemoryStream? t_jpegOutputStream;
+
     public static byte[] EncodeToJpeg(byte[] rawImageData, int width, int height, Android.Graphics.ImageFormatType format, int quality = 80)
     {
         // Validate input to prevent JNI crashes on invalid data
@@ -1089,7 +1095,9 @@ public class Server : IDisposable
 
         try
         {
-            using var outputStream = new MemoryStream();
+            var outputStream = t_jpegOutputStream ??= new MemoryStream(width * height);
+            outputStream.SetLength(0); // reset for reuse
+
             if (format == Android.Graphics.ImageFormatType.Nv21 || format == Android.Graphics.ImageFormatType.Yuv420888)
             {
                 // Create Java objects and immediately use them
@@ -1110,7 +1118,11 @@ public class Server : IDisposable
                     return Array.Empty<byte>();
                 }
             }
-            return outputStream.ToArray();
+            // Use GetBuffer + length to avoid the extra allocation from ToArray()
+            var length = (int)outputStream.Length;
+            var result = new byte[length];
+            Buffer.BlockCopy(outputStream.GetBuffer(), 0, result, 0, length);
+            return result;
         }
         catch (Exception ex)
         {

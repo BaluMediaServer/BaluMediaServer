@@ -175,9 +175,16 @@ public class JpegEncoderService : IDisposable
         }
     }
 
+    // Reusable MemoryStream per encoder thread to avoid repeated allocation.
+    // Thread-safety: each encoder loop (back/front) calls EncodeToJpeg on its own thread,
+    // and we use [ThreadStatic] to give each thread its own instance.
+    [ThreadStatic]
+    private static MemoryStream? t_outputStream;
+
     /// <summary>
     /// Encodes raw YUV frame data to JPEG format.
     /// Explicitly disposes Java objects to prevent SIGSEGV on background threads.
+    /// Reuses a per-thread MemoryStream to reduce GC pressure.
     /// </summary>
     private static byte[] EncodeToJpeg(byte[] rawImageData, int width, int height,
         Android.Graphics.ImageFormatType format, int quality)
@@ -194,7 +201,8 @@ public class JpegEncoderService : IDisposable
 
         try
         {
-            using var outputStream = new MemoryStream();
+            var outputStream = t_outputStream ??= new MemoryStream(width * height); // pre-size
+            outputStream.SetLength(0); // reset for reuse
 
             if (format == Android.Graphics.ImageFormatType.Nv21 ||
                 format == Android.Graphics.ImageFormatType.Yuv420888)
@@ -218,7 +226,11 @@ public class JpegEncoderService : IDisposable
                 }
             }
 
-            return outputStream.ToArray();
+            // Use GetBuffer + length to avoid the extra copy from ToArray()
+            var length = (int)outputStream.Length;
+            var result = new byte[length];
+            Buffer.BlockCopy(outputStream.GetBuffer(), 0, result, 0, length);
+            return result;
         }
         catch (Exception ex)
         {

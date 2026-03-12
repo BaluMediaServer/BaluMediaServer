@@ -62,6 +62,9 @@ public class ClientManager : IClientManager
     public int PlayingClientCount => _clients.Values.Count(p => p.IsPlaying);
 
     /// <inheritdoc/>
+    public bool HasMjpegClients => _clients.Values.Any(c => c.Codec == CodecType.MJPEG && c.IsPlaying);
+
+    /// <inheritdoc/>
     public bool AddClient(Client client)
     {
         var result = _clients.TryAdd(client.Id, client);

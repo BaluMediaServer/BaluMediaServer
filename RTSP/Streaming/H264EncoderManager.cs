@@ -29,8 +29,10 @@ public class H264EncoderManager : IH264EncoderManager
     private byte[]? _currentPps;
     private readonly object _spsPpsLock = new();
 
-    // Maximum frames to buffer before dropping (prevents latency buildup)
-    private const int MaxH264QueueSize = 10;
+    // Maximum encoded frames to buffer before dropping.
+    // Lower values reduce latency; DropOldest ensures we never stall.
+    // At 25fps: 3 frames = 120ms max buffering delay.
+    private const int MaxH264QueueSize = 3;
 
     /// <summary>
     /// Initializes a new instance of H264EncoderManager with bounded channels.

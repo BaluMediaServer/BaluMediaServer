@@ -902,9 +902,11 @@ Console.WriteLine($"Connect to: rtsp://{localIP}:7778/live/back");
 - **Fix**: This is handled automatically since v1.5.17 — the encoder is pre-warmed at SETUP time. If you still experience this, ensure you're using the latest version
 
 **3. Video plays but is garbled or green**
-- **Symptom**: VLC connects and shows frames, but image is corrupted
-- **Cause**: SPS/PPS parameter sets not delivered before IDR frame
-- **Fix**: The server sends SPS/PPS before every keyframe and on first frame. Ensure your client requests a new DESCRIBE/SETUP/PLAY sequence rather than resuming a stale session
+- **Symptom**: VLC connects and shows frames, but image is corrupted (green bottom half)
+- **Possible causes**:
+  - **NV21 UV plane offset**: MediaTek cameras may produce oversized buffers (e.g., 1843198 bytes for 1280x720). The UV plane starts at `width * height` (declared dimensions), NOT at the end of the full buffer. Reading UV from the wrong offset causes green corruption. Fixed in v1.5.20.
+  - **Color format mismatch**: `COLOR_FormatYUV420Flexible` has undefined buffer layout for raw ByteBuffer writes. Use `COLOR_FormatYUV420SemiPlanar` (NV12) instead. Fixed in v1.5.20.
+  - **SPS/PPS not delivered**: The server sends SPS/PPS before every keyframe and on first frame. Ensure your client requests a new DESCRIBE/SETUP/PLAY sequence rather than resuming a stale session.
 
 #### H.264 Encoding Issues
 ```csharp
@@ -950,6 +952,18 @@ If the H.264 stream starts but freezes after a few seconds (while MJPEG continue
 - **Symptom**: Stream works briefly then stops, client appears disconnected
 - **Cause**: Aggressive timeout settings or premature client cleanup
 - **Fix**: The library uses graduated error counting (10 consecutive failures for TCP, 5 for UDP) and checks `IsPlaying` before marking clients as dead. Fixed since v1.5.16
+
+#### App Crashes After Hours of Streaming (SIGABRT)
+
+If the app crashes after hours of continuous streaming with `Cannot transition thread from RUNNING with DONE_BLOCKING` in the logs:
+
+**Root Cause**: Mono GC thread-state corruption triggered by BufferQueue starvation. The camera's ImageReader buffer slots fill up because frames are not released fast enough, causing JNI calls to block for 1+ seconds. While blocked, the Mono GC tries to transition the thread state and hits an invalid state machine transition, aborting the process.
+
+**Fix (v1.5.21)**: Camera services now marshal all Java `VideoFrame` data into managed `FrameEventArgs` in `OnFrameAvailable` (on the JNI callback thread) and recycle the native frame immediately. The processing thread (`ProcessFramesAsync`) operates entirely in managed code with zero JNI calls, eliminating the GC thread-state race window.
+
+**Complementary native AAR fix (v2.0.2)**: The native Kotlin library now calls `Image.close()` immediately after copying pixel data, before invoking the .NET callback, so ImageReader buffer slots are never held during slow callback execution.
+
+**Diagnostic**: Check logcat for `waitForFreeSlotThenRelock TIMED_OUT` on `ImageReader` — this indicates the BufferQueue is starved.
 
 #### Performance Optimization
 
@@ -1111,6 +1125,8 @@ Unit tests cover pure C# components. Android-dependent classes (camera services,
 - ✅ **H.264 thread safety fix and connection stability** (v1.5.15)
 - ✅ **H.264 stream freeze fix — MediaTek I-frame interval, RTP timestamps, client lifecycle** (v1.5.16)
 - ✅ **VLC compatibility — RFC-compliant RTSP/SDP, CRLF line endings, encoder pre-warming** (v1.5.17)
+- ✅ **H.264 green corruption fix — NV21 UV plane offset, NV12 color format, resolution change support** (v1.5.20)
+- ✅ **Long-running stability fix — JNI-free processing thread, immediate native frame release, bitrate fix, latency reduction** (v1.5.21)
 
 ### Planned (v1.6+)
 - ⬜ Fix image rotation on some devices
@@ -1169,6 +1185,21 @@ There are few (if any) options to integrate RTSP servers with Android using C# a
 -- Adding a preview (WIP) for video profiles allowing to create custom paths for this new profiles, will allow to set a custom resolution, bitrate and more.
 
 - v1.1.4: Adding auth option into CTOR of Server class, to enable or disable auth on stream rtsp, adding feature to determina video quality into mjpeg server
+
+- v1.5.21: **Long-Running Stability & Latency Fix** — Eliminates overnight SIGABRT crashes and reduces streaming latency.
+  - **JNI-free processing thread**: `BackCameraService` and `FrontCameraService` now marshal all `VideoFrame` data into managed `FrameEventArgs` in the `OnFrameAvailable` callback (JNI context) and recycle the native frame immediately. The `ProcessFramesAsync` thread makes zero JNI calls, preventing Mono GC thread-state corruption (`Cannot transition thread from RUNNING with DONE_BLOCKING`).
+  - **Channel type change**: Frame channels now hold `FrameEventArgs` (managed) instead of `VideoFrame` (Java object). `DropOldest` is safe again since dropped items have no native resources to leak.
+  - **Bitrate fix**: `SetParameters(PARAMETER_KEY_VIDEO_BITRATE)` was incorrectly passing `(int)BitrateMode.CbrFd` (value 3) instead of the actual bitrate (2 Mbps), causing extremely low quality. Now correctly passes `_bitrate`. Also moved `SetParameters` call to after `encoder.Start()` as required by MediaCodec API.
+  - **Latency reduction**: Encoder input queue reduced from 5 to 2 frames (80ms vs 200ms). Manager output queue reduced from 10 to 3 frames (120ms vs 400ms). MediaCodec dequeue timeouts reduced from 5ms to 1ms. Total pipeline latency reduced from ~650ms to ~240ms.
+  - **Native AAR v2.0.2**: `Image.close()` now called immediately after pixel copy (before callbacks), UV conversion uses bulk copy, queue capacity reduced from 100 to 5.
+
+- v1.5.20: **H.264 Green Corruption Fix** — Fixes green/corrupted image at higher resolutions on MediaTek devices.
+  - **NV21 UV plane offset fix**: MediaTek cameras produce oversized buffers (e.g., 1843198 bytes for 1280x720) but the UV plane starts at `width * height` (declared dimensions), not at the end of the buffer. The encoder was reading Y padding data as UV, causing green corruption in the bottom half of the image.
+  - **NV12 color format preference**: Changed from `COLOR_FormatYUV420Flexible` to `COLOR_FormatYUV420SemiPlanar` (NV12). Flexible format has undefined buffer layout for raw ByteBuffer writes — its internal plane offsets vary by resolution and vendor. NV12 guarantees Y at offset 0, UV interleaved at `stride * sliceHeight`.
+  - **Encoder sliceHeight=0 guard**: Some encoders return 0 for stride/sliceHeight meaning "same as configured". Added guard to prevent `dstYPlaneSize = 0` which would cause UV data to overwrite Y data.
+  - **Relaxed sliceHeight deduction**: Accept aligned sliceHeight values within 256 rows of the configured height, accommodating various encoder alignment requirements (16/32/64 boundary).
+  - **Resolution change support**: Added `ApplyResolutionChange()` pipeline — stops encoder, clears SPS/PPS, restarts camera at new resolution, disconnects affected clients, and pre-warms encoder.
+  - Fixed same UV offset bug in `CropAndDestrideFrame()` fallback path.
 
 - v1.5.17: **VLC Compatibility Release** — Full RFC 2326/4566 compliance for standards-compliant RTSP clients.
   - Case-insensitive RTSP header parsing (`StringComparer.OrdinalIgnoreCase`) — VLC may send headers with varying casing

@@ -125,6 +125,8 @@ Multiple lifecycle mechanisms (WatchDog, HandleClient, RTCP, TransportManager) w
 - Multiple MJPEG clients: Single encode shared across all clients
 - VLC/live555: Instant first-connect playback (encoder pre-warmed at SETUP)
 - Full RFC compliance: Works with any standards-compliant RTSP client
+- H.264 pipeline latency: ~240ms end-to-end (v1.5.21)
+- Long-running stability: 6+ hour continuous streaming without crash (v1.5.21)
 
 ### VLC Compatibility and RFC Compliance (v1.5.17)
 
@@ -192,6 +194,69 @@ Multiple lifecycle mechanisms (WatchDog, HandleClient, RTCP, TransportManager) w
 **Risk**: High potential for introducing bugs
 
 **Status**: Deferred - the three completed optimizations provide significant performance gains. ArrayPool can be added in a future release if GC pressure becomes an issue at very high resolutions (1080p+).
+
+### H.264 Green Corruption Fix (v1.5.20)
+
+**Problem**: H.264 video showed green corruption in the bottom half of the image at higher resolutions (e.g., 1280x720) on MediaTek devices.
+
+**Root Cause**: MediaTek cameras produce oversized NV21 buffers (e.g., 1843198 bytes for a 1280x720 frame). The code incorrectly assumed the extra bytes were additional Y rows (inferring 1280x960) and placed the UV read offset at `width * 960 = 1228800`. In reality, the NV21 UV plane starts at `width * height = 921600` (declared dimensions), and the extra bytes are buffer padding. This caused Y padding data to be read as UV chroma, producing green corruption.
+
+**Solution**:
+- Fixed `WriteFrameToEncoderBuffer()`: UV plane read offset uses `srcWidth * srcHeight` (declared height)
+- Fixed `CropAndDestrideFrame()`: Same UV offset fix in both fast path and general path
+- Changed color format preference from `COLOR_FormatYUV420Flexible` to `COLOR_FormatYUV420SemiPlanar` (NV12) — Flexible has undefined buffer layout for raw ByteBuffer writes
+- Added sliceHeight=0 guard to prevent UV overwriting Y when encoder returns 0
+
+**Files Changed**:
+- `RTSP/H264Encoder.cs` — UV offset fix, color format, sliceHeight guard, deduction bounds
+
+**Impact**:
+- ✅ Eliminated green corruption at all resolutions
+- ✅ Correct NV21→NV12 color conversion with proper plane offsets
+- ✅ Robust encoder buffer layout handling
+
+### Long-Running Stability & Latency Fix (v1.5.21)
+
+**Problem**: After ~561K frames (~6+ hours), the app crashed with `SIGABRT: Cannot transition thread from RUNNING with DONE_BLOCKING`. Root cause: Mono GC thread-state corruption triggered by JNI calls from a managed thread that the GC tried to suspend mid-transition. Additionally, the H.264 bitrate was incorrectly set to 3 bps instead of 2 Mbps, and pipeline buffering added ~650ms of unnecessary latency.
+
+**Root Causes and Fixes**:
+
+1. **JNI-Free Processing Thread (CRASH FIX)**
+   - Camera services (`BackCameraService`, `FrontCameraService`) previously held Java `VideoFrame` objects in a `Channel<VideoFrame>`, forcing the processing thread to cross the JNI boundary when reading frame data
+   - Changed to `Channel<FrameEventArgs>`: all Java object access (GetData, Width, Height, etc.) happens in `OnFrameAvailable` on the native callback thread (already in JNI context), native frame is recycled immediately, and only managed `FrameEventArgs` is written to the channel
+   - `ProcessFramesAsync` now makes ZERO JNI calls — purely managed code, immune to Mono GC thread-state corruption
+   - `DropOldest` is now safe since channel items are managed-only (no native resources to leak)
+
+2. **Bitrate Bug Fix (QUALITY FIX)**
+   - `bundle.PutInt(MediaCodec.ParameterKeyVideoBitrate, (int)BitrateMode.CbrFd)` was passing the enum value (~3) instead of the actual bitrate
+   - Fixed to `bundle.PutInt(MediaCodec.ParameterKeyVideoBitrate, _bitrate)` (2,000,000 bps)
+   - `SetParameters` moved after `encoder.Start()` as required by MediaCodec API
+
+3. **Latency Reduction (RESPONSIVENESS)**
+   - H264Encoder input queue: 5 → 2 frames (~120ms saved)
+   - H264EncoderManager output queue: 10 → 3 frames (~280ms saved)
+   - DequeueInputBuffer timeout: 5000μs → 1000μs
+   - DequeueOutputBuffer timeout: 5000μs → 1000μs
+   - Total pipeline latency reduced from ~650ms to ~240ms
+
+4. **Native AAR v2.0.2 Integration**
+   - `Image.close()` called before callback to prevent BufferQueue slot exhaustion
+   - Bulk UV plane copy replaces per-pixel iteration
+   - Native queue capacity reduced from 100 → 5 frames
+
+**Files Changed**:
+- `Services/BackCameraService.cs` — Channel<VideoFrame> → Channel<FrameEventArgs>, JNI-free processing
+- `Services/FrontCameraService.cs` — Same refactor as BackCameraService
+- `RTSP/H264Encoder.cs` — Bitrate fix, SetParameters ordering, reduced queue/timeouts
+- `RTSP/Streaming/H264EncoderManager.cs` — Output queue 10 → 3
+- `Jar/camerastreamer-release.aar` — Native AAR v2.0.2
+
+**Impact**:
+- ✅ Eliminated overnight SIGABRT crash (JNI-free processing thread)
+- ✅ H.264 quality restored (bitrate 3 bps → 2 Mbps)
+- ✅ Pipeline latency reduced from ~650ms to ~240ms
+- ✅ No native resource leaks from DropOldest channel policy
+- ✅ Native BufferQueue starvation prevented (Image.close before callback)
 
 ## Architecture Improvements
 

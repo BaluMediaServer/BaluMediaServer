@@ -122,7 +122,7 @@ public class H264Encoder : IDisposable
         // Concurrent JNI calls to MediaCodec from different threads can cause
         // vendor-specific stalls (especially on MediaTek).
         _frameChannel = Channel.CreateBounded<FrameData>(
-            new BoundedChannelOptions(5)
+            new BoundedChannelOptions(2)
             {
                 FullMode = BoundedChannelFullMode.DropOldest,
                 SingleReader = true,
@@ -518,17 +518,18 @@ public class H264Encoder : IDisposable
                 }
                 encoder.Configure(format, null, null, MediaCodecConfigFlags.Encode);
 
-                // Set bitrate mode after configuration if supported
+                // Now start the encoder
+                encoder.Start();
+
+                // Reinforce bitrate after Start() — SetParameters requires a started codec.
+                // The bitrate was already set in MediaFormat before Configure(), but some
+                // SoCs (MediaTek) may ignore it; this dynamic update ensures compliance.
                 if (Build.VERSION.SdkInt >= BuildVersionCodes.R)
                 {
                     var bundle = new Bundle();
-                    bundle.PutInt(MediaCodec.ParameterKeyVideoBitrate, 
-                        (int)BitrateMode.CbrFd);
+                    bundle.PutInt(MediaCodec.ParameterKeyVideoBitrate, _bitrate);
                     encoder.SetParameters(bundle);
                 }
-
-                // Now start the encoder
-                encoder.Start();
 
                 _encoder = encoder;
                 _isRunning = true;
@@ -798,6 +799,7 @@ public class H264Encoder : IDisposable
     /// </summary>
     /// <param name="frame">The frame data to encode.</param>
     private bool _loggedFirstFeed = false;
+    private bool _loggedFirstWriteFrame = false;
 
     public void FeedInputBuffer(FrameData frame)
     {
@@ -806,8 +808,8 @@ public class H264Encoder : IDisposable
 
         try
         {
-            // Wait up to 5ms for an input buffer (reduced for lower latency)
-            var inputIndex = _encoder.DequeueInputBuffer(5000);
+            // Wait up to 1ms for an input buffer (low latency)
+            var inputIndex = _encoder.DequeueInputBuffer(1000);
 
             if (inputIndex >= 0)
             {
@@ -859,14 +861,13 @@ public class H264Encoder : IDisposable
     /// <summary>
     /// Writes camera frame data directly to the encoder's input buffer.
     /// Handles all transformations in one pass:
-    /// 1. Crop from camera resolution (e.g., 1280x960 4:3) to encoder resolution (e.g., 1280x720 16:9)
-    /// 2. Convert NV21 (camera) → NV12 (encoder) by swapping V/U bytes
-    /// 3. Write with correct stride/sliceHeight layout for the encoder
+    /// 1. Convert NV21 (camera) → NV12 (encoder) by swapping V/U bytes
+    /// 2. Write with correct stride/sliceHeight layout for the encoder
     ///
-    /// MediaTek encoders often use sliceHeight matching the camera's actual height (e.g., 960)
-    /// even when configured for a smaller height (720). This means the UV plane starts at
-    /// stride * sliceHeight (e.g., 1280*960=1,228,800) instead of stride * height (1280*720=921,600).
-    /// Writing UV at the wrong offset causes green corruption in the bottom of the image.
+    /// Important: MediaTek cameras may produce oversized buffers (e.g., 1843198 bytes for
+    /// a 1280x720 frame) but the NV21 UV plane always starts at width * height — right after
+    /// the declared Y rows. The extra bytes are buffer padding, NOT extra Y rows.
+    /// Reading UV from the wrong offset (e.g., width * bufferHeight) causes green corruption.
     /// </summary>
     private int WriteFrameToEncoderBuffer(ByteBuffer inputBuffer, byte[] frameData,
         int srcWidth, int srcHeight)
@@ -874,23 +875,15 @@ public class H264Encoder : IDisposable
         int stride = _encoderStride;
         int sliceHeight = _encoderSliceHeight;
 
-        // Detect actual source height from frame data (MediaTek 4:3 camera quirk)
-        int actualSrcHeight = srcHeight;
-        int srcExpected = (srcWidth * srcHeight * 3) / 2;
-        if (frameData.Length > srcExpected && srcWidth > 0)
-        {
-            int h = (frameData.Length * 2 + srcWidth * 3 - 1) / (srcWidth * 3);
-            if (h % 2 != 0) h++;
-            int check = (srcWidth * h * 3) / 2;
-            if (Math.Abs(check - frameData.Length) <= 16 && h > srcHeight)
-                actualSrcHeight = h;
-        }
-
         // Source data layout (NV21):
-        // Y plane: srcWidth * actualSrcHeight bytes at offset 0
-        // VU plane: srcWidth * (actualSrcHeight/2) bytes at offset srcWidth * actualSrcHeight
+        // Y plane: srcWidth * srcHeight bytes at offset 0
+        // VU plane: srcWidth * (srcHeight/2) bytes at offset srcWidth * srcHeight
+        // Note: MediaTek cameras may produce oversized buffers (e.g., 1843198 bytes for
+        // 1280x720) but the UV plane always starts right after srcHeight rows of Y,
+        // NOT after the full buffer. The extra bytes are buffer padding.
+        int actualSrcHeight = srcHeight;
         int srcYStride = srcWidth;
-        int srcUvStart = srcWidth * actualSrcHeight;
+        int srcUvStart = srcWidth * srcHeight;
 
         // Encoder buffer layout (NV12):
         // Y plane: stride * sliceHeight bytes at offset 0
@@ -916,17 +909,19 @@ public class H264Encoder : IDisposable
             }
         }
 
-        if (!_loggedFirstFeed)
+        if (!_loggedFirstWriteFrame)
         {
-            Log.Info("H264", $"WriteFrame: srcActual={srcWidth}x{actualSrcHeight}, encoder={_width}x{_height}, stride={stride}, slice={sliceHeight}, bufCap={inputBuffer.Capacity()}, dstTotal={totalDstSize}");
+            _loggedFirstWriteFrame = true;
+            Log.Info("H264", $"WriteFrame: src={srcWidth}x{srcHeight}, encoder={_width}x{_height}, stride={stride}, slice={sliceHeight}, bufCap={inputBuffer.Capacity()}, srcUvStart={srcUvStart}, dstYPlane={dstYPlaneSize}, frameLen={frameData.Length}");
         }
 
         int copyWidth = Math.Min(srcWidth, _width);
         int copyHeight = Math.Min(actualSrcHeight, _height);
 
-        // Build the output in a byte array matching the encoder's expected layout
-        // This is more reliable than seeking in the ByteBuffer
-        byte[] encoderData = new byte[Math.Min(totalDstSize, inputBuffer.Capacity())];
+        // Build the output in a pooled byte array matching the encoder's expected layout
+        int encoderDataSize = Math.Min(totalDstSize, inputBuffer.Capacity());
+        byte[] encoderData = _bufferPool.Rent(encoderDataSize);
+        Array.Clear(encoderData, 0, encoderDataSize);
 
         // Copy Y plane: crop top-left of source into encoder layout
         for (int row = 0; row < copyHeight; row++)
@@ -934,7 +929,7 @@ public class H264Encoder : IDisposable
             int srcOff = row * srcYStride;
             int dstOff = row * stride;
             if (srcOff + copyWidth > frameData.Length) break;
-            if (dstOff + copyWidth > encoderData.Length) break;
+            if (dstOff + copyWidth > encoderDataSize) break;
             System.Buffer.BlockCopy(frameData, srcOff, encoderData, dstOff, copyWidth);
         }
 
@@ -946,7 +941,7 @@ public class H264Encoder : IDisposable
             int srcOff = srcUvStart + row * srcYStride;
             int dstOff = dstYPlaneSize + row * stride;
             if (srcOff + copyUvWidth > frameData.Length) break;
-            if (dstOff + copyUvWidth > encoderData.Length) break;
+            if (dstOff + copyUvWidth > encoderDataSize) break;
             // Swap V,U → U,V while copying
             for (int i = 0; i < copyUvWidth - 1; i += 2)
             {
@@ -955,15 +950,17 @@ public class H264Encoder : IDisposable
             }
         }
 
-        int writeSize = Math.Min(encoderData.Length, inputBuffer.Capacity());
+        int writeSize = Math.Min(encoderDataSize, inputBuffer.Capacity());
         inputBuffer.Put(encoderData, 0, writeSize);
+        _bufferPool.Return(encoderData);
         return writeSize;
     }
 
     /// <summary>
     /// Crops and de-strides a YUV420/NV21 frame from source resolution to encoder resolution.
-    /// Handles both stride padding (row stride > image width) and resolution mismatch
-    /// (camera resolution differs from encoder resolution) by doing row-by-row copies.
+    /// Handles stride padding (row stride > image width) by doing row-by-row copies.
+    /// The NV21 UV plane is always at offset width * height (declared dimensions),
+    /// even when the buffer is oversized (e.g., MediaTek padding).
     /// </summary>
     private byte[] CropAndDestrideFrame(byte[] frameData, int srcWidth, int srcHeight, int dstWidth, int dstHeight)
     {
@@ -983,51 +980,27 @@ public class H264Encoder : IDisposable
             return padded;
         }
 
-        // Determine if extra data is from stride padding (wider rows) or extra height (taller frame).
-        // MediaTek cameras often produce 4:3 frames regardless of requested 16:9 resolution,
-        // e.g. request 1280x720 → get 1280x960, request 1920x1080 → get 1920x1440.
+        // Detect stride padding (wider rows) from oversized buffers.
+        // Note: MediaTek cameras may produce oversized buffers (e.g., 1843198 bytes for
+        // 1280x720) but the NV21 UV plane always starts at width * height. The extra bytes
+        // are buffer padding, NOT extra Y rows. Do not inflate actualSrcHeight.
         int srcStride = srcWidth;
         int actualSrcHeight = srcHeight;
         int expectedSize = (srcWidth * srcHeight * 3) / 2;
 
         if (frameData.Length > expectedSize)
         {
-            // Hypothesis 1: Extra height — camera produced more rows than reported
-            // Round UP to avoid truncation (e.g., 1843198*2/3840 = 959.999 → must be 960)
-            // and ensure even height (YUV420 requires even height for half-height UV plane)
-            int heightFromData = (frameData.Length * 2 + srcWidth * 3 - 1) / (srcWidth * 3);
-            if (heightFromData % 2 != 0) heightFromData++;
-            int sizeFromHeight = (srcWidth * heightFromData * 3) / 2;
-
-            // Hypothesis 2: Extra stride — rows have padding bytes
+            // Check if extra data is from stride padding (wider rows)
             int totalRows = srcHeight + srcHeight / 2;
             int strideFromData = totalRows > 0 ? (frameData.Length + totalRows - 1) / totalRows : srcWidth;
             int sizeFromStride = (strideFromData * srcHeight * 3) / 2;
-
-            bool heightFits = Math.Abs(sizeFromHeight - frameData.Length) <= 16 && heightFromData > srcHeight;
             bool strideFits = Math.Abs(sizeFromStride - frameData.Length) <= 16 && strideFromData > srcWidth;
 
-            if (heightFits && (!strideFits || strideFromData % 16 != 0))
-            {
-                // Extra height (MediaTek 4:3 pattern) — no stride padding
-                actualSrcHeight = heightFromData;
-                srcStride = srcWidth;
-            }
-            else if (strideFits)
-            {
-                // Extra stride — row padding
-                srcStride = strideFromData;
-            }
-            else if (heightFromData >= dstHeight)
-            {
-                // Neither matches cleanly, prefer height if usable
-                actualSrcHeight = heightFromData;
-                srcStride = srcWidth;
-            }
-            else
+            if (strideFits)
             {
                 srcStride = strideFromData;
             }
+            // Otherwise: oversized buffer with no stride padding — use declared dimensions
         }
 
         // Sanity check: stride should be >= source width
@@ -1044,15 +1017,15 @@ public class H264Encoder : IDisposable
         if (srcStride == dstWidth && actualSrcHeight == dstHeight && frameData.Length == dstSize)
             return frameData;
 
-        // Fast path: no stride padding and width matches — contiguous crop (just trim extra height)
+        // Fast path: no stride padding and width matches — contiguous crop
         if (srcStride == dstWidth && srcWidth == dstWidth && actualSrcHeight >= dstHeight)
         {
             byte[] result = new byte[dstSize];
             // Copy Y plane: first dstHeight rows contiguously
             int yBytes = dstWidth * dstHeight;
             System.Buffer.BlockCopy(frameData, 0, result, 0, yBytes);
-            // Copy UV plane: starts at srcWidth * actualSrcHeight in source
-            int srcUvStart = srcWidth * actualSrcHeight;
+            // Copy UV plane: starts at srcWidth * srcHeight (declared height, not buffer height)
+            int srcUvStart = srcWidth * srcHeight;
             int uvBytes = dstWidth * (dstHeight / 2);
             if (srcUvStart + uvBytes <= frameData.Length)
             {
@@ -1079,10 +1052,10 @@ public class H264Encoder : IDisposable
             }
 
             // Copy VU plane (NV21 interleaved): row by row, taking top-left crop
-            // VU plane starts after Y plane in source (stride * actualSrcHeight)
-            int srcUvStart = srcStride * actualSrcHeight;
+            // VU plane starts at srcStride * srcHeight (declared height, not buffer height)
+            int srcUvStart = srcStride * srcHeight;
             int dstUvStart = dstWidth * dstHeight;
-            int copyUvHeight = Math.Min(actualSrcHeight / 2, dstHeight / 2);
+            int copyUvHeight = Math.Min(srcHeight / 2, dstHeight / 2);
             int copyUvWidth = (copyWidth / 2) * 2;
 
             srcOffset = srcUvStart;
@@ -1142,8 +1115,8 @@ public class H264Encoder : IDisposable
 
         try
         {
-            // Wait up to 5ms for output (reduced for lower latency)
-            var outputIndex = _encoder.DequeueOutputBuffer(bufferInfo, 5000);
+            // Wait up to 1ms for output (low latency)
+            var outputIndex = _encoder.DequeueOutputBuffer(bufferInfo, 1000);
             
             if (outputIndex >= 0)
             {
