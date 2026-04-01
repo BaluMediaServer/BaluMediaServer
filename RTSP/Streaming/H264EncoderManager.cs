@@ -6,9 +6,9 @@ using BaluMediaServer.Services;
 namespace BaluMediaServer.RTSP.Streaming;
 
 /// <summary>
-/// Manages H.264 encoder lifecycle and frame queues for front and back cameras.
-/// Handles encoder start/stop, frame buffering, and SPS/PPS caching.
-/// Uses Channels for efficient, event-driven frame delivery.
+/// Manages H.264 encoder lifecycle and per-client frame channels for front and back cameras.
+/// Uses a fan-out model: each encoded frame is written to every registered client's own channel,
+/// so all clients receive every frame independently (no round-robin starvation).
 /// </summary>
 public class H264EncoderManager : IH264EncoderManager
 {
@@ -17,9 +17,13 @@ public class H264EncoderManager : IH264EncoderManager
     private readonly object _h264FrontLock = new();
     private readonly object _h264BackLock = new();
 
-    // Event-driven frame channels (replaces ConcurrentQueue polling)
-    private readonly Channel<H264FrameEventArgs> _h264FrameChannelBack;
-    private readonly Channel<H264FrameEventArgs> _h264FrameChannelFront;
+    // Per-client channels: one bounded channel per registered client per camera.
+    // The encoder fan-out writes each frame into every client's channel simultaneously,
+    // so N clients each receive all frames rather than competing for 1/N of them.
+    private readonly Dictionary<string, Channel<H264FrameEventArgs>> _backClientChannels = new();
+    private readonly Dictionary<string, Channel<H264FrameEventArgs>> _frontClientChannels = new();
+    private readonly object _backClientChannelsLock = new();
+    private readonly object _frontClientChannelsLock = new();
 
     private int _h264BackEncoderExpectedFrameSize = 0;
     private int _h264FrontEncoderExpectedFrameSize = 0;
@@ -29,36 +33,61 @@ public class H264EncoderManager : IH264EncoderManager
     private byte[]? _currentPps;
     private readonly object _spsPpsLock = new();
 
-    // Maximum encoded frames to buffer before dropping.
-    // Lower values reduce latency; DropOldest ensures we never stall.
-    // At 25fps: 3 frames = 120ms max buffering delay.
+    // Per-client buffer: 3 frames at 25fps = 120ms max buffering delay.
+    // DropOldest ensures slow clients never stall the fan-out loop.
     private const int MaxH264QueueSize = 3;
-
-    /// <summary>
-    /// Initializes a new instance of H264EncoderManager with bounded channels.
-    /// </summary>
-    public H264EncoderManager()
-    {
-        // Create bounded channels with DropOldest policy to prevent memory buildup
-        _h264FrameChannelBack = Channel.CreateBounded<H264FrameEventArgs>(
-            new BoundedChannelOptions(MaxH264QueueSize)
-            {
-                FullMode = BoundedChannelFullMode.DropOldest,
-                SingleReader = false,
-                SingleWriter = false
-            });
-
-        _h264FrameChannelFront = Channel.CreateBounded<H264FrameEventArgs>(
-            new BoundedChannelOptions(MaxH264QueueSize)
-            {
-                FullMode = BoundedChannelFullMode.DropOldest,
-                SingleReader = false,
-                SingleWriter = false
-            });
-    }
 
     /// <inheritdoc/>
     public event EventHandler<H264FrameEventArgs>? FrameEncoded;
+
+    /// <inheritdoc/>
+    public void RegisterClientChannel(int cameraId, string clientId)
+    {
+        var channel = Channel.CreateBounded<H264FrameEventArgs>(
+            new BoundedChannelOptions(MaxH264QueueSize)
+            {
+                FullMode = BoundedChannelFullMode.DropOldest,
+                SingleReader = true,
+                SingleWriter = false
+            });
+
+        if (cameraId == 1)
+        {
+            lock (_frontClientChannelsLock) { _frontClientChannels[clientId] = channel; }
+        }
+        else
+        {
+            lock (_backClientChannelsLock) { _backClientChannels[clientId] = channel; }
+        }
+        Log.Debug("[EncoderManager]", $"Registered frame channel for client {clientId} camera {cameraId}");
+    }
+
+    /// <inheritdoc/>
+    public void UnregisterClientChannel(int cameraId, string clientId)
+    {
+        Channel<H264FrameEventArgs>? channel = null;
+
+        if (cameraId == 1)
+        {
+            lock (_frontClientChannelsLock)
+            {
+                _frontClientChannels.TryGetValue(clientId, out channel);
+                _frontClientChannels.Remove(clientId);
+            }
+        }
+        else
+        {
+            lock (_backClientChannelsLock)
+            {
+                _backClientChannels.TryGetValue(clientId, out channel);
+                _backClientChannels.Remove(clientId);
+            }
+        }
+
+        // Complete the writer so any awaiting ReadAsync gets ChannelClosedException
+        channel?.Writer.TryComplete();
+        Log.Debug("[EncoderManager]", $"Unregistered frame channel for client {clientId} camera {cameraId}");
+    }
 
     /// <inheritdoc/>
     public void StartEncoder(int cameraId, int width, int height, int frameSize = 0)
@@ -92,11 +121,12 @@ public class H264EncoderManager : IH264EncoderManager
             {
                 Log.Info("[EncoderManager]", "Back encoder stalled — restarting");
                 _h264BackEncoder.FrameEncoded -= OnH264BackFrameEncoded;
-                try { _h264BackEncoder.Dispose(); } catch { }
+                var staleBackEncoder = _h264BackEncoder;
                 _h264BackEncoder = null;
+                _ = Task.Run(() => { try { staleBackEncoder.Dispose(); } catch { } });
 
-                // Drain stale frames from the old encoder session
-                while (_h264FrameChannelBack.Reader.TryRead(out _)) { }
+                // Drain stale frames from all registered client channels
+                DrainClientChannels(_backClientChannels, _backClientChannelsLock);
             }
 
             if (_h264BackEncoder == null)
@@ -144,11 +174,12 @@ public class H264EncoderManager : IH264EncoderManager
             {
                 Log.Info("[EncoderManager]", "Front encoder stalled — restarting");
                 _h264FrontEncoder.FrameEncoded -= OnH264FrontFrameEncoded;
-                try { _h264FrontEncoder.Dispose(); } catch { }
+                var staleFrontEncoder = _h264FrontEncoder;
                 _h264FrontEncoder = null;
+                _ = Task.Run(() => { try { staleFrontEncoder.Dispose(); } catch { } });
 
-                // Drain stale frames from the old encoder session
-                while (_h264FrameChannelFront.Reader.TryRead(out _)) { }
+                // Drain stale frames from all registered client channels
+                DrainClientChannels(_frontClientChannels, _frontClientChannelsLock);
             }
 
             if (_h264FrontEncoder == null)
@@ -211,12 +242,7 @@ public class H264EncoderManager : IH264EncoderManager
                 _h264BackEncoder.Dispose();
                 _h264BackEncoder = null;
                 _h264BackEncoderExpectedFrameSize = 0;
-
-                // Drain stale frames from the channel to prevent old-session frames
-                // from being delivered to clients after the encoder restarts
-                while (_h264FrameChannelBack.Reader.TryRead(out _)) { }
-
-                Log.Info("[EncoderManager]", "H264 back encoder stopped and channel drained");
+                Log.Info("[EncoderManager]", "H264 back encoder stopped");
             }
         }
     }
@@ -232,12 +258,7 @@ public class H264EncoderManager : IH264EncoderManager
                 _h264FrontEncoder.Dispose();
                 _h264FrontEncoder = null;
                 _h264FrontEncoderExpectedFrameSize = 0;
-
-                // Drain stale frames from the channel to prevent old-session frames
-                // from being delivered to clients after the encoder restarts
-                while (_h264FrameChannelFront.Reader.TryRead(out _)) { }
-
-                Log.Info("[EncoderManager]", "H264 front encoder stopped and channel drained");
+                Log.Info("[EncoderManager]", "H264 front encoder stopped");
             }
         }
     }
@@ -253,16 +274,23 @@ public class H264EncoderManager : IH264EncoderManager
     }
 
     /// <inheritdoc/>
-    public bool TryDequeueFrame(int cameraId, out H264FrameEventArgs? frame)
+    public bool TryDequeueFrame(int cameraId, string clientId, out H264FrameEventArgs? frame)
     {
-        var channel = cameraId == 1 ? _h264FrameChannelFront : _h264FrameChannelBack;
-        return channel.Reader.TryRead(out frame);
+        Channel<H264FrameEventArgs>? channel = GetClientChannel(cameraId, clientId);
+        if (channel != null)
+            return channel.Reader.TryRead(out frame);
+
+        frame = null;
+        return false;
     }
 
     /// <inheritdoc/>
-    public async ValueTask<H264FrameEventArgs> DequeueFrameAsync(int cameraId, CancellationToken cancellationToken)
+    public async ValueTask<H264FrameEventArgs> DequeueFrameAsync(int cameraId, string clientId, CancellationToken cancellationToken)
     {
-        var channel = cameraId == 1 ? _h264FrameChannelFront : _h264FrameChannelBack;
+        Channel<H264FrameEventArgs>? channel = GetClientChannel(cameraId, clientId);
+        if (channel == null)
+            throw new ChannelClosedException($"No channel registered for client {clientId} camera {cameraId}");
+
         return await channel.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -337,6 +365,19 @@ public class H264EncoderManager : IH264EncoderManager
         return _h264BackEncoderExpectedFrameSize;
     }
 
+    /// <inheritdoc/>
+    public void RequestKeyFrame(int cameraId)
+    {
+        if (cameraId == 1)
+        {
+            lock (_h264FrontLock) { _h264FrontEncoder?.RequestKeyFrame(); }
+        }
+        else
+        {
+            lock (_h264BackLock) { _h264BackEncoder?.RequestKeyFrame(); }
+        }
+    }
+
     /// <summary>
     /// Clears the SPS/PPS cache.
     /// </summary>
@@ -351,38 +392,32 @@ public class H264EncoderManager : IH264EncoderManager
 
     private void OnH264FrontFrameEncoded(object? sender, H264FrameEventArgs e)
     {
-        // Update global SPS/PPS cache for SDP generation
         UpdateSpsPpsCache(e);
 
-        // Write to channel (bounded channel with DropOldest automatically handles overflow)
-        _h264FrameChannelFront.Writer.TryWrite(e);
+        // Fan-out: deliver this frame to every registered front-camera client
+        lock (_frontClientChannelsLock)
+        {
+            foreach (var ch in _frontClientChannels.Values)
+                ch.Writer.TryWrite(e);
+        }
 
-        try
-        {
-            FrameEncoded?.Invoke(this, e);
-        }
-        catch (Exception ex)
-        {
-            Android.Util.Log.Error("H264EncoderManager", $"FrameEncoded subscriber error: {ex.Message}");
-        }
+        try { FrameEncoded?.Invoke(this, e); }
+        catch (Exception ex) { Android.Util.Log.Error("H264EncoderManager", $"FrameEncoded subscriber error: {ex.Message}"); }
     }
 
     private void OnH264BackFrameEncoded(object? sender, H264FrameEventArgs e)
     {
-        // Update global SPS/PPS cache for SDP generation
         UpdateSpsPpsCache(e);
 
-        // Write to channel (bounded channel with DropOldest automatically handles overflow)
-        _h264FrameChannelBack.Writer.TryWrite(e);
+        // Fan-out: deliver this frame to every registered back-camera client
+        lock (_backClientChannelsLock)
+        {
+            foreach (var ch in _backClientChannels.Values)
+                ch.Writer.TryWrite(e);
+        }
 
-        try
-        {
-            FrameEncoded?.Invoke(this, e);
-        }
-        catch (Exception ex)
-        {
-            Android.Util.Log.Error("H264EncoderManager", $"FrameEncoded subscriber error: {ex.Message}");
-        }
+        try { FrameEncoded?.Invoke(this, e); }
+        catch (Exception ex) { Android.Util.Log.Error("H264EncoderManager", $"FrameEncoded subscriber error: {ex.Message}"); }
     }
 
     private void UpdateSpsPpsCache(H264FrameEventArgs e)
@@ -394,6 +429,35 @@ public class H264EncoderManager : IH264EncoderManager
                 if (e.Sps != null) _currentSps = e.Sps;
                 if (e.Pps != null) _currentPps = e.Pps;
             }
+        }
+    }
+
+    private Channel<H264FrameEventArgs>? GetClientChannel(int cameraId, string clientId)
+    {
+        if (cameraId == 1)
+        {
+            lock (_frontClientChannelsLock)
+            {
+                _frontClientChannels.TryGetValue(clientId, out var ch);
+                return ch;
+            }
+        }
+        else
+        {
+            lock (_backClientChannelsLock)
+            {
+                _backClientChannels.TryGetValue(clientId, out var ch);
+                return ch;
+            }
+        }
+    }
+
+    private static void DrainClientChannels(Dictionary<string, Channel<H264FrameEventArgs>> channels, object lockObj)
+    {
+        lock (lockObj)
+        {
+            foreach (var ch in channels.Values)
+                while (ch.Reader.TryRead(out _)) { }
         }
     }
 

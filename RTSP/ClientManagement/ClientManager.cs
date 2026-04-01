@@ -12,8 +12,8 @@ namespace BaluMediaServer.RTSP.ClientManagement;
 public class ClientManager : IClientManager
 {
     private readonly ConcurrentDictionary<string, Client> _clients = new();
-    private readonly Dictionary<string, byte[]?> _clientSpsCache = new();
-    private readonly Dictionary<string, byte[]?> _clientPpsCache = new();
+    private readonly ConcurrentDictionary<string, byte[]?> _clientSpsCache = new();
+    private readonly ConcurrentDictionary<string, byte[]?> _clientPpsCache = new();
     private readonly ConcurrentDictionary<string, FramePacer> _clientPacers = new();
     private readonly ITransportManager _transportManager;
 
@@ -102,8 +102,8 @@ public class ClientManager : IClientManager
                 client.IsPlaying = false;
 
                 _transportManager.ReleaseClientPorts(client);
-                _clientSpsCache.Remove(client.Id);
-                _clientPpsCache.Remove(client.Id);
+                _clientSpsCache.TryRemove(client.Id, out _);
+                _clientPpsCache.TryRemove(client.Id, out _);
                 _clientPacers.TryRemove(client.Id, out _);
                 _clients.TryRemove(client.Id, out _);
                 client.Dispose();
@@ -172,8 +172,8 @@ public class ClientManager : IClientManager
                 lock (client)
                 {
                     _transportManager.ReleaseClientPorts(client);
-                    _clientSpsCache.Remove(client.Id);
-                    _clientPpsCache.Remove(client.Id);
+                    _clientSpsCache.TryRemove(client.Id, out _);
+                    _clientPpsCache.TryRemove(client.Id, out _);
                     _clientPacers.TryRemove(client.Id, out _);
                     _clients.TryRemove(client.Id, out _);
                     client.Dispose();

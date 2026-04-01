@@ -25,34 +25,7 @@ public class RtpPacketBuilder : IRtpPacketBuilder
     public byte[] CreateRtpPacket(Client client, byte[] payload, uint timestamp, bool marker, byte payloadType)
     {
         var packet = new byte[12 + payload.Length];
-        packet[0] = 0x80; // V=2, P=0, X=0, CC=0
-        packet[1] = (byte)(marker ? 0x80 | payloadType : payloadType);
-
-        // Atomically read and increment sequence number to prevent race conditions
-        ushort seqNum;
-        lock (client)
-        {
-            seqNum = client.SequenceNumber++;
-            // Track last RTP timestamp and packet/octet counts for RTCP Sender Reports
-            client.LastRtpTimestampSent = timestamp;
-            client.PacketCount++;
-            client.OctetCount += (uint)payload.Length;
-        }
-        packet[2] = (byte)(seqNum >> 8);
-        packet[3] = (byte)(seqNum & 0xFF);
-
-        // Use the provided timestamp for all fragments
-        packet[4] = (byte)(timestamp >> 24);
-        packet[5] = (byte)(timestamp >> 16);
-        packet[6] = (byte)(timestamp >> 8);
-        packet[7] = (byte)(timestamp & 0xFF);
-
-        // SSRC
-        packet[8] = (byte)(client.SsrcId >> 24);
-        packet[9] = (byte)(client.SsrcId >> 16);
-        packet[10] = (byte)(client.SsrcId >> 8);
-        packet[11] = (byte)(client.SsrcId & 0xFF);
-
+        WriteRtpHeader(client, packet, timestamp, marker, payloadType, payload.Length);
         Buffer.BlockCopy(payload, 0, packet, 12, payload.Length);
         return packet;
     }
@@ -75,20 +48,16 @@ public class RtpPacketBuilder : IRtpPacketBuilder
 
         if (nalLength <= MaxPayloadSize)
         {
-            // Single NAL unit mode
-            var payload = new byte[nalLength];
-            Buffer.BlockCopy(nalUnit, nalStart, payload, 0, nalLength);
-            bool marker = lastFrame;
-            var rtpPacket = CreateRtpPacket(client, payload, nalTimestamp, marker, 96);
-
+            // Single NAL unit — build RTP packet directly from source, no intermediate payload copy
+            var rtpPacket = BuildRtpPacket(client, nalUnit, nalStart, nalLength, nalTimestamp, lastFrame, 96);
             await _transportManager.SendDataAsync(client, rtpPacket).ConfigureAwait(false);
         }
         else
         {
-            // FU-A fragmentation
+            // FU-A fragmentation — build each RTP packet inline, no intermediate payload buffer
             byte nalHeader = nalUnit[nalStart];
             byte nalType = (byte)(nalHeader & 0x1F);
-            byte nalNri = (byte)(nalHeader & 0x60);
+            byte fuIndicator = (byte)((nalHeader & 0x60) | 28); // NRI preserved, type=28 (FU-A)
 
             int dataOffset = nalStart + 1;
             int remainingData = nalLength - 1;
@@ -99,15 +68,17 @@ public class RtpPacketBuilder : IRtpPacketBuilder
                 int fragmentSize = Math.Min(MaxPayloadSize - 2, remainingData);
                 bool isLastFragment = fragmentSize == remainingData;
                 bool marker = lastFrame && isLastFragment;
-                var payload = new byte[fragmentSize + 2];
-                payload[0] = (byte)(nalNri | 28); // FU-A
-                payload[1] = nalType;
-                if (isFirstFragment) payload[1] |= 0x80; // Start bit
-                if (isLastFragment) payload[1] |= 0x40;  // End bit
 
-                Buffer.BlockCopy(nalUnit, dataOffset, payload, 2, fragmentSize);
+                byte fuHeader = nalType;
+                if (isFirstFragment) fuHeader |= 0x80; // Start bit
+                if (isLastFragment) fuHeader |= 0x40;  // End bit
 
-                var rtpPacket = CreateRtpPacket(client, payload, nalTimestamp, marker, 96);
+                // Allocate one packet: 12 (RTP header) + 2 (FU indicator + FU header) + fragment
+                var rtpPacket = new byte[14 + fragmentSize];
+                WriteRtpHeader(client, rtpPacket, nalTimestamp, marker, 96, 2 + fragmentSize);
+                rtpPacket[12] = fuIndicator;
+                rtpPacket[13] = fuHeader;
+                Buffer.BlockCopy(nalUnit, dataOffset, rtpPacket, 14, fragmentSize);
 
                 await _transportManager.SendDataAsync(client, rtpPacket).ConfigureAwait(false);
                 dataOffset += fragmentSize;
@@ -115,6 +86,47 @@ public class RtpPacketBuilder : IRtpPacketBuilder
                 isFirstFragment = false;
             }
         }
+    }
+
+    /// <summary>
+    /// Builds an RTP packet by copying directly from a source byte array at a given offset,
+    /// eliminating the need for an intermediate payload buffer.
+    /// </summary>
+    private byte[] BuildRtpPacket(Client client, byte[] sourceData, int srcOffset, int srcLength, uint timestamp, bool marker, byte payloadType)
+    {
+        var packet = new byte[12 + srcLength];
+        WriteRtpHeader(client, packet, timestamp, marker, payloadType, srcLength);
+        Buffer.BlockCopy(sourceData, srcOffset, packet, 12, srcLength);
+        return packet;
+    }
+
+    /// <summary>
+    /// Writes the 12-byte RTP fixed header into a pre-allocated buffer and updates per-packet counters.
+    /// Caller is responsible for writing the payload starting at offset 12.
+    /// </summary>
+    private void WriteRtpHeader(Client client, byte[] packet, uint timestamp, bool marker, byte payloadType, int payloadLength)
+    {
+        packet[0] = 0x80; // V=2, P=0, X=0, CC=0
+        packet[1] = (byte)(marker ? 0x80 | payloadType : payloadType);
+
+        ushort seqNum;
+        lock (client)
+        {
+            seqNum = client.SequenceNumber++;
+            client.LastRtpTimestampSent = timestamp;
+            client.PacketCount++;
+            client.OctetCount += (uint)payloadLength;
+        }
+        packet[2] = (byte)(seqNum >> 8);
+        packet[3] = (byte)(seqNum & 0xFF);
+        packet[4] = (byte)(timestamp >> 24);
+        packet[5] = (byte)(timestamp >> 16);
+        packet[6] = (byte)(timestamp >> 8);
+        packet[7] = (byte)(timestamp & 0xFF);
+        packet[8]  = (byte)(client.SsrcId >> 24);
+        packet[9]  = (byte)(client.SsrcId >> 16);
+        packet[10] = (byte)(client.SsrcId >> 8);
+        packet[11] = (byte)(client.SsrcId & 0xFF);
     }
 
     /// <inheritdoc/>
@@ -196,37 +208,14 @@ public class RtpPacketBuilder : IRtpPacketBuilder
     }
 
     /// <summary>
-    /// Creates an RTP packet using the client's RtpTimestamp property.
+    /// Creates an RTP packet using the client's RtpTimestamp property (used by MJPEG).
     /// </summary>
     private byte[] CreateRtpPacketOld(Client client, byte[] payload, bool marker, byte payloadType)
     {
+        uint ts;
+        lock (client) { ts = client.RtpTimestamp; }
         var packet = new byte[12 + payload.Length];
-        packet[0] = 0x80; // V=2, P=0, X=0, CC=0
-        packet[1] = (byte)(marker ? 0x80 | payloadType : payloadType);
-
-        ushort seqNum;
-        lock (client)
-        {
-            seqNum = client.SequenceNumber++;
-            client.PacketCount++;
-            client.OctetCount += (uint)payload.Length;
-
-            packet[2] = (byte)(seqNum >> 8);
-            packet[3] = (byte)(seqNum & 0xFF);
-
-            // Timestamp (client-specific)
-            packet[4] = (byte)(client.RtpTimestamp >> 24);
-            packet[5] = (byte)(client.RtpTimestamp >> 16);
-            packet[6] = (byte)(client.RtpTimestamp >> 8);
-            packet[7] = (byte)(client.RtpTimestamp & 0xFF);
-
-            // SSRC (client-specific)
-            packet[8] = (byte)(client.SsrcId >> 24);
-            packet[9] = (byte)(client.SsrcId >> 16);
-            packet[10] = (byte)(client.SsrcId >> 8);
-            packet[11] = (byte)(client.SsrcId & 0xFF);
-        }
-
+        WriteRtpHeader(client, packet, ts, marker, payloadType, payload.Length);
         Buffer.BlockCopy(payload, 0, packet, 12, payload.Length);
         return packet;
     }

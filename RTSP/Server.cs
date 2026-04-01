@@ -972,7 +972,9 @@ public class Server : IDisposable
                 }
                 catch (IOException)
                 {
-                    // Socket closed or reset by client
+                    // Socket closed or reset by client — signal streaming task to stop immediately
+                    // so it doesn't linger waiting for 10 consecutive send errors
+                    if (client != null) lock (client) { client.IsPlaying = false; }
                     break;
                 }
                 catch (ObjectDisposedException)
@@ -984,6 +986,8 @@ public class Server : IDisposable
                 if (requestLine == null)
                 {
                     Log.Info("[RTSP Server]", $"Client {client.Id} disconnected (end of stream)");
+                    // Signal streaming task to stop immediately rather than waiting for 10 send errors
+                    if (client != null) lock (client) { client.IsPlaying = false; }
                     break;
                 }
 

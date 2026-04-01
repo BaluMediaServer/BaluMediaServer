@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Net.Sockets;
 using Android.Util;
 using BaluMediaServer.Models;
@@ -66,112 +67,122 @@ public class TransportManager : ITransportManager
     /// <inheritdoc/>
     public async Task<bool> SendInterleavedDataAsync(Socket socket, byte channel, byte[] rtpPacket, Client? client = null)
     {
-        var frame = new byte[4 + rtpPacket.Length];
-        frame[0] = 0x24; // $ magic byte
-        frame[1] = channel;
-        frame[2] = (byte)(rtpPacket.Length >> 8);
-        frame[3] = (byte)(rtpPacket.Length & 0xFF);
-        Buffer.BlockCopy(rtpPacket, 0, frame, 4, rtpPacket.Length);
-
+        // Use ArrayPool to avoid per-packet heap allocation for the 4-byte RTSP framing header.
+        // The pooled buffer is returned after the send completes (safe because SendAsync is awaited).
+        int frameSize = 4 + rtpPacket.Length;
+        var frame = ArrayPool<byte>.Shared.Rent(frameSize);
         try
         {
-            if (socket?.Connected ?? false)
+            frame[0] = 0x24; // $ magic byte
+            frame[1] = channel;
+            frame[2] = (byte)(rtpPacket.Length >> 8);
+            frame[3] = (byte)(rtpPacket.Length & 0xFF);
+            Buffer.BlockCopy(rtpPacket, 0, frame, 4, rtpPacket.Length);
+
+            try
             {
-                // Use a standalone timeout (not linked to server CTS) to detect stuck connections.
-                // Linking to _cts.Token would cause all sends to fail during server lifecycle events
-                // (e.g., Stop/Dispose), preventing graceful client cleanup.
-                using var sendCts = new CancellationTokenSource(3000);
+                if (socket?.Connected ?? false)
+                {
+                    // Use a standalone timeout (not linked to server CTS) to detect stuck connections.
+                    // Linking to _cts.Token would cause all sends to fail during server lifecycle events
+                    // (e.g., Stop/Dispose), preventing graceful client cleanup.
+                    using var sendCts = new CancellationTokenSource(3000);
 
-                await socket.SendAsync(frame, SocketFlags.None, sendCts.Token).ConfigureAwait(false);
+                    await socket.SendAsync(frame.AsMemory(0, frameSize), SocketFlags.None, sendCts.Token).ConfigureAwait(false);
 
-                // Update activity time on successful send
+                    // Update activity time on successful send
+                    if (client != null)
+                    {
+                        lock (client)
+                        {
+                            client.LastActivityTime = DateTime.UtcNow;
+                            client.ConsecutiveSendErrors = 0;
+                        }
+                    }
+                    return true;
+                }
+
+                // Socket not connected — track the error so the streaming loop can detect it
                 if (client != null)
                 {
                     lock (client)
                     {
-                        client.LastActivityTime = DateTime.UtcNow;
-                        client.ConsecutiveSendErrors = 0;
+                        client.ConsecutiveSendErrors++;
+                        if (client.ConsecutiveSendErrors >= 10)
+                        {
+                            client.IsPlaying = false;
+                        }
                     }
                 }
-                return true;
+                return false;
             }
-
-            // Socket not connected — track the error so the streaming loop can detect it
-            if (client != null)
+            catch (OperationCanceledException)
             {
-                lock (client)
+                if (client != null)
                 {
-                    client.ConsecutiveSendErrors++;
-                    if (client.ConsecutiveSendErrors >= 10)
+                    lock (client)
                     {
-                        client.IsPlaying = false;
+                        client.ConsecutiveSendErrors++;
+                        Log.Warn("[TransportManager]", $"TCP send timeout (3s) - client {client.Id} error count: {client.ConsecutiveSendErrors}");
+                        if (client.ConsecutiveSendErrors >= 10)
+                        {
+                            client.IsPlaying = false;
+                            Log.Error("[TransportManager]", $"Client {client.Id} marked for cleanup - too many timeouts");
+                        }
                     }
                 }
+                else
+                {
+                    Log.Warn("[TransportManager]", "TCP send timeout - client may be disconnected");
+                }
+                return false;
             }
-            return false;
+            catch (SocketException ex)
+            {
+                if (client != null)
+                {
+                    lock (client)
+                    {
+                        client.ConsecutiveSendErrors++;
+                        Log.Error("[TransportManager]", $"TCP send socket error for client {client.Id} (error count: {client.ConsecutiveSendErrors}): {ex.SocketErrorCode} - {ex.Message}");
+                        if (client.ConsecutiveSendErrors >= 10)
+                        {
+                            client.IsPlaying = false;
+                            Log.Error("[TransportManager]", $"Client {client.Id} marked for cleanup - too many socket errors");
+                        }
+                    }
+                }
+                else
+                {
+                    Log.Error("[TransportManager]", $"TCP send socket error: {ex.SocketErrorCode} - {ex.Message}");
+                }
+                return false;
+            }
+            catch (Exception ex)
+            {
+                if (client != null)
+                {
+                    lock (client)
+                    {
+                        client.ConsecutiveSendErrors++;
+                        Log.Error("[TransportManager]", $"TCP send error for client {client.Id} (error count: {client.ConsecutiveSendErrors}): {ex.Message}");
+                        if (client.ConsecutiveSendErrors >= 10)
+                        {
+                            client.IsPlaying = false;
+                            Log.Error("[TransportManager]", $"Client {client.Id} marked for cleanup after {client.ConsecutiveSendErrors} errors");
+                        }
+                    }
+                }
+                else
+                {
+                    Log.Error("[TransportManager]", $"TCP send error: {ex.Message}");
+                }
+                return false;
+            }
         }
-        catch (OperationCanceledException)
+        finally
         {
-            if (client != null)
-            {
-                lock (client)
-                {
-                    client.ConsecutiveSendErrors++;
-                    Log.Warn("[TransportManager]", $"TCP send timeout (3s) - client {client.Id} error count: {client.ConsecutiveSendErrors}");
-                    if (client.ConsecutiveSendErrors >= 10)
-                    {
-                        client.IsPlaying = false;
-                        Log.Error("[TransportManager]", $"Client {client.Id} marked for cleanup - too many timeouts");
-                    }
-                }
-            }
-            else
-            {
-                Log.Warn("[TransportManager]", "TCP send timeout - client may be disconnected");
-            }
-            return false;
-        }
-        catch (SocketException ex)
-        {
-            if (client != null)
-            {
-                lock (client)
-                {
-                    client.ConsecutiveSendErrors++;
-                    Log.Error("[TransportManager]", $"TCP send socket error for client {client.Id} (error count: {client.ConsecutiveSendErrors}): {ex.SocketErrorCode} - {ex.Message}");
-                    if (client.ConsecutiveSendErrors >= 10)
-                    {
-                        client.IsPlaying = false;
-                        Log.Error("[TransportManager]", $"Client {client.Id} marked for cleanup - too many socket errors");
-                    }
-                }
-            }
-            else
-            {
-                Log.Error("[TransportManager]", $"TCP send socket error: {ex.SocketErrorCode} - {ex.Message}");
-            }
-            return false;
-        }
-        catch (Exception ex)
-        {
-            if (client != null)
-            {
-                lock (client)
-                {
-                    client.ConsecutiveSendErrors++;
-                    Log.Error("[TransportManager]", $"TCP send error for client {client.Id} (error count: {client.ConsecutiveSendErrors}): {ex.Message}");
-                    if (client.ConsecutiveSendErrors >= 10)
-                    {
-                        client.IsPlaying = false;
-                        Log.Error("[TransportManager]", $"Client {client.Id} marked for cleanup after {client.ConsecutiveSendErrors} errors");
-                    }
-                }
-            }
-            else
-            {
-                Log.Error("[TransportManager]", $"TCP send error: {ex.Message}");
-            }
-            return false;
+            ArrayPool<byte>.Shared.Return(frame);
         }
     }
 

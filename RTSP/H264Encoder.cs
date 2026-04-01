@@ -43,8 +43,13 @@ public class H264Encoder : IDisposable
     private const int COLOR_FormatYUV420Flexible = 2135033992;
     private long _lastTimestamp = 0;
     private int _lastLoggedSize = 0;
-    private readonly EncoderInfo _bestEncoder = new();
+    private readonly EncoderInfo _bestEncoder;
     private readonly Stopwatch _stopwatch = new();
+
+    // Cache the codec scan result — the system codec list never changes at runtime,
+    // so re-scanning on every stall restart wastes 200-700ms for nothing.
+    private static EncoderInfo? _cachedBestEncoder;
+    private static readonly object _bestEncoderCacheLock = new();
     private int _selectedColorFormat = COLOR_FormatYUV420SemiPlanar;
     private int _encoderStride;    // Actual encoder input row stride (may differ from _width)
     private int _encoderSliceHeight; // Actual encoder Y plane height (may differ from _height)
@@ -57,7 +62,7 @@ public class H264Encoder : IDisposable
     // Output stall detection: if input is fed but no output for this duration, encoder is stalled
     private long _lastOutputTicks;
     private long _lastInputTicks;
-    private const long StallThresholdTicks = 5 * TimeSpan.TicksPerSecond; // 5 seconds
+    private const long StallThresholdTicks = 1 * TimeSpan.TicksPerSecond; // 1 second
 
     /// <summary>
     /// Event raised when a frame has been encoded and is ready for streaming.
@@ -129,11 +134,24 @@ public class H264Encoder : IDisposable
                 SingleWriter = false
             });
 
-        var codecList = new MediaCodecList(new());
-        var codecInfos = codecList.GetCodecInfos();
-
-        _bestEncoder = SelectBestEncoder(codecInfos!);
+        _bestEncoder = GetCachedBestEncoder();
     }
+
+    private static EncoderInfo GetCachedBestEncoder()
+    {
+        lock (_bestEncoderCacheLock)
+        {
+            if (_cachedBestEncoder == null)
+            {
+                var codecList = new MediaCodecList(new());
+                var codecInfos = codecList.GetCodecInfos();
+                _cachedBestEncoder = SelectBestEncoder(codecInfos!);
+                Log.Info("H264MTK", $"Encoder selection cached: {_cachedBestEncoder?.Name ?? "none"}");
+            }
+            return _cachedBestEncoder;
+        }
+    }
+
     private static readonly Dictionary<string, int> EncoderPriority = new Dictionary<string, int>
     {
         // Hardware encoders (highest priority)
@@ -295,8 +313,10 @@ public class H264Encoder : IDisposable
             var videoCaps = caps.VideoCapabilities;
             if (videoCaps != null)
             {
-                encoderInfo.MaxSupportedWidth = (int)videoCaps.SupportedWidths.Upper;
-                encoderInfo.MaxSupportedHeight = (int)videoCaps.SupportedHeights.Upper;
+                var widthUpper = videoCaps.SupportedWidths?.Upper;
+                var heightUpper = videoCaps.SupportedHeights?.Upper;
+                if (widthUpper != null) encoderInfo.MaxSupportedWidth = (int)widthUpper;
+                if (heightUpper != null) encoderInfo.MaxSupportedHeight = (int)heightUpper;
                 encoderInfo.Supports4K = videoCaps.IsSizeSupported(3840, 2160);
                 encoderInfo.SupportsQHD = videoCaps.IsSizeSupported(2560, 1440);
                 encoderInfo.SupportsFullHD = videoCaps.IsSizeSupported(1920, 1080);
@@ -596,6 +616,30 @@ public class H264Encoder : IDisposable
     }
 
     /// <summary>
+    /// Signals the encoder to produce an IDR (keyframe) on the next output frame.
+    /// Call this when a new client connects so their decoder can start immediately
+    /// instead of waiting up to one full I-frame interval (1 second at current settings).
+    /// </summary>
+    public void RequestKeyFrame()
+    {
+        lock (_lock)
+        {
+            if (!_isRunning || _encoder == null || _disposed) return;
+            try
+            {
+                var bundle = new Bundle();
+                bundle.PutInt(MediaCodec.ParameterKeyRequestSyncFrame, 0);
+                _encoder.SetParameters(bundle);
+                Log.Debug("H264MTK", "IDR keyframe requested for new client");
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("H264MTK", $"RequestKeyFrame failed: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>
     /// Updates the encoder bitrate dynamically without restarting.
     /// </summary>
     /// <param name="newBitrate">The new bitrate in bits per second.</param>
@@ -745,7 +789,7 @@ public class H264Encoder : IDisposable
                         long sinceLastOutput = currentTicks - _lastOutputTicks;
                         long sinceLastInput = currentTicks - _lastInputTicks;
 
-                        if (sinceLastOutput > StallThresholdTicks && sinceLastInput < StallThresholdTicks)
+                        if (sinceLastOutput > StallThresholdTicks && sinceLastInput < StallThresholdTicks && gotFirstOutput)
                         {
                             Log.Error("H264MTK", $"Output stall detected: no output for {sinceLastOutput / TimeSpan.TicksPerSecond}s while input is active (gotFirstOutput={gotFirstOutput}) — stopping encoder");
                             _isRunning = false;
@@ -1404,9 +1448,9 @@ public class H264Encoder : IDisposable
             // This prevents SIGSEGV from encoder thread accessing disposed objects
             if (_encoderThread != null && _encoderThread.IsAlive)
             {
-                if (!_encoderThread.Join(3000))
+                if (!_encoderThread.Join(500))
                 {
-                    Log.Warn("H264MTK", "Encoder thread did not stop within 3s timeout");
+                    Log.Warn("H264MTK", "Encoder thread did not stop within 500ms timeout");
                 }
             }
 
@@ -1422,9 +1466,9 @@ public class H264Encoder : IDisposable
                     catch { }
                 });
 
-                if (!releaseTask.Wait(TimeSpan.FromSeconds(3)))
+                if (!releaseTask.Wait(TimeSpan.FromSeconds(0.5)))
                 {
-                    Log.Warn("H264MTK", "Encoder.Release() timed out (3s) - may cause resource leak");
+                    Log.Warn("H264MTK", "Encoder.Release() timed out (500ms) - may cause resource leak");
                 }
             }
             catch (System.Exception ex)
