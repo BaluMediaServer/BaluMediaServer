@@ -162,6 +162,12 @@ public class StreamingController : IStreamingController
         // Pre-allocate per-session state to avoid per-frame allocations in the hot path.
         // nalSendBuffer is cleared and reused on every frame; the list header is allocated once.
         var nalSendBuffer = new List<byte[]>(8);
+        var rtpBatchBuffer = new List<byte[]>(32);
+
+        // Reusable CTS for frame dequeue timeouts — avoids allocating a new
+        // CancellationTokenSource.CreateLinkedTokenSource on every frame attempt.
+        // Single-element array so the async method can update the reference.
+        var reusableTimeoutCts = new CancellationTokenSource?[1];
 
         try
         {
@@ -169,12 +175,6 @@ public class StreamingController : IStreamingController
 
             while (client.IsPlaying && !cancellationToken.IsCancellationRequested)
             {
-                // Update activity time at start of each streaming attempt
-                lock (client)
-                {
-                    client.LastActivityTime = DateTime.UtcNow;
-                }
-
                 // Check for too many consecutive errors (fast, no blocking)
                 // Socket disconnection is detected reliably via send errors in TransportManager.
                 // We do NOT use IsSocketConnected(Poll+Available) here because the HandleClient
@@ -186,12 +186,11 @@ public class StreamingController : IStreamingController
                     break;
                 }
 
-                var frameStart = DateTime.UtcNow;
                 bool frameSent = false;
 
                 if (client.Codec == CodecType.H264)
                 {
-                    frameSent = await StreamH264ToClientAsync(client, cancellationToken, nalSendBuffer).ConfigureAwait(false);
+                    frameSent = await StreamH264ToClientAsync(client, cancellationToken, nalSendBuffer, reusableTimeoutCts, rtpBatchBuffer).ConfigureAwait(false);
 
                     if (!frameSent)
                     {
@@ -229,6 +228,7 @@ public class StreamingController : IStreamingController
                 }
                 else
                 {
+                    var frameStart = DateTime.UtcNow;
                     await StreamMjpegToClientAsync(client, cancellationToken).ConfigureAwait(false);
                     var elapsed = (DateTime.UtcNow - frameStart).TotalMilliseconds;
                     var waitTime = frameIntervalMs - (int)elapsed;
@@ -249,6 +249,7 @@ public class StreamingController : IStreamingController
         }
         finally
         {
+            reusableTimeoutCts[0]?.Dispose();
             // Unregister channel before cleanup so the fan-out stops writing to this client.
             if (client.Codec == CodecType.H264)
             {
@@ -343,19 +344,26 @@ public class StreamingController : IStreamingController
     /// <param name="client">The target client.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>True if a frame was successfully sent, false otherwise.</returns>
-    private async Task<bool> StreamH264ToClientAsync(Models.Client client, CancellationToken cancellationToken, List<byte[]> nalSendBuffer)
+    private async Task<bool> StreamH264ToClientAsync(Models.Client client, CancellationToken cancellationToken, List<byte[]> nalSendBuffer, CancellationTokenSource?[] reusableTimeoutCts, List<byte[]> rtpBatch)
     {
         H264FrameEventArgs? h264Frame;
 
         // Try non-blocking dequeue first (zero allocation in the hot path)
         if (!_encoderManager.TryDequeueFrame(client.CameraId, client.Id, out h264Frame) || h264Frame == null)
         {
-            // No frame ready — wait with a timeout to prevent blocking forever if encoder stalls
+            // No frame ready — wait with a timeout to prevent blocking forever if encoder stalls.
+            // Reuse CTS to avoid per-frame allocation of CreateLinkedTokenSource.
             try
             {
-                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                timeoutCts.CancelAfter(FrameDequeueTimeoutMs);
-                h264Frame = await _encoderManager.DequeueFrameAsync(client.CameraId, client.Id, timeoutCts.Token).ConfigureAwait(false);
+                var cts = reusableTimeoutCts[0];
+                if (cts == null || !cts.TryReset())
+                {
+                    cts?.Dispose();
+                    cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    reusableTimeoutCts[0] = cts;
+                }
+                cts.CancelAfter(FrameDequeueTimeoutMs);
+                h264Frame = await _encoderManager.DequeueFrameAsync(client.CameraId, client.Id, cts.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
             {
@@ -436,16 +444,20 @@ public class StreamingController : IStreamingController
 
         try
         {
-            // Send SPS/PPS before keyframes/IDR frames, first frame, or if not cached
+            // Build all RTP packets for this frame into a batch, then send with a single syscall.
+            // This eliminates per-packet await/lock overhead (5-20ms per frame on Android).
+            rtpBatch.Clear();
+
+            // Build SPS/PPS packets before keyframes/IDR frames, first frame, or if not cached
             bool needsSpsPps = isIdrFrame || client.FrameCount == 1 || !_clientManager.HasCachedSpsPps(client.Id);
 
             if (needsSpsPps && h264Frame.Sps != null && h264Frame.Pps != null)
             {
-                await _rtpBuilder.SendH264NalAsRtpAsync(client, h264Frame.Sps, frameRtpTimestamp, false).ConfigureAwait(false);
-                await _rtpBuilder.SendH264NalAsRtpAsync(client, h264Frame.Pps, frameRtpTimestamp, false).ConfigureAwait(false);
+                _rtpBuilder.BuildH264NalRtpPackets(client, h264Frame.Sps, frameRtpTimestamp, false, rtpBatch);
+                _rtpBuilder.BuildH264NalRtpPackets(client, h264Frame.Pps, frameRtpTimestamp, false, rtpBatch);
                 _clientManager.CacheSpsPps(client.Id, h264Frame.Sps, h264Frame.Pps);
             }
-            // Filter and send NAL units
+            // Filter NAL units
             // SPS (7) and PPS (8) are already sent above when needsSpsPps is true,
             // so skip them here to avoid sending duplicate parameter sets.
             bool spsPpsSentSeparately = needsSpsPps && h264Frame.Sps != null && h264Frame.Pps != null;
@@ -470,13 +482,16 @@ public class StreamingController : IStreamingController
                 nalSendBuffer.Add(nal);
             }
 
+            // Build all NAL RTP packets into the batch
             int nalCount = nalSendBuffer.Count;
             for (int i = 0; i < nalCount; i++)
             {
-                var nalUnit = nalSendBuffer[i];
                 bool isLastNalOfFrame = i == nalCount - 1;
-                await _rtpBuilder.SendH264NalAsRtpAsync(client, nalUnit, frameRtpTimestamp, isLastNalOfFrame).ConfigureAwait(false);
+                _rtpBuilder.BuildH264NalRtpPackets(client, nalSendBuffer[i], frameRtpTimestamp, isLastNalOfFrame, rtpBatch);
             }
+
+            // Send entire frame as one batch (single lock acquisition + single TCP send)
+            await _transportManager.SendBatchAsync(client, rtpBatch).ConfigureAwait(false);
 
             pacer.MarkFrameSent();
             return true;

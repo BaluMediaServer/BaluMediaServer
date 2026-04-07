@@ -85,7 +85,6 @@ public class FramePacer
     public void RecordDrop()
     {
         _consecutiveDrops++;
-        Log.Debug("FramePacer", $"Dropped frame (consecutive: {_consecutiveDrops})");
     }
 
     /// <summary>

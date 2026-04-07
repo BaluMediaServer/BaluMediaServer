@@ -89,6 +89,59 @@ public class RtpPacketBuilder : IRtpPacketBuilder
     }
 
     /// <summary>
+    /// Builds RTP packets for an H.264 NAL unit and appends them to the provided list
+    /// instead of sending immediately. This enables batch sending (single syscall per frame).
+    /// </summary>
+    public void BuildH264NalRtpPackets(Client client, byte[] nalUnit, uint nalTimestamp, bool lastFrame, List<byte[]> outPackets)
+    {
+        int nalStart = 0;
+        if (nalUnit.Length >= 4 && nalUnit[0] == 0 && nalUnit[1] == 0 && nalUnit[2] == 0 && nalUnit[3] == 1)
+            nalStart = 4;
+        else if (nalUnit.Length >= 3 && nalUnit[0] == 0 && nalUnit[1] == 0 && nalUnit[2] == 1)
+            nalStart = 3;
+
+        int nalLength = nalUnit.Length - nalStart;
+        if (nalLength <= 0) return;
+
+        if (nalLength <= MaxPayloadSize)
+        {
+            outPackets.Add(BuildRtpPacket(client, nalUnit, nalStart, nalLength, nalTimestamp, lastFrame, 96));
+        }
+        else
+        {
+            byte nalHeader = nalUnit[nalStart];
+            byte nalType = (byte)(nalHeader & 0x1F);
+            byte fuIndicator = (byte)((nalHeader & 0x60) | 28);
+
+            int dataOffset = nalStart + 1;
+            int remainingData = nalLength - 1;
+            bool isFirstFragment = true;
+
+            while (remainingData > 0)
+            {
+                int fragmentSize = Math.Min(MaxPayloadSize - 2, remainingData);
+                bool isLastFragment = fragmentSize == remainingData;
+                bool marker = lastFrame && isLastFragment;
+
+                byte fuHeader = nalType;
+                if (isFirstFragment) fuHeader |= 0x80;
+                if (isLastFragment) fuHeader |= 0x40;
+
+                var rtpPacket = new byte[14 + fragmentSize];
+                WriteRtpHeader(client, rtpPacket, nalTimestamp, marker, 96, 2 + fragmentSize);
+                rtpPacket[12] = fuIndicator;
+                rtpPacket[13] = fuHeader;
+                Buffer.BlockCopy(nalUnit, dataOffset, rtpPacket, 14, fragmentSize);
+
+                outPackets.Add(rtpPacket);
+                dataOffset += fragmentSize;
+                remainingData -= fragmentSize;
+                isFirstFragment = false;
+            }
+        }
+    }
+
+    /// <summary>
     /// Builds an RTP packet by copying directly from a source byte array at a given offset,
     /// eliminating the need for an intermediate payload buffer.
     /// </summary>

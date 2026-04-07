@@ -62,7 +62,7 @@ public class H264Encoder : IDisposable
     // Output stall detection: if input is fed but no output for this duration, encoder is stalled
     private long _lastOutputTicks;
     private long _lastInputTicks;
-    private const long StallThresholdTicks = 1 * TimeSpan.TicksPerSecond; // 1 second
+    private static readonly long StallThresholdTicks = Stopwatch.Frequency; // 1 second
 
     /// <summary>
     /// Event raised when a frame has been encoded and is ready for streaming.
@@ -127,7 +127,7 @@ public class H264Encoder : IDisposable
         // Concurrent JNI calls to MediaCodec from different threads can cause
         // vendor-specific stalls (especially on MediaTek).
         _frameChannel = Channel.CreateBounded<FrameData>(
-            new BoundedChannelOptions(2)
+            new BoundedChannelOptions(1)
             {
                 FullMode = BoundedChannelFullMode.DropOldest,
                 SingleReader = true,
@@ -740,7 +740,7 @@ public class H264Encoder : IDisposable
         int consecutiveErrors = 0;
         const int maxConsecutiveErrors = 10;
 
-        long now = DateTime.UtcNow.Ticks;
+        long now = Stopwatch.GetTimestamp();
         _lastOutputTicks = now;
         _lastInputTicks = 0;
 
@@ -767,7 +767,7 @@ public class H264Encoder : IDisposable
 
                     if (processedOutput)
                     {
-                        _lastOutputTicks = DateTime.UtcNow.Ticks;
+                        _lastOutputTicks = Stopwatch.GetTimestamp();
                     }
 
                     // Check disposed again before feeding input
@@ -778,29 +778,31 @@ public class H264Encoder : IDisposable
                     {
                         FeedInputBuffer(frame);
                         processedInput = true;
-                        _lastInputTicks = DateTime.UtcNow.Ticks;
+                        _lastInputTicks = Stopwatch.GetTimestamp();
                     }
 
                     // Output stall detection: input is being fed but no output for too long
                     // means the hardware encoder (MediaCodec) is internally deadlocked or never started producing
                     if (_lastInputTicks > 0)
                     {
-                        long currentTicks = DateTime.UtcNow.Ticks;
+                        long currentTicks = Stopwatch.GetTimestamp();
                         long sinceLastOutput = currentTicks - _lastOutputTicks;
                         long sinceLastInput = currentTicks - _lastInputTicks;
 
                         if (sinceLastOutput > StallThresholdTicks && sinceLastInput < StallThresholdTicks && gotFirstOutput)
                         {
-                            Log.Error("H264MTK", $"Output stall detected: no output for {sinceLastOutput / TimeSpan.TicksPerSecond}s while input is active (gotFirstOutput={gotFirstOutput}) — stopping encoder");
+                            Log.Error("H264MTK", $"Output stall detected: no output for {sinceLastOutput / Stopwatch.Frequency}s while input is active (gotFirstOutput={gotFirstOutput}) — stopping encoder");
                             _isRunning = false;
                             break;
                         }
                     }
 
-                    // Small sleep to prevent CPU spinning only if nothing was processed
+                    // SpinWait auto-escalates: spin → yield → short sleep, giving sub-ms
+                    // wake-up instead of Thread.Sleep(1) which sleeps 1-15ms on Android.
                     if (!processedInput && !processedOutput)
                     {
-                        Thread.Sleep(1);
+                        var sw = new SpinWait();
+                        sw.SpinOnce();
                     }
 
                     // Reset error counter on successful iteration

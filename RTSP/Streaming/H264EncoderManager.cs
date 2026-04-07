@@ -33,9 +33,9 @@ public class H264EncoderManager : IH264EncoderManager
     private byte[]? _currentPps;
     private readonly object _spsPpsLock = new();
 
-    // Per-client buffer: 3 frames at 25fps = 120ms max buffering delay.
+    // Per-client buffer: 1 frame — always deliver the freshest encoded frame.
     // DropOldest ensures slow clients never stall the fan-out loop.
-    private const int MaxH264QueueSize = 3;
+    private const int MaxH264QueueSize = 1;
 
     /// <inheritdoc/>
     public event EventHandler<H264FrameEventArgs>? FrameEncoded;

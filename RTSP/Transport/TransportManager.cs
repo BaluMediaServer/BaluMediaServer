@@ -64,6 +64,115 @@ public class TransportManager : ITransportManager
         }
     }
 
+    /// <summary>
+    /// Sends multiple RTP packets in a single batch, acquiring the SendLock once.
+    /// For TCP: concatenates all interleaved-framed packets into one buffer for a single socket.SendAsync.
+    /// For UDP: sends all packets in a tight loop within the lock.
+    /// </summary>
+    public async Task<bool> SendBatchAsync(Client client, List<byte[]> packets)
+    {
+        if (packets.Count == 0) return true;
+
+        // Single packet — skip batching overhead
+        if (packets.Count == 1)
+            return await SendDataAsync(client, packets[0]).ConfigureAwait(false);
+
+        if (!await client.SendLock.WaitAsync(3000).ConfigureAwait(false))
+        {
+            Log.Warn("[TransportManager]", $"SendLock timeout (3s) for client {client.Id} - skipping batch");
+            return false;
+        }
+        try
+        {
+            if (client.Transport == TransportMode.TCPInterleaved)
+            {
+                return await SendInterleavedBatchAsync(client, packets).ConfigureAwait(false);
+            }
+            else if (client.Transport == TransportMode.UDP)
+            {
+                bool allOk = true;
+                foreach (var pkt in packets)
+                {
+                    if (!await SendUdpDataAsync(client, pkt, false).ConfigureAwait(false))
+                        allOk = false;
+                }
+                return allOk;
+            }
+            return false;
+        }
+        finally
+        {
+            client.SendLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Concatenates multiple RTP packets into a single TCP interleaved buffer and sends with one syscall.
+    /// </summary>
+    private async Task<bool> SendInterleavedBatchAsync(Client client, List<byte[]> packets)
+    {
+        // Calculate total frame size: each packet needs 4-byte interleaved header + data
+        int totalSize = 0;
+        for (int i = 0; i < packets.Count; i++)
+            totalSize += 4 + packets[i].Length;
+
+        var frame = ArrayPool<byte>.Shared.Rent(totalSize);
+        try
+        {
+            int offset = 0;
+            for (int i = 0; i < packets.Count; i++)
+            {
+                var rtpPacket = packets[i];
+                frame[offset] = 0x24; // $ magic byte
+                frame[offset + 1] = client.RtpChannel;
+                frame[offset + 2] = (byte)(rtpPacket.Length >> 8);
+                frame[offset + 3] = (byte)(rtpPacket.Length & 0xFF);
+                Buffer.BlockCopy(rtpPacket, 0, frame, offset + 4, rtpPacket.Length);
+                offset += 4 + rtpPacket.Length;
+            }
+
+            try
+            {
+                var socket = client.Socket;
+                if (socket?.Connected ?? false)
+                {
+                    await socket.SendAsync(frame.AsMemory(0, totalSize), SocketFlags.None).ConfigureAwait(false);
+                    lock (client)
+                    {
+                        client.LastActivityTick = Environment.TickCount64;
+                        client.ConsecutiveSendErrors = 0;
+                    }
+                    return true;
+                }
+
+                lock (client)
+                {
+                    client.ConsecutiveSendErrors++;
+                    if (client.ConsecutiveSendErrors >= 10)
+                        client.IsPlaying = false;
+                }
+                return false;
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or SocketException)
+            {
+                lock (client)
+                {
+                    client.ConsecutiveSendErrors++;
+                    if (client.ConsecutiveSendErrors >= 10)
+                    {
+                        client.IsPlaying = false;
+                        Log.Error("[TransportManager]", $"Client {client.Id} marked for cleanup after batch send error");
+                    }
+                }
+                return false;
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(frame);
+        }
+    }
+
     /// <inheritdoc/>
     public async Task<bool> SendInterleavedDataAsync(Socket socket, byte channel, byte[] rtpPacket, Client? client = null)
     {
@@ -83,19 +192,16 @@ public class TransportManager : ITransportManager
             {
                 if (socket?.Connected ?? false)
                 {
-                    // Use a standalone timeout (not linked to server CTS) to detect stuck connections.
-                    // Linking to _cts.Token would cause all sends to fail during server lifecycle events
-                    // (e.g., Stop/Dispose), preventing graceful client cleanup.
-                    using var sendCts = new CancellationTokenSource(3000);
-
-                    await socket.SendAsync(frame.AsMemory(0, frameSize), SocketFlags.None, sendCts.Token).ConfigureAwait(false);
+                    // Send with socket-level timeout (set at connection time) instead of
+                    // allocating a new CancellationTokenSource per packet.
+                    await socket.SendAsync(frame.AsMemory(0, frameSize), SocketFlags.None).ConfigureAwait(false);
 
                     // Update activity time on successful send
                     if (client != null)
                     {
                         lock (client)
                         {
-                            client.LastActivityTime = DateTime.UtcNow;
+                            client.LastActivityTick = Environment.TickCount64;
                             client.ConsecutiveSendErrors = 0;
                         }
                     }
@@ -197,7 +303,7 @@ public class TransportManager : ITransportManager
                 await client.UdpSocket.SendToAsync(rtpPacket, SocketFlags.None, endpoint).ConfigureAwait(false);
                 lock (client)
                 {
-                    client.LastActivityTime = DateTime.UtcNow;
+                    client.LastActivityTick = Environment.TickCount64;
                     client.ConsecutiveSendErrors = 0;
                 }
                 return true;

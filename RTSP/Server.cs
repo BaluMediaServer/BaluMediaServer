@@ -476,14 +476,6 @@ public class Server : IDisposable
                 _loggedFirstBackFrame = true;
                 Log.Info("[RTSP Server]", $"First back frame received: {arg.Width}x{arg.Height}, {arg.Data.Length} bytes");
             }
-            try
-            {
-                OnNewBackFrame?.Invoke(this, arg);
-            }
-            catch (Exception ex)
-            {
-                Log.Error("[RTSP Server]", $"OnNewBackFrame subscriber error: {ex.Message}");
-            }
             lock (_frameBackLock)
             {
                 var wasNull = _latestBackFrame == null;
@@ -493,6 +485,7 @@ public class Server : IDisposable
                     Log.Info("[RTSP Server]", $"Back frame restored after {_getLatestFrameNullCount} null reads: {arg.Width}x{arg.Height}, {arg.Data.Length} bytes");
                 }
             }
+            // Feed encoder FIRST — lowest latency path. Event subscribers run after.
             if (_isStreaming)
             {
                 _encoderManager.FeedFrame(0, arg);
@@ -500,6 +493,14 @@ public class Server : IDisposable
             // Queue for JPEG encoding only when RTSP-MJPEG clients exist
             if (_clientManager.HasMjpegClients)
                 _jpegEncoder.QueueFrame(arg, 0);
+            try
+            {
+                OnNewBackFrame?.Invoke(this, arg);
+            }
+            catch (Exception ex)
+            {
+                Log.Error("[RTSP Server]", $"OnNewBackFrame subscriber error: {ex.Message}");
+            }
         }
     }
 
@@ -507,6 +508,18 @@ public class Server : IDisposable
     {
         if (arg?.Data != null && arg.Data.Length > 0)
         {
+            lock (_frameFrontLock)
+            {
+                _latestFrontFrame = arg;
+            }
+            // Feed encoder FIRST — lowest latency path. Event subscribers run after.
+            if (_isStreaming)
+            {
+                _encoderManager.FeedFrame(1, arg);
+            }
+            // Queue for JPEG encoding only when RTSP-MJPEG clients exist
+            if (_clientManager.HasMjpegClients)
+                _jpegEncoder.QueueFrame(arg, 1);
             try
             {
                 OnNewFrontFrame?.Invoke(this, arg);
@@ -515,17 +528,6 @@ public class Server : IDisposable
             {
                 Log.Error("[RTSP Server]", $"OnNewFrontFrame subscriber error: {ex.Message}");
             }
-            lock (_frameFrontLock)
-            {
-                _latestFrontFrame = arg;
-            }
-            if (_isStreaming)
-            {
-                _encoderManager.FeedFrame(1, arg);
-            }
-            // Queue for JPEG encoding only when RTSP-MJPEG clients exist
-            if (_clientManager.HasMjpegClients)
-                _jpegEncoder.QueueFrame(arg, 1);
         }
     }
 
@@ -916,6 +918,7 @@ public class Server : IDisposable
             {
                 var client = await _socket.AcceptAsync(_cts.Token);
                 client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.NoDelay, true);
+                client.SendTimeout = 3000; // 3s send timeout — replaces per-packet CTS allocation
                 _ = Task.Run(async () =>
                 {
                     try

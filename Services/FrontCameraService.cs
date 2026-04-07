@@ -35,12 +35,9 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
     /// <returns>The calculated channel capacity.</returns>
     private static int GetChannelCapacity(int width, int height)
     {
-        int frameSize = (width * height * 3) / 2; // YUV420 frame size
-        // Target ~8MB max buffer to prevent memory issues at high resolutions
-        // Keep minimal buffer for high-res to reduce memory pressure
-        const int maxBufferSize = 8_000_000;
-        int capacity = Math.Max(2, maxBufferSize / frameSize);
-        return Math.Min(capacity, 10); // Cap at 10 frames max
+        // Capacity=1 with DropOldest ensures the encoder always gets the freshest frame,
+        // eliminating queue-induced latency (was 2-10 frames = 80-400ms at 25fps).
+        return 1;
     }
 
     /// <summary>
