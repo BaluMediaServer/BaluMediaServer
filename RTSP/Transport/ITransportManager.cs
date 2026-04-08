@@ -22,6 +22,14 @@ public interface ITransportManager
     Task<bool> SendBatchAsync(Client client, List<byte[]> packets);
 
     /// <summary>
+    /// Synchronous version of <see cref="SendBatchAsync"/> for use on dedicated OS threads.
+    /// Acquires the SendLock with <c>SemaphoreSlim.Wait()</c> and sends via <c>Socket.Send()</c>
+    /// so the calling thread never yields to the thread pool — eliminating the 30–40ms async
+    /// continuation scheduling delay seen on Android.
+    /// </summary>
+    bool SendBatchSync(Client client, List<byte[]> packets);
+
+    /// <summary>
     /// Sends data via TCP interleaved transport.
     /// </summary>
     /// <param name="socket">The socket.</param>

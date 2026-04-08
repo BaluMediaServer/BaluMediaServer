@@ -295,6 +295,38 @@ public class H264EncoderManager : IH264EncoderManager
     }
 
     /// <inheritdoc/>
+    public H264FrameEventArgs? WaitDequeueFrame(int cameraId, string clientId, int timeoutMs, CancellationToken cancellationToken)
+    {
+        Channel<H264FrameEventArgs>? channel = GetClientChannel(cameraId, clientId);
+        if (channel == null) return null;
+
+        try
+        {
+            var vt = channel.Reader.WaitToReadAsync(cancellationToken);
+
+            // Fast path: frame already in channel — no OS wait needed.
+            if (vt.IsCompleted)
+            {
+                if (!vt.Result) return null; // channel completed (encoder stopped)
+                channel.Reader.TryRead(out var immediateFrame);
+                return immediateFrame;
+            }
+
+            // Slow path: block the current OS thread (a LongRunning/Thread-class thread).
+            // Task.Wait() uses a kernel futex → the OS wakes this thread the moment the
+            // encoder writes a frame, with ~1ms scheduling latency vs 10–70ms for async
+            // continuation dispatch on Android's thread pool.
+            if (!vt.AsTask().Wait(timeoutMs, cancellationToken)) return null; // timeout
+            channel.Reader.TryRead(out var frame);
+            return frame;
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    /// <inheritdoc/>
     public (byte[]? sps, byte[]? pps) GetSpsPps()
     {
         lock (_spsPpsLock)
