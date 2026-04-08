@@ -61,6 +61,7 @@ public class SdpGenerator : ISdpGenerator
             sdp.Append("m=video 0 RTP/AVP 96\r\n");
             sdp.Append($"c=IN IP4 {serverIp}\r\n");
             sdp.Append("a=rtpmap:96 H264/90000\r\n");
+            sdp.Append("a=framerate:25\r\n");
 
             // Build fmtp line with sprop-parameter-sets for VLC and other players
             var fmtpParams = new StringBuilder("profile-level-id=42e01e;packetization-mode=1");

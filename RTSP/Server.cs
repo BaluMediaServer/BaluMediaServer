@@ -124,6 +124,13 @@ public class Server : IDisposable
         _frontCameraWidth = FrontCameraResolution.GetWidth();
         _frontCameraHeight = FrontCameraResolution.GetHeight();
 
+        // Ensure enough thread pool threads to avoid scheduling jitter on the streaming loop.
+        // The default minimum is ProcessorCount (8 on MT6768), which is insufficient when
+        // the encoding loop, camera callbacks, and multiple client streaming loops all compete
+        // for thread pool slots. Each idle thread costs ~1MB of stack but eliminates the
+        // 20-70ms wakeup delay seen when a slot has to be spun up on demand.
+        ThreadPool.SetMinThreads(32, 32);
+
         // Initialize modules
         _authManager = new AuthManager { RequireAuthentication = AuthRequired };
         _authManager.AddUser("admin", "password123");
@@ -1052,7 +1059,10 @@ public class Server : IDisposable
                 if (await protocolHandler.HandlePlayAsync(writer, request, client).ConfigureAwait(false))
                 {
                     _isStreaming = true;
-                    _ = Task.Run(async () =>
+                    // LongRunning: gives the streaming loop a dedicated OS thread instead of
+                    // a thread-pool slot. Prevents 20-70ms scheduling jitter caused by the pool
+                    // being saturated by the encoding loop, camera callbacks, and Android work.
+                    _ = Task.Factory.StartNew(async () =>
                     {
                         try
                         {
@@ -1062,7 +1072,7 @@ public class Server : IDisposable
                         {
                             Log.Error("[RTSP Server]", $"StreamToClient unhandled error: {ex.Message}");
                         }
-                    }, _cts.Token);
+                    }, _cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
                 }
                 break;
             case "TEARDOWN":

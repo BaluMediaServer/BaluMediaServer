@@ -493,6 +493,16 @@ public class StreamingController : IStreamingController
             // Send entire frame as one batch (single lock acquisition + single TCP send)
             await _transportManager.SendBatchAsync(client, rtpBatch).ConfigureAwait(false);
 
+            // Periodically log server-side stream-path latency (encoder output → network send).
+            // This measures queuing + dequeue + RTP build time — should be <10ms.
+            // High values indicate backpressure in the streaming path.
+            if (h264Frame.EncodedAt > 0 && client.FrameCount % 25 == 1)
+            {
+                double streamPathMs = (System.Diagnostics.Stopwatch.GetTimestamp() - h264Frame.EncodedAt)
+                    * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                Log.Info("H264Latency", $"Stream path: encoded→sent={streamPathMs:F1}ms (client {client.Id[..8]}, frame {client.FrameCount})");
+            }
+
             pacer.MarkFrameSent();
             return true;
         }

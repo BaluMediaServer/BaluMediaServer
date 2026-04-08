@@ -24,6 +24,12 @@ public class H264FrameEventArgs : EventArgs
     public long Timestamp { get; set; }
 
     /// <summary>
+    /// Stopwatch ticks captured when this frame exited the hardware encoder.
+    /// Used for server-side latency diagnostics.
+    /// </summary>
+    public long EncodedAt { get; set; }
+
+    /// <summary>
     /// Gets or sets the Sequence Parameter Set (SPS) NAL unit.
     /// Contains essential encoding parameters required for decoder initialization.
     /// </summary>

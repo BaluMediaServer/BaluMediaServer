@@ -103,6 +103,12 @@ public class H264Encoder : IDisposable
         /// Gets or sets the source frame height (camera resolution, may differ from encoder).
         /// </summary>
         public int SourceHeight { get; set; }
+
+        /// <summary>
+        /// Stopwatch ticks when this frame was queued to the encoder input channel.
+        /// Used for encoder pipeline latency diagnostics.
+        /// </summary>
+        public long QueuedAt { get; set; }
     }
 
     /// <summary>
@@ -497,35 +503,52 @@ public class H264Encoder : IDisposable
                 // Use SetInteger (not SetFloat) — MediaTek MT6768 misinterprets sub-second float
                 // values as 0, causing EVERY frame to be an IDR keyframe, which exhausts the
                 // encoder's internal buffers and causes it to stall after ~1000 frames.
-                // Value of 1 = IDR every 1 second (~25 frames at 25fps).
-                format.SetInteger(MediaFormat.KeyIFrameInterval, 1);
+                // Value 2 = IDR every 2 seconds. IDR frames cause 120-220ms encoding stalls on
+                // MT6768; halving their frequency halves the jitter. New clients still get an IDR
+                // within ~40ms via RequestKeyFrame(). IntraRefresh every 10 frames provides
+                // continuous partial recovery for packet-loss robustness.
+                format.SetInteger(MediaFormat.KeyIFrameInterval, 2);
                 
                 // Set profile and level for better compatibility
                 format.SetInteger(MediaFormat.KeyProfile, (int)MediaCodecProfileType.Avcprofilebaseline);
                 format.SetInteger(MediaFormat.KeyLevel, 0x100);
 
                 // Low latency configuration
-                if (Build.VERSION.SdkInt >= BuildVersionCodes.R) // API 30+
-                {
-                    format.SetInteger(MediaFormat.KeyLowLatency, 1);
-                    format.SetInteger(MediaFormat.KeyPriority, 0); // Real-time priority
-                }
-
                 if (Build.VERSION.SdkInt >= BuildVersionCodes.M) // API 23+
                 {
+                    format.SetInteger(MediaFormat.KeyPriority, 0); // Real-time priority (added in API 23)
                     format.SetInteger(MediaFormat.KeyOperatingRate, short.MaxValue);
-                    
+
                     // Only set intra refresh if supported
                     if (_bestEncoder.SupportsIntraRefresh)
                     {
                         format.SetInteger(MediaFormat.KeyIntraRefreshPeriod, 10);
                     }
                 }
+
+                if (Build.VERSION.SdkInt >= BuildVersionCodes.P) // API 28+
+                {
+                    // Explicitly request 0-frame encoder pipeline depth. Without this, hardware
+                    // encoders buffer N frames internally before outputting the first result,
+                    // adding N × frame_interval of latency. This forces immediate output.
+#pragma warning disable CA1416
+                    format.SetInteger(MediaFormat.KeyLatency, 0);
+#pragma warning restore CA1416
+                }
+
+                if (Build.VERSION.SdkInt >= BuildVersionCodes.R) // API 30+
+                {
+                    format.SetInteger(MediaFormat.KeyLowLatency, 1);
+                }
+
                 if (_bestEncoder.Name.Contains("MTK"))
                 {
                     try
                     {
                         format.SetInteger("vendor.mtk-ext-enc-low-latency.enable", 1);
+                        // Non-reference P-frames: encoder can drop them under load without
+                        // breaking the reference chain, reducing encoding stalls.
+                        format.SetInteger("vendor.mtk-ext-enc-nonrefp.enable", 1);
                     }
                     catch { }
                 }
@@ -722,7 +745,7 @@ public class H264Encoder : IDisposable
         _frameNumber++;
 
         // Channel with DropOldest automatically handles frame dropping
-        _frameChannel.Writer.TryWrite(new() { Data = frameData, Timestamp = timestamp });
+        _frameChannel.Writer.TryWrite(new() { Data = frameData, Timestamp = timestamp, QueuedAt = Stopwatch.GetTimestamp() });
     }
 
     /// <summary>
@@ -743,6 +766,8 @@ public class H264Encoder : IDisposable
         long now = Stopwatch.GetTimestamp();
         _lastOutputTicks = now;
         _lastInputTicks = 0;
+        int _outputFrameCount = 0;
+        long _prevOutputTicks = 0;
 
         Log.Debug("H264MTK", "Encoding loop started");
 
@@ -767,7 +792,23 @@ public class H264Encoder : IDisposable
 
                     if (processedOutput)
                     {
-                        _lastOutputTicks = Stopwatch.GetTimestamp();
+                        long outputNow = Stopwatch.GetTimestamp();
+                        _outputFrameCount++;
+
+                        // Log encoder output interval every 25 frames to diagnose pipeline depth.
+                        // Expected: ~40ms at 25fps. If consistently >80ms, encoder is buffering multiple frames.
+                        if (_outputFrameCount % 25 == 0 && _prevOutputTicks > 0)
+                        {
+                            double intervalMs = (_lastOutputTicks > 0)
+                                ? (outputNow - _prevOutputTicks) * 1000.0 / Stopwatch.Frequency / 25.0
+                                : 0;
+                            double inputToOutputMs = (_lastInputTicks > 0)
+                                ? (outputNow - _lastInputTicks) * 1000.0 / Stopwatch.Frequency
+                                : 0;
+                            Log.Info("H264Latency", $"Encoder: avg output interval={intervalMs:F1}ms, last input→output={inputToOutputMs:F1}ms, frames={_outputFrameCount}");
+                        }
+                        _prevOutputTicks = outputNow;
+                        _lastOutputTicks = outputNow;
                     }
 
                     // Check disposed again before feeding input
@@ -1222,7 +1263,8 @@ public class H264Encoder : IDisposable
                             IsKeyFrame = (bufferInfo.Flags & MediaCodecBufferFlags.KeyFrame) != 0,
                             Timestamp = bufferInfo.PresentationTimeUs,
                             Sps = sps,
-                            Pps = pps
+                            Pps = pps,
+                            EncodedAt = Stopwatch.GetTimestamp()
                         };
 
                         FrameEncoded?.Invoke(this, frameEvent);
