@@ -101,4 +101,9 @@ public interface IClientManager
     /// <param name="targetFps">The target FPS.</param>
     /// <returns>The frame pacer.</returns>
     FramePacer GetOrCreatePacer(string clientId, int targetFps = 25);
+
+    /// <summary>
+    /// Gets whether any connected client is using MJPEG codec.
+    /// </summary>
+    bool HasMjpegClients { get; }
 }

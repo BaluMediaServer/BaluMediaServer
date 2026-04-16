@@ -28,6 +28,11 @@ public interface IRtpPacketBuilder
     Task SendH264NalAsRtpAsync(Client client, byte[] nalUnit, uint timestamp, bool lastFrame);
 
     /// <summary>
+    /// Builds RTP packets for an H.264 NAL unit into the provided list (no send).
+    /// </summary>
+    void BuildH264NalRtpPackets(Client client, byte[] nalUnit, uint nalTimestamp, bool lastFrame, List<byte[]> outPackets);
+
+    /// <summary>
     /// Sends JPEG data as RTP packets.
     /// </summary>
     /// <param name="client">The client.</param>

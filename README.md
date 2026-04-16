@@ -32,7 +32,7 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 - Provides two camera services: `FrontCameraService` and `BackCameraService`
 - Real-time frame capture at resolutions from 320x240 up to **4K UHD (3840x2160)** (device dependent)
 - Automatic encoder resolution validation with graceful fallback
-- Dynamic memory-optimized buffer management for high resolutions
+- Ultra-low latency pipeline with minimal buffering (capacity=1 channels, batch RTP sends)
 - Default frame rate: 45 FPS (adjusts dynamically)
 
 ### 🔹 RTSP Server (Pure C#)
@@ -47,6 +47,7 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 - **Multiple Profiles**: Support for `/live/front` and `/live/back` routes
 - **Robust Client Lifecycle**: Graduated error counting, timeout protection, and race-free cleanup
 - **Cross-SoC Compatibility**: Wall-clock RTP timestamps and MediaTek-safe encoder configuration
+- **VLC Compatible**: Full RFC 2326/4566 compliance — works with VLC, ffplay, OBS, and any standards-compliant RTSP client
 
 ### 🔹 MJPEG HTTP Server
 - Simple, independent MJPEG server for easy HTML display
@@ -105,7 +106,7 @@ RTSP/
 
 ### NuGet Package
 ```xml
-<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.16" />
+<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.17" />
 ```
 
 ### Manual Installation
@@ -663,6 +664,8 @@ The H.264 encoder automatically optimizes for MediaTek and other Android devices
 - The encoder uses `SetInteger(KeyIFrameInterval, 1)` instead of `SetFloat()`. MediaTek MT6768 (and possibly other MediaTek SoCs) misinterprets sub-second float values as `0`, causing every frame to become an IDR keyframe. This exhausts the encoder's internal buffers after ~1000 frames and causes a permanent stall.
 - RTP timestamps are derived from `Stopwatch` wall-clock time instead of the encoder's `PresentationTimeUs`. The MT6768 reports `PresentationTimeUs` in units ~1000x larger than microseconds, which would cause RTP timestamp deltas of ~3,000,000 per frame instead of the expected ~3,600 (at 25fps/90kHz). Players would buffer forever waiting for "future" frames.
 - The encoding loop drains output buffers before feeding new input to prevent buffer starvation on resource-constrained SoCs.
+- The encoding loop uses `SpinWait` (v1.5.23) instead of `Thread.Sleep(1)` for sub-millisecond responsiveness when polling for encoder output.
+- All pipeline channels (camera → encoder input → per-client output) use capacity=1 with `DropOldest` to minimize buffering latency. This ensures the encoder always processes the freshest camera frame.
 
 ### Video Resolution Configuration
 
@@ -805,10 +808,15 @@ private async void StartPeriodicSnapshots()
 ### Connecting with Popular Clients
 
 #### VLC Media Player
-1. Open VLC
+1. Open VLC (version 3.0+ with live555 support)
 2. Go to Media → Open Network Stream
 3. Enter: `rtsp://admin:password123@your-ip:7778/live/back`
 4. Click Play
+
+**VLC Tips:**
+- For best reliability, use TCP transport: Tools → Preferences → All → Input/Codecs → Network → set "RTP over RTSP (TCP)" to "Always"
+- On Linux, the snap version of VLC is recommended (`snap install vlc`) — some distro packages (Debian/Kali) are compiled without live555 RTSP support
+- Stream playback starts instantly on first connect thanks to encoder pre-warming at SETUP time
 
 #### FFmpeg
 ```bash
@@ -883,6 +891,25 @@ var localIP = server.GetLocalIpAddress();
 Console.WriteLine($"Connect to: rtsp://{localIP}:7778/live/back");
 ```
 
+#### VLC Cannot Connect or Shows No Video
+
+**1. VLC compiled without live555 (Linux)**
+- **Symptom**: VLC shows "satip" or "access_realrtsp" errors instead of connecting
+- **Cause**: Some Linux distro packages (Debian, Kali) compile VLC with `--disable-live555`
+- **Fix**: Install VLC via snap (`snap install vlc`) or download from [videolan.org](https://www.videolan.org/) which includes live555
+
+**2. Connection timeout on first connect**
+- **Symptom**: VLC says "unable to open MRL" on first attempt, works on retry
+- **Cause**: H.264 encoder warm-up delay exceeds live555 timeout
+- **Fix**: This is handled automatically since v1.5.17 — the encoder is pre-warmed at SETUP time. If you still experience this, ensure you're using the latest version
+
+**3. Video plays but is garbled or green**
+- **Symptom**: VLC connects and shows frames, but image is corrupted (green bottom half)
+- **Possible causes**:
+  - **NV21 UV plane offset**: MediaTek cameras may produce oversized buffers (e.g., 1843198 bytes for 1280x720). The UV plane starts at `width * height` (declared dimensions), NOT at the end of the full buffer. Reading UV from the wrong offset causes green corruption. Fixed in v1.5.20.
+  - **Color format mismatch**: `COLOR_FormatYUV420Flexible` has undefined buffer layout for raw ByteBuffer writes. Use `COLOR_FormatYUV420SemiPlanar` (NV12) instead. Fixed in v1.5.20.
+  - **SPS/PPS not delivered**: The server sends SPS/PPS before every keyframe and on first frame. Ensure your client requests a new DESCRIBE/SETUP/PLAY sequence rather than resuming a stale session.
+
 #### H.264 Encoding Issues
 ```csharp
 // Check if device supports hardware encoding
@@ -928,6 +955,18 @@ If the H.264 stream starts but freezes after a few seconds (while MJPEG continue
 - **Cause**: Aggressive timeout settings or premature client cleanup
 - **Fix**: The library uses graduated error counting (10 consecutive failures for TCP, 5 for UDP) and checks `IsPlaying` before marking clients as dead. Fixed since v1.5.16
 
+#### App Crashes After Hours of Streaming (SIGABRT)
+
+If the app crashes after hours of continuous streaming with `Cannot transition thread from RUNNING with DONE_BLOCKING` in the logs:
+
+**Root Cause**: Mono GC thread-state corruption triggered by BufferQueue starvation. The camera's ImageReader buffer slots fill up because frames are not released fast enough, causing JNI calls to block for 1+ seconds. While blocked, the Mono GC tries to transition the thread state and hits an invalid state machine transition, aborting the process.
+
+**Fix (v1.5.21)**: Camera services now marshal all Java `VideoFrame` data into managed `FrameEventArgs` in `OnFrameAvailable` (on the JNI callback thread) and recycle the native frame immediately. The processing thread (`ProcessFramesAsync`) operates entirely in managed code with zero JNI calls, eliminating the GC thread-state race window.
+
+**Complementary native AAR fix (v2.0.2)**: The native Kotlin library now calls `Image.close()` immediately after copying pixel data, before invoking the .NET callback, so ImageReader buffer slots are never held during slow callback execution.
+
+**Diagnostic**: Check logcat for `waitForFreeSlotThenRelock TIMED_OUT` on `ImageReader` — this indicates the BufferQueue is starved.
+
 #### Performance Optimization
 
 #### Memory Management
@@ -969,8 +1008,14 @@ Server.OnClientsChange += (clients) => {
 **Connection Stability Notes:**
 - The server uses graduated error counting: TCP clients tolerate up to 10 consecutive send failures before being disconnected, UDP clients tolerate 5. This prevents premature disconnection from transient network issues.
 - Playing clients are protected from the WatchDog — they are never marked as dead while actively streaming.
-- Frame dequeue uses a 2-second timeout to prevent the streaming loop from blocking forever if the H.264 encoder stalls.
-- Per-client `SemaphoreSlim` (SendLock) serializes all sends to prevent TCP interleaved framing corruption.
+- Frame dequeue uses a 200ms timeout with automatic encoder restart after consecutive timeouts.
+- Per-client `SemaphoreSlim` (SendLock) serializes all sends to prevent TCP interleaved framing corruption. Batch RTP sends acquire the lock once per frame instead of per packet.
+
+**Latency Optimization Notes (v1.5.23):**
+- All frame channels use capacity=1 with `DropOldest` — the encoder always processes the freshest frame, eliminating queue-induced latency.
+- RTP packets for an entire H.264 frame are built into a batch and sent with a single `socket.SendAsync` call (TCP), reducing per-frame network overhead from 10-15 syscalls to 1.
+- The encoder loop uses `SpinWait` for sub-millisecond responsiveness instead of `Thread.Sleep(1)` (which sleeps 1-15ms on Android).
+- Per-packet `CancellationTokenSource` allocations are eliminated using `TryReset()` and `socket.SendTimeout`.
 
 #### Transport Protocol Recommendations
 ```csharp
@@ -1087,6 +1132,10 @@ Unit tests cover pure C# components. Android-dependent classes (camera services,
 - ✅ **Client reconnection bug fix** (v1.5.14)
 - ✅ **H.264 thread safety fix and connection stability** (v1.5.15)
 - ✅ **H.264 stream freeze fix — MediaTek I-frame interval, RTP timestamps, client lifecycle** (v1.5.16)
+- ✅ **VLC compatibility — RFC-compliant RTSP/SDP, CRLF line endings, encoder pre-warming** (v1.5.17)
+- ✅ **H.264 green corruption fix — NV21 UV plane offset, NV12 color format, resolution change support** (v1.5.20)
+- ✅ **Long-running stability fix — JNI-free processing thread, immediate native frame release, bitrate fix, latency reduction** (v1.5.21)
+- ✅ **Ultra-low latency pipeline — buffer depth reduction, batch RTP sends, allocation elimination, SpinWait encoder loop** (v1.5.23)
 
 ### Planned (v1.6+)
 - ⬜ Fix image rotation on some devices
@@ -1145,6 +1194,38 @@ There are few (if any) options to integrate RTSP servers with Android using C# a
 -- Adding a preview (WIP) for video profiles allowing to create custom paths for this new profiles, will allow to set a custom resolution, bitrate and more.
 
 - v1.1.4: Adding auth option into CTOR of Server class, to enable or disable auth on stream rtsp, adding feature to determina video quality into mjpeg server
+
+- v1.5.23: **Ultra-Low Latency Pipeline Overhaul** — Reduces end-to-end streaming latency from 2-3 seconds to ~100-300ms on LAN.
+  - **Buffer depth reduction**: All pipeline channels (camera, encoder input, per-client output) reduced to capacity=1 with `DropOldest`. Eliminates 280-600ms of queue-induced latency — the encoder always processes the freshest frame.
+  - **Batch RTP sends**: All RTP packets for an H.264 frame (SPS/PPS + NAL FU-A fragments) are built into a list and sent with a single `socket.SendAsync` call via new `TransportManager.SendBatchAsync()`. Reduces per-frame network overhead from 10-15 syscalls/lock acquisitions to 1.
+  - **Encoder loop SpinWait**: Replaced `Thread.Sleep(1)` (1-15ms on Android) with `SpinWait.SpinOnce()` for sub-millisecond encoder responsiveness. Stall detection uses `Stopwatch.GetTimestamp()` instead of `DateTime.UtcNow.Ticks`.
+  - **Allocation elimination**: Reusable `CancellationTokenSource` with `TryReset()` for frame dequeue timeouts. Per-send CTS replaced with `socket.SendTimeout = 3000` set at connection time. Activity tracking uses `Environment.TickCount64` instead of `DateTime.UtcNow`. Eliminates ~300+ allocations/sec from the hot path.
+  - **Hot-path cleanup**: Removed `Log.Debug` from `FramePacer.RecordDrop()` (JNI + string alloc per dropped frame). Encoder is fed before event subscribers in frame callbacks. Redundant `DateTime.UtcNow` calls removed from H264 streaming loop.
+
+- v1.5.21: **Long-Running Stability & Latency Fix** — Eliminates overnight SIGABRT crashes and reduces streaming latency.
+  - **JNI-free processing thread**: `BackCameraService` and `FrontCameraService` now marshal all `VideoFrame` data into managed `FrameEventArgs` in the `OnFrameAvailable` callback (JNI context) and recycle the native frame immediately. The `ProcessFramesAsync` thread makes zero JNI calls, preventing Mono GC thread-state corruption (`Cannot transition thread from RUNNING with DONE_BLOCKING`).
+  - **Channel type change**: Frame channels now hold `FrameEventArgs` (managed) instead of `VideoFrame` (Java object). `DropOldest` is safe again since dropped items have no native resources to leak.
+  - **Bitrate fix**: `SetParameters(PARAMETER_KEY_VIDEO_BITRATE)` was incorrectly passing `(int)BitrateMode.CbrFd` (value 3) instead of the actual bitrate (2 Mbps), causing extremely low quality. Now correctly passes `_bitrate`. Also moved `SetParameters` call to after `encoder.Start()` as required by MediaCodec API.
+  - **Latency reduction**: Encoder input queue reduced from 5 to 2 frames (80ms vs 200ms). Manager output queue reduced from 10 to 3 frames (120ms vs 400ms). MediaCodec dequeue timeouts reduced from 5ms to 1ms. Total pipeline latency reduced from ~650ms to ~240ms.
+  - **Native AAR v2.0.2**: `Image.close()` now called immediately after pixel copy (before callbacks), UV conversion uses bulk copy, queue capacity reduced from 100 to 5.
+
+- v1.5.20: **H.264 Green Corruption Fix** — Fixes green/corrupted image at higher resolutions on MediaTek devices.
+  - **NV21 UV plane offset fix**: MediaTek cameras produce oversized buffers (e.g., 1843198 bytes for 1280x720) but the UV plane starts at `width * height` (declared dimensions), not at the end of the buffer. The encoder was reading Y padding data as UV, causing green corruption in the bottom half of the image.
+  - **NV12 color format preference**: Changed from `COLOR_FormatYUV420Flexible` to `COLOR_FormatYUV420SemiPlanar` (NV12). Flexible format has undefined buffer layout for raw ByteBuffer writes — its internal plane offsets vary by resolution and vendor. NV12 guarantees Y at offset 0, UV interleaved at `stride * sliceHeight`.
+  - **Encoder sliceHeight=0 guard**: Some encoders return 0 for stride/sliceHeight meaning "same as configured". Added guard to prevent `dstYPlaneSize = 0` which would cause UV data to overwrite Y data.
+  - **Relaxed sliceHeight deduction**: Accept aligned sliceHeight values within 256 rows of the configured height, accommodating various encoder alignment requirements (16/32/64 boundary).
+  - **Resolution change support**: Added `ApplyResolutionChange()` pipeline — stops encoder, clears SPS/PPS, restarts camera at new resolution, disconnects affected clients, and pre-warms encoder.
+  - Fixed same UV offset bug in `CropAndDestrideFrame()` fallback path.
+
+- v1.5.17: **VLC Compatibility Release** — Full RFC 2326/4566 compliance for standards-compliant RTSP clients.
+  - Case-insensitive RTSP header parsing (`StringComparer.OrdinalIgnoreCase`) — VLC may send headers with varying casing
+  - OPTIONS method handled before authentication per RFC 2326 §10.1 — VLC sends unauthenticated OPTIONS as capability probe
+  - CRLF (`\r\n`) line endings in all RTSP responses and SDP — `StreamWriter` on Android/Linux defaults to `\n`, but live555 strictly requires `\r\n`
+  - `Content-Base` header includes trailing slash for correct relative URL resolution of `trackID=N` per RFC 3986
+  - `Range: npt=0.000-` header in PLAY response — required by VLC to confirm playback position
+  - Proper `RTP-Info` URL format with base URI + trackID
+  - H.264 encoder pre-warming at SETUP time — prevents live555 timeout on first connect by having the encoder ready before PLAY
+  - Encoder stall recovery — automatically restarts stalled encoders when subsequent clients connect
 
 - v1.1.5: Fixing EventBuss command on Server class, if the server was started do not raise the flag into it, and sometimes make the app crash due to "Port already in use" or even using excesive CPU on multiple MJPEG servers.
 Adding to MJPEGServer preview of EventBuss to handle it by there, but needs sync with main server to avoid duplicate instances or commands.

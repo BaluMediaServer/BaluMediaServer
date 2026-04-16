@@ -17,6 +17,11 @@ public interface ITransportManager
     Task<bool> SendDataAsync(Client client, byte[] data);
 
     /// <summary>
+    /// Sends multiple RTP packets in a single batch for reduced syscall/lock overhead.
+    /// </summary>
+    Task<bool> SendBatchAsync(Client client, List<byte[]> packets);
+
+    /// <summary>
     /// Sends data via TCP interleaved transport.
     /// </summary>
     /// <param name="socket">The socket.</param>

@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Threading.Channels;
 using Android.Content;
 using BaluMediaServer.Interfaces;
@@ -17,12 +16,14 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
     private CameraFrameCaptureService? _cameraCapture;
     private readonly Context _context;
     private readonly CancellationTokenSource _cts = new();
-    //private readonly BlockingCollection<VideoFrame> _videoFrames = new(25);
-    private Channel<VideoFrame> _videoFrames = default!;
+    // Channel holds managed FrameEventArgs (not Java VideoFrame objects) so that the
+    // processing thread never needs JNI calls — avoiding Mono GC thread-state corruption.
+    private Channel<FrameEventArgs> _frameChannel = default!;
     private Task? _thread;
     private DateTime _lastFrameTime;
     private readonly TimeSpan _minFrameInterval = TimeSpan.FromMilliseconds(22); // +- 45 fps
     private volatile bool _disposed;  // Prevents JNI access after disposal
+    private int _channelCapacity;
 
     /// <summary>
     /// Calculates the channel capacity based on resolution to limit memory usage.
@@ -32,12 +33,9 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
     /// <returns>The calculated channel capacity.</returns>
     private static int GetChannelCapacity(int width, int height)
     {
-        int frameSize = (width * height * 3) / 2; // YUV420 frame size
-        // Target ~8MB max buffer to prevent memory issues at high resolutions
-        // Keep minimal buffer for high-res to reduce memory pressure
-        const int maxBufferSize = 8_000_000;
-        int capacity = Math.Max(2, maxBufferSize / frameSize);
-        return Math.Min(capacity, 10); // Cap at 10 frames max
+        // Capacity=1 with DropOldest ensures the encoder always gets the freshest frame,
+        // eliminating queue-induced latency (was 2-10 frames = 80-400ms at 25fps).
+        return 1;
     }
 
     /// <summary>
@@ -51,6 +49,7 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
     public event EventHandler<string>? ErrorOccurred;
 
     private bool _threadRunning = false;
+    private bool _loggedFirstProcessedFrame = false;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="BackCameraService"/> class.
@@ -72,11 +71,21 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
     {
         try
         {
+            // Stop and release the old native camera BEFORE creating a new one.
+            // Without this, the old Camera2 device holds the camera lock and the
+            // new instance can't open it — causing zero frames for 10-30+ seconds
+            // until GC finalizes the orphaned session.
+            try { _cameraCapture?.StopBackCameraCapture(); } catch { }
+            try { _cameraCapture?.Dispose(); } catch { }
+            _cameraCapture = null;
+
             // Create channel BEFORE starting capture to avoid race condition
             // Use dynamic capacity based on resolution to limit memory usage
-            int channelCapacity = GetChannelCapacity(width, height);
-            _videoFrames = Channel.CreateBounded<VideoFrame>(
-                new BoundedChannelOptions(channelCapacity)
+            _channelCapacity = GetChannelCapacity(width, height);
+            // Channel holds managed FrameEventArgs — DropOldest is safe since there
+            // are no native resources to recycle (data was copied in OnFrameAvailable).
+            _frameChannel = Channel.CreateBounded<FrameEventArgs>(
+                new BoundedChannelOptions(_channelCapacity)
                 {
                     FullMode = BoundedChannelFullMode.DropOldest,
                     SingleReader = true,
@@ -89,10 +98,13 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
             // Now start the camera - frames can safely arrive
             _cameraCapture = new(_context);
             _cameraCapture.SetBackCameraCallback(this);
+            _loggedFirstProcessedFrame = false;
             _cameraCapture?.StartBackCameraCapture(width, height);
+            global::Android.Util.Log.Info("[BackCameraService]", $"StartCapture({width}x{height}): camera started, channel capacity={_channelCapacity}, cts cancelled={_cts.IsCancellationRequested}");
         }
         catch (Exception ex)
         {
+            global::Android.Util.Log.Error("[BackCameraService]", $"StartCapture({width}x{height}) FAILED: {ex.Message}");
             SafeInvokeError($"Failed to start capture: {ex.Message}");
         }
     }
@@ -106,7 +118,7 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
         {
             _cameraCapture?.StopBackCameraCapture();
             _threadRunning = false;
-            _videoFrames?.Writer.TryComplete();
+            _frameChannel?.Writer.TryComplete();
         }
         catch (Exception ex)
         {
@@ -116,7 +128,11 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
 
     /// <summary>
     /// Callback invoked by the native camera service when a new frame is available.
-    /// Implements rate limiting and queues frames for processing.
+    /// Marshals all data from the Java VideoFrame into a managed FrameEventArgs and
+    /// recycles the native frame immediately. This ensures the processing thread
+    /// (ProcessFramesAsync) never crosses the JNI boundary, preventing the Mono GC
+    /// thread-state corruption that causes "Cannot transition thread from RUNNING
+    /// with DONE_BLOCKING" SIGABRT crashes.
     /// </summary>
     /// <param name="frame">The video frame from the camera.</param>
     public void OnFrameAvailable(VideoFrame frame)
@@ -124,7 +140,7 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
         try
         {
             // Check disposed flag FIRST to prevent JNI access after disposal
-            if (_disposed || _videoFrames == null)
+            if (_disposed || _frameChannel == null)
             {
                 SafeRecycleFrame(frame);
                 return;
@@ -137,10 +153,31 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
                 return; // Drop immediately
             }
             _lastFrameTime = DateTime.UtcNow;
-            if (!_videoFrames.Writer.TryWrite(frame))
+
+            // Marshal all data from Java object NOW (we're on the Java callback thread,
+            // already in JNI context) so the processing thread stays pure managed code.
+            var data = frame.GetData();
+            if (data == null || data.Length == 0)
             {
                 SafeRecycleFrame(frame);
+                return;
             }
+
+            var args = new FrameEventArgs
+            {
+                Data = data,
+                Width = frame.Width,
+                Height = frame.Height,
+                Timestamp = frame.Timestamp,
+                Format = frame.Format,
+                CameraId = frame.CameraId
+            };
+
+            // Recycle native frame IMMEDIATELY — we've copied everything we need
+            SafeRecycleFrame(frame);
+
+            // Channel uses DropOldest which is safe — FrameEventArgs is managed-only
+            _frameChannel.Writer.TryWrite(args);
         }
         catch (Exception ex)
         {
@@ -198,27 +235,19 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
     }
 
     /// <summary>
-    /// Processes a single video frame and raises the FrameReceived event.
-    /// Checks disposed flag before accessing VideoFrame JNI methods.
+    /// Raises the FrameReceived event with pre-marshaled managed data.
+    /// No JNI calls — all Java object access happened in OnFrameAvailable.
     /// </summary>
-    /// <param name="frame">The video frame to process.</param>
-    public void ProcessFrame(VideoFrame frame)
+    /// <param name="args">The pre-marshaled frame data.</param>
+    public void ProcessFrame(FrameEventArgs args)
     {
-        // Check disposed BEFORE accessing VideoFrame JNI methods to prevent SIGSEGV
         if (_disposed) return;
 
-        var args = new FrameEventArgs
+        if (!_loggedFirstProcessedFrame)
         {
-            Data = frame.GetData()!,
-            Width = frame.Width,
-            Height = frame.Height,
-            Timestamp = frame.Timestamp,
-            Format = frame.Format,
-            CameraId = frame.CameraId
-        };
-
-        // Check disposed again before invoking event
-        if (_disposed) return;
+            _loggedFirstProcessedFrame = true;
+            global::Android.Util.Log.Info("[BackCameraService]", $"First processed frame: {args.Width}x{args.Height}, {args.Data?.Length ?? 0} bytes, subscribers={FrameReceived?.GetInvocationList().Length ?? 0}");
+        }
 
         try
         {
@@ -231,37 +260,24 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
     }
 
     /// <summary>
-    /// Continuously processes frames from the channel until cancelled.
-    /// Checks disposed flag to prevent JNI access after disposal.
+    /// Continuously processes managed frame data from the channel until cancelled.
+    /// This thread makes ZERO JNI calls — all Java object access was done in
+    /// OnFrameAvailable. This prevents the Mono GC thread-state corruption crash.
     /// </summary>
     /// <returns>A task that represents the asynchronous frame processing operation.</returns>
     public async Task ProcessFramesAsync()
     {
-        // Check both _threadRunning and _disposed for clean shutdown
         while (!_cts.IsCancellationRequested && _threadRunning && !_disposed)
         {
             try
             {
-                // Check disposed before blocking read
                 if (_disposed) break;
 
-                // Use async read - this is blocking the thread currently
-                var frame = await _videoFrames.Reader.ReadAsync(_cts.Token).ConfigureAwait(false);
-                try
-                {
-                    // Check disposed after read completes, before JNI access
-                    if (_disposed)
-                    {
-                        SafeRecycleFrame(frame);
-                        break;
-                    }
-                    ProcessFrame(frame);
-                }
-                finally
-                {
-                    // Safely recycle frame buffer
-                    SafeRecycleFrame(frame);
-                }
+                var args = await _frameChannel.Reader.ReadAsync(_cts.Token).ConfigureAwait(false);
+
+                if (_disposed) break;
+
+                ProcessFrame(args);
             }
             catch (OperationCanceledException)
             {
@@ -273,7 +289,6 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
             }
             catch (Exception ex)
             {
-                // Don't log errors during disposal
                 if (!_disposed)
                 {
                     OnError(ex.Message);
@@ -321,7 +336,7 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
             _threadRunning = false;
 
             // Signal channel completion and cancel token to unblock processing task
-            _videoFrames?.Writer.TryComplete();
+            _frameChannel?.Writer.TryComplete();
             _cts?.Cancel();
 
             // Wait for processing task to fully stop BEFORE touching native resources

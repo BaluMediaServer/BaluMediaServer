@@ -23,6 +23,11 @@ public class H264Encoder : IDisposable
     private int _bitrate;
     private readonly int _frameRate;
     private bool _isRunning;
+
+    /// <summary>
+    /// Gets whether the encoder is currently running.
+    /// </summary>
+    public bool IsRunning => _isRunning;
     private Thread? _encoderThread;
     private readonly Channel<FrameData> _frameChannel;
     private readonly ArrayPool<byte> _bufferPool = ArrayPool<byte>.Create();
@@ -38,14 +43,26 @@ public class H264Encoder : IDisposable
     private const int COLOR_FormatYUV420Flexible = 2135033992;
     private long _lastTimestamp = 0;
     private int _lastLoggedSize = 0;
-    private readonly EncoderInfo _bestEncoder = new();
+    private readonly EncoderInfo _bestEncoder;
     private readonly Stopwatch _stopwatch = new();
+
+    // Cache the codec scan result — the system codec list never changes at runtime,
+    // so re-scanning on every stall restart wastes 200-700ms for nothing.
+    private static EncoderInfo? _cachedBestEncoder;
+    private static readonly object _bestEncoderCacheLock = new();
     private int _selectedColorFormat = COLOR_FormatYUV420SemiPlanar;
+    private int _encoderStride;    // Actual encoder input row stride (may differ from _width)
+    private int _encoderSliceHeight; // Actual encoder Y plane height (may differ from _height)
 
     // Frame-rate synchronized timestamp management
     private long _frameNumber = 0;
     private long _frameIntervalUs; // Microseconds per frame based on target FPS
     private long _baseTimestamp = -1;
+
+    // Output stall detection: if input is fed but no output for this duration, encoder is stalled
+    private long _lastOutputTicks;
+    private long _lastInputTicks;
+    private static readonly long StallThresholdTicks = Stopwatch.Frequency; // 1 second
 
     /// <summary>
     /// Event raised when a frame has been encoded and is ready for streaming.
@@ -76,6 +93,16 @@ public class H264Encoder : IDisposable
         /// Gets or sets the presentation timestamp in microseconds.
         /// </summary>
         public long Timestamp { get; set; }
+
+        /// <summary>
+        /// Gets or sets the source frame width (camera resolution, may differ from encoder).
+        /// </summary>
+        public int SourceWidth { get; set; }
+
+        /// <summary>
+        /// Gets or sets the source frame height (camera resolution, may differ from encoder).
+        /// </summary>
+        public int SourceHeight { get; set; }
     }
 
     /// <summary>
@@ -100,18 +127,31 @@ public class H264Encoder : IDisposable
         // Concurrent JNI calls to MediaCodec from different threads can cause
         // vendor-specific stalls (especially on MediaTek).
         _frameChannel = Channel.CreateBounded<FrameData>(
-            new BoundedChannelOptions(5)
+            new BoundedChannelOptions(1)
             {
                 FullMode = BoundedChannelFullMode.DropOldest,
                 SingleReader = true,
                 SingleWriter = false
             });
 
-        var codecList = new MediaCodecList(new());
-        var codecInfos = codecList.GetCodecInfos();
-
-        _bestEncoder = SelectBestEncoder(codecInfos!);
+        _bestEncoder = GetCachedBestEncoder();
     }
+
+    private static EncoderInfo GetCachedBestEncoder()
+    {
+        lock (_bestEncoderCacheLock)
+        {
+            if (_cachedBestEncoder == null)
+            {
+                var codecList = new MediaCodecList(new());
+                var codecInfos = codecList.GetCodecInfos();
+                _cachedBestEncoder = SelectBestEncoder(codecInfos!);
+                Log.Info("H264MTK", $"Encoder selection cached: {_cachedBestEncoder?.Name ?? "none"}");
+            }
+            return _cachedBestEncoder;
+        }
+    }
+
     private static readonly Dictionary<string, int> EncoderPriority = new Dictionary<string, int>
     {
         // Hardware encoders (highest priority)
@@ -273,8 +313,10 @@ public class H264Encoder : IDisposable
             var videoCaps = caps.VideoCapabilities;
             if (videoCaps != null)
             {
-                encoderInfo.MaxSupportedWidth = (int)videoCaps.SupportedWidths.Upper;
-                encoderInfo.MaxSupportedHeight = (int)videoCaps.SupportedHeights.Upper;
+                var widthUpper = videoCaps.SupportedWidths?.Upper;
+                var heightUpper = videoCaps.SupportedHeights?.Upper;
+                if (widthUpper != null) encoderInfo.MaxSupportedWidth = (int)widthUpper;
+                if (heightUpper != null) encoderInfo.MaxSupportedHeight = (int)heightUpper;
                 encoderInfo.Supports4K = videoCaps.IsSizeSupported(3840, 2160);
                 encoderInfo.SupportsQHD = videoCaps.IsSizeSupported(2560, 1440);
                 encoderInfo.SupportsFullHD = videoCaps.IsSizeSupported(1920, 1080);
@@ -364,6 +406,49 @@ public class H264Encoder : IDisposable
     }
 
     /// <summary>
+    /// Probes the hardware encoder to find the nearest supported resolution without
+    /// actually creating or starting an encoder. Use this to configure the camera at
+    /// a resolution the encoder can handle, avoiding a costly camera restart.
+    /// </summary>
+    public static (int width, int height) ProbeSupportedResolution(int requestedWidth, int requestedHeight)
+    {
+        try
+        {
+            var codecList = new MediaCodecList(new());
+            var codecInfos = codecList.GetCodecInfos();
+            var best = SelectBestEncoder(codecInfos!);
+            if (best?.Capabilities?.VideoCapabilities == null)
+                return (requestedWidth, requestedHeight);
+
+            var videoCaps = best.Capabilities.VideoCapabilities;
+            if (videoCaps.IsSizeSupported(requestedWidth, requestedHeight))
+                return (requestedWidth, requestedHeight);
+
+            // Try common resolutions in descending order
+            var resolutions = new[] {
+                (3840, 2160), (2560, 1440), (1920, 1080), (1280, 720),
+                (800, 600), (640, 480), (320, 240)
+            };
+
+            foreach (var (w, h) in resolutions)
+            {
+                if (w <= requestedWidth && h <= requestedHeight && videoCaps.IsSizeSupported(w, h))
+                {
+                    Log.Info("H264", $"ProbeSupportedResolution: {requestedWidth}x{requestedHeight} not supported, using {w}x{h}");
+                    return (w, h);
+                }
+            }
+
+            return (640, 480);
+        }
+        catch (Exception ex)
+        {
+            Log.Error("H264", $"ProbeSupportedResolution error: {ex.Message}");
+            return (requestedWidth, requestedHeight);
+        }
+    }
+
+    /// <summary>
     /// Starts the H.264 encoder and begins the encoding loop.
     /// </summary>
     /// <returns><c>true</c> if the encoder started successfully; otherwise, <c>false</c>.</returns>
@@ -387,17 +472,18 @@ public class H264Encoder : IDisposable
                 // Create format with encoder's supported color format
                 var format = MediaFormat.CreateVideoFormat(MediaFormat.MimetypeVideoAvc, _width, _height);
 
-                // Use the best color format from the selected encoder
-                // Prefer YUV420Flexible as it handles stride/alignment automatically
-                if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420Flexible))
-                {
-                    _selectedColorFormat = COLOR_FormatYUV420Flexible;
-                    Log.Debug("H264", "Using COLOR_FormatYUV420Flexible");
-                }
-                else if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420SemiPlanar))
+                // Prefer NV12 (SemiPlanar) — it has a well-defined buffer layout for raw
+                // ByteBuffer writes. COLOR_FormatYUV420Flexible has undefined layout for
+                // raw writes and causes green corruption at higher resolutions.
+                if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420SemiPlanar))
                 {
                     _selectedColorFormat = COLOR_FormatYUV420SemiPlanar; // NV12
                     Log.Debug("H264", "Using COLOR_FormatYUV420SemiPlanar (NV12)");
+                }
+                else if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420Flexible))
+                {
+                    _selectedColorFormat = COLOR_FormatYUV420Flexible;
+                    Log.Warn("H264", "Using COLOR_FormatYUV420Flexible (NV12 unavailable)");
                 }
                 else
                 {
@@ -452,20 +538,45 @@ public class H264Encoder : IDisposable
                 }
                 encoder.Configure(format, null, null, MediaCodecConfigFlags.Encode);
 
-                // Set bitrate mode after configuration if supported
+                // Now start the encoder
+                encoder.Start();
+
+                // Reinforce bitrate after Start() — SetParameters requires a started codec.
+                // The bitrate was already set in MediaFormat before Configure(), but some
+                // SoCs (MediaTek) may ignore it; this dynamic update ensures compliance.
                 if (Build.VERSION.SdkInt >= BuildVersionCodes.R)
                 {
                     var bundle = new Bundle();
-                    bundle.PutInt(MediaCodec.ParameterKeyVideoBitrate, 
-                        (int)BitrateMode.CbrFd);
+                    bundle.PutInt(MediaCodec.ParameterKeyVideoBitrate, _bitrate);
                     encoder.SetParameters(bundle);
                 }
 
-                // Now start the encoder
-                encoder.Start();
-                
                 _encoder = encoder;
                 _isRunning = true;
+
+                // Query actual input format to get stride and sliceHeight
+                // MediaCodec may use larger stride/sliceHeight for alignment
+                _encoderStride = _width;
+                _encoderSliceHeight = _height;
+                try
+                {
+                    var inputFormat = encoder.InputFormat;
+                    if (inputFormat != null)
+                    {
+                        _encoderStride = inputFormat.GetInteger(MediaFormat.KeyStride, _width);
+                        _encoderSliceHeight = inputFormat.GetInteger(MediaFormat.KeySliceHeight, _height);
+
+                        // Some encoders return 0 meaning "same as configured"
+                        if (_encoderStride <= 0) _encoderStride = _width;
+                        if (_encoderSliceHeight <= 0) _encoderSliceHeight = _height;
+
+                        Log.Info("H264", $"Encoder input: stride={_encoderStride}, sliceHeight={_encoderSliceHeight} (video={_width}x{_height})");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn("H264", $"Could not query input format: {ex.Message}");
+                }
 
                 // Start encoding thread
                 _encoderThread = new Thread(EncodingLoop)
@@ -500,6 +611,30 @@ public class H264Encoder : IDisposable
                 _encoder = null;
                 _isRunning = false;
                 return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Signals the encoder to produce an IDR (keyframe) on the next output frame.
+    /// Call this when a new client connects so their decoder can start immediately
+    /// instead of waiting up to one full I-frame interval (1 second at current settings).
+    /// </summary>
+    public void RequestKeyFrame()
+    {
+        lock (_lock)
+        {
+            if (!_isRunning || _encoder == null || _disposed) return;
+            try
+            {
+                var bundle = new Bundle();
+                bundle.PutInt(MediaCodec.ParameterKeyRequestSyncFrame, 0);
+                _encoder.SetParameters(bundle);
+                Log.Debug("H264MTK", "IDR keyframe requested for new client");
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("H264MTK", $"RequestKeyFrame failed: {ex.Message}");
             }
         }
     }
@@ -541,11 +676,11 @@ public class H264Encoder : IDisposable
     /// </summary>
     /// <param name="frameData">The raw YUV420 frame data.</param>
     /// <param name="timestamp">The presentation timestamp in microseconds.</param>
-    public void QueueFrame(byte[] frameData, long timestamp)
+    public void QueueFrame(byte[] frameData, long timestamp, int sourceWidth = 0, int sourceHeight = 0)
     {
         if (!_isRunning) return;
 
-        _frameChannel.Writer.TryWrite(new() { Data = frameData, Timestamp = timestamp });
+        _frameChannel.Writer.TryWrite(new() { Data = frameData, Timestamp = timestamp, SourceWidth = sourceWidth, SourceHeight = sourceHeight });
     }
 
     /// <summary>
@@ -605,6 +740,10 @@ public class H264Encoder : IDisposable
         int consecutiveErrors = 0;
         const int maxConsecutiveErrors = 10;
 
+        long now = Stopwatch.GetTimestamp();
+        _lastOutputTicks = now;
+        _lastInputTicks = 0;
+
         Log.Debug("H264MTK", "Encoding loop started");
 
         try
@@ -626,6 +765,11 @@ public class H264Encoder : IDisposable
                     // This prevents input buffer starvation when the encoder's internal queue is full.
                     processedOutput = DrainOutputBuffer(bufferInfo, ref sps, ref pps, ref gotFirstOutput);
 
+                    if (processedOutput)
+                    {
+                        _lastOutputTicks = Stopwatch.GetTimestamp();
+                    }
+
                     // Check disposed again before feeding input
                     if (_disposed) break;
 
@@ -634,12 +778,31 @@ public class H264Encoder : IDisposable
                     {
                         FeedInputBuffer(frame);
                         processedInput = true;
+                        _lastInputTicks = Stopwatch.GetTimestamp();
                     }
 
-                    // Small sleep to prevent CPU spinning only if nothing was processed
+                    // Output stall detection: input is being fed but no output for too long
+                    // means the hardware encoder (MediaCodec) is internally deadlocked or never started producing
+                    if (_lastInputTicks > 0)
+                    {
+                        long currentTicks = Stopwatch.GetTimestamp();
+                        long sinceLastOutput = currentTicks - _lastOutputTicks;
+                        long sinceLastInput = currentTicks - _lastInputTicks;
+
+                        if (sinceLastOutput > StallThresholdTicks && sinceLastInput < StallThresholdTicks && gotFirstOutput)
+                        {
+                            Log.Error("H264MTK", $"Output stall detected: no output for {sinceLastOutput / Stopwatch.Frequency}s while input is active (gotFirstOutput={gotFirstOutput}) — stopping encoder");
+                            _isRunning = false;
+                            break;
+                        }
+                    }
+
+                    // SpinWait auto-escalates: spin → yield → short sleep, giving sub-ms
+                    // wake-up instead of Thread.Sleep(1) which sleeps 1-15ms on Android.
                     if (!processedInput && !processedOutput)
                     {
-                        Thread.Sleep(1);
+                        var sw = new SpinWait();
+                        sw.SpinOnce();
                     }
 
                     // Reset error counter on successful iteration
@@ -681,6 +844,9 @@ public class H264Encoder : IDisposable
     /// Handles color format conversion and stride padding as needed.
     /// </summary>
     /// <param name="frame">The frame data to encode.</param>
+    private bool _loggedFirstFeed = false;
+    private bool _loggedFirstWriteFrame = false;
+
     public void FeedInputBuffer(FrameData frame)
     {
         // Check disposed flag BEFORE any JNI calls to prevent SIGSEGV
@@ -688,13 +854,13 @@ public class H264Encoder : IDisposable
 
         try
         {
-            // Wait up to 5ms for an input buffer (reduced for lower latency)
-            var inputIndex = _encoder.DequeueInputBuffer(5000);
-            
+            // Wait up to 1ms for an input buffer (low latency)
+            var inputIndex = _encoder.DequeueInputBuffer(1000);
+
             if (inputIndex >= 0)
             {
                 ByteBuffer? inputBuffer;
-                
+
                 if (Build.VERSION.SdkInt >= BuildVersionCodes.Lollipop)
                 {
                     inputBuffer = _encoder.GetInputBuffer(inputIndex);
@@ -706,7 +872,7 @@ public class H264Encoder : IDisposable
                     inputBuffer = buffers?[inputIndex];
 #pragma warning restore CS0618
                 }
-                
+
                 if (inputBuffer != null)
                 {
                     inputBuffer.Clear();
@@ -714,48 +880,19 @@ public class H264Encoder : IDisposable
                     // Calculate expected size for the encoder (width * height * 1.5 for YUV420)
                     int expectedSize = (_width * _height * 3) / 2;
 
-                    // Start with raw frame data
                     byte[] frameData = frame.Data;
 
-                    // Log size mismatch for debugging (only once per unique size)
-                    if (frameData.Length != expectedSize && _lastLoggedSize != frameData.Length)
+                    // One-time diagnostic log
+                    if (!_loggedFirstFeed)
                     {
-                        _lastLoggedSize = frameData.Length;
-                        Log.Info("H264", $"Frame size: {frameData.Length}, encoder expects: {expectedSize} for {_width}x{_height}, diff: {frameData.Length - expectedSize}");
+                        _loggedFirstFeed = true;
+                        Log.Info("H264", $"DIAG feed: frameLen={frameData.Length}, expected={expectedSize}, encoder={_width}x{_height}, src={frame.SourceWidth}x{frame.SourceHeight}, bufCap={inputBuffer.Capacity()}, stride={_encoderStride}, slice={_encoderSliceHeight}, colorFmt={_selectedColorFormat}");
                     }
 
-                    // FIRST: Handle stride padding from camera BEFORE any color conversion
-                    // This must happen on the original NV21 data
-                    if (frameData.Length > expectedSize)
-                    {
-                        // Frame larger than expected - has row stride padding
-                        // Need to remove padding row by row to avoid artifacts
-                        frameData = RemoveRowStridePadding(frameData, _width, _height);
-                    }
-                    else if (frameData.Length < expectedSize)
-                    {
-                        // Frame smaller than expected - pad
-                        byte[] padded = new byte[expectedSize];
-                        System.Buffer.BlockCopy(frameData, 0, padded, 0, frameData.Length);
-                        frameData = padded;
-                    }
-
-                    // THEN: Apply color format conversion if needed
-                    // YUV420Flexible can accept NV21 directly, NV12 needs conversion
-                    if (_selectedColorFormat != COLOR_FormatYUV420Flexible)
-                    {
-                        // Convert NV21 to NV12 for SemiPlanar format (now on stride-corrected data)
-                        frameData = ConvertNV21ToNV12(frameData);
-                    }
-
-                    // Ensure buffer can hold the entire frame
-                    if (inputBuffer.Capacity() < frameData.Length)
-                    {
-                        Log.Warn("H264MTK", $"Input buffer too small: {inputBuffer.Capacity()} < {frameData.Length}");
-                    }
-
-                    var dataSize = Math.Min(frameData.Length, inputBuffer.Capacity());
-                    inputBuffer.Put(frameData, 0, dataSize);
+                    // Write frame directly to encoder buffer with correct stride/sliceHeight layout
+                    // This avoids intermediate allocations and handles the MediaTek sliceHeight > height case
+                    int dataSize = WriteFrameToEncoderBuffer(inputBuffer, frameData,
+                        frame.SourceWidth, frame.SourceHeight);
 
                     _encoder.QueueInputBuffer(inputIndex, 0, dataSize, frame.Timestamp, 0);
                     _lastTimestamp = frame.Timestamp;
@@ -768,27 +905,217 @@ public class H264Encoder : IDisposable
         }
     }
     /// <summary>
-    /// Handles frame data that is larger than expected due to camera stride padding.
-    /// Uses simple truncation - takes only the expected bytes.
+    /// Writes camera frame data directly to the encoder's input buffer.
+    /// Handles all transformations in one pass:
+    /// 1. Convert NV21 (camera) → NV12 (encoder) by swapping V/U bytes
+    /// 2. Write with correct stride/sliceHeight layout for the encoder
+    ///
+    /// Important: MediaTek cameras may produce oversized buffers (e.g., 1843198 bytes for
+    /// a 1280x720 frame) but the NV21 UV plane always starts at width * height — right after
+    /// the declared Y rows. The extra bytes are buffer padding, NOT extra Y rows.
+    /// Reading UV from the wrong offset (e.g., width * bufferHeight) causes green corruption.
     /// </summary>
-    private byte[] RemoveRowStridePadding(byte[] frameData, int width, int height)
+    private int WriteFrameToEncoderBuffer(ByteBuffer inputBuffer, byte[] frameData,
+        int srcWidth, int srcHeight)
     {
-        int expectedSize = (width * height * 3) / 2;
+        int stride = _encoderStride;
+        int sliceHeight = _encoderSliceHeight;
 
-        // If frame matches or is smaller, handle simply
-        if (frameData.Length <= expectedSize)
+        // Source data layout (NV21):
+        // Y plane: srcWidth * srcHeight bytes at offset 0
+        // VU plane: srcWidth * (srcHeight/2) bytes at offset srcWidth * srcHeight
+        // Note: MediaTek cameras may produce oversized buffers (e.g., 1843198 bytes for
+        // 1280x720) but the UV plane always starts right after srcHeight rows of Y,
+        // NOT after the full buffer. The extra bytes are buffer padding.
+        int actualSrcHeight = srcHeight;
+        int srcYStride = srcWidth;
+        int srcUvStart = srcWidth * srcHeight;
+
+        // Encoder buffer layout (NV12):
+        // Y plane: stride * sliceHeight bytes at offset 0
+        // UV plane: stride * (sliceHeight/2) bytes at offset stride * sliceHeight
+        int dstYPlaneSize = stride * sliceHeight;
+        int dstUvPlaneSize = stride * (sliceHeight / 2);
+        int totalDstSize = dstYPlaneSize + dstUvPlaneSize;
+
+        // Deduce sliceHeight from buffer capacity if query failed (defaults matched height)
+        if (sliceHeight == _height && inputBuffer.Capacity() > totalDstSize + stride)
         {
-            if (frameData.Length == expectedSize)
-                return frameData;
-            byte[] paddedData = new byte[expectedSize];
-            System.Buffer.BlockCopy(frameData, 0, paddedData, 0, frameData.Length);
-            return paddedData;
+            // Buffer is larger than expected — encoder likely has bigger sliceHeight
+            // sliceHeight = bufferCapacity * 2 / (stride * 3)
+            int deducedSlice = (inputBuffer.Capacity() * 2) / (stride * 3);
+            if (deducedSlice > _height && (deducedSlice <= _height + 256 || deducedSlice <= actualSrcHeight + 16))
+            {
+                sliceHeight = deducedSlice;
+                _encoderSliceHeight = sliceHeight;
+                dstYPlaneSize = stride * sliceHeight;
+                dstUvPlaneSize = stride * (sliceHeight / 2);
+                totalDstSize = dstYPlaneSize + dstUvPlaneSize;
+                Log.Info("H264", $"Deduced encoder sliceHeight={sliceHeight} from bufCap={inputBuffer.Capacity()} (stride={stride})");
+            }
         }
 
-        // Simple truncation - just take the first expectedSize bytes
-        byte[] truncated = new byte[expectedSize];
-        System.Buffer.BlockCopy(frameData, 0, truncated, 0, expectedSize);
-        return truncated;
+        if (!_loggedFirstWriteFrame)
+        {
+            _loggedFirstWriteFrame = true;
+            Log.Info("H264", $"WriteFrame: src={srcWidth}x{srcHeight}, encoder={_width}x{_height}, stride={stride}, slice={sliceHeight}, bufCap={inputBuffer.Capacity()}, srcUvStart={srcUvStart}, dstYPlane={dstYPlaneSize}, frameLen={frameData.Length}");
+        }
+
+        int copyWidth = Math.Min(srcWidth, _width);
+        int copyHeight = Math.Min(actualSrcHeight, _height);
+
+        // Build the output in a pooled byte array matching the encoder's expected layout
+        int encoderDataSize = Math.Min(totalDstSize, inputBuffer.Capacity());
+        byte[] encoderData = _bufferPool.Rent(encoderDataSize);
+        Array.Clear(encoderData, 0, encoderDataSize);
+
+        // Copy Y plane: crop top-left of source into encoder layout
+        for (int row = 0; row < copyHeight; row++)
+        {
+            int srcOff = row * srcYStride;
+            int dstOff = row * stride;
+            if (srcOff + copyWidth > frameData.Length) break;
+            if (dstOff + copyWidth > encoderDataSize) break;
+            System.Buffer.BlockCopy(frameData, srcOff, encoderData, dstOff, copyWidth);
+        }
+
+        // Copy UV plane: NV21 (VU interleaved) → NV12 (UV interleaved) with U/V swap
+        int copyUvHeight = Math.Min(actualSrcHeight / 2, _height / 2);
+        int copyUvWidth = (copyWidth / 2) * 2; // Ensure even for chroma pairs
+        for (int row = 0; row < copyUvHeight; row++)
+        {
+            int srcOff = srcUvStart + row * srcYStride;
+            int dstOff = dstYPlaneSize + row * stride;
+            if (srcOff + copyUvWidth > frameData.Length) break;
+            if (dstOff + copyUvWidth > encoderDataSize) break;
+            // Swap V,U → U,V while copying
+            for (int i = 0; i < copyUvWidth - 1; i += 2)
+            {
+                encoderData[dstOff + i] = frameData[srcOff + i + 1];     // U
+                encoderData[dstOff + i + 1] = frameData[srcOff + i];     // V
+            }
+        }
+
+        int writeSize = Math.Min(encoderDataSize, inputBuffer.Capacity());
+        inputBuffer.Put(encoderData, 0, writeSize);
+        _bufferPool.Return(encoderData);
+        return writeSize;
+    }
+
+    /// <summary>
+    /// Crops and de-strides a YUV420/NV21 frame from source resolution to encoder resolution.
+    /// Handles stride padding (row stride > image width) by doing row-by-row copies.
+    /// The NV21 UV plane is always at offset width * height (declared dimensions),
+    /// even when the buffer is oversized (e.g., MediaTek padding).
+    /// </summary>
+    private byte[] CropAndDestrideFrame(byte[] frameData, int srcWidth, int srcHeight, int dstWidth, int dstHeight)
+    {
+        int dstSize = (dstWidth * dstHeight * 3) / 2;
+
+        // If source dimensions are unknown, try to infer or fall back to simple handling
+        if (srcWidth <= 0 || srcHeight <= 0)
+        {
+            if (frameData.Length >= dstSize)
+            {
+                byte[] truncated = new byte[dstSize];
+                System.Buffer.BlockCopy(frameData, 0, truncated, 0, dstSize);
+                return truncated;
+            }
+            byte[] padded = new byte[dstSize];
+            System.Buffer.BlockCopy(frameData, 0, padded, 0, Math.Min(frameData.Length, dstSize));
+            return padded;
+        }
+
+        // Detect stride padding (wider rows) from oversized buffers.
+        // Note: MediaTek cameras may produce oversized buffers (e.g., 1843198 bytes for
+        // 1280x720) but the NV21 UV plane always starts at width * height. The extra bytes
+        // are buffer padding, NOT extra Y rows. Do not inflate actualSrcHeight.
+        int srcStride = srcWidth;
+        int actualSrcHeight = srcHeight;
+        int expectedSize = (srcWidth * srcHeight * 3) / 2;
+
+        if (frameData.Length > expectedSize)
+        {
+            // Check if extra data is from stride padding (wider rows)
+            int totalRows = srcHeight + srcHeight / 2;
+            int strideFromData = totalRows > 0 ? (frameData.Length + totalRows - 1) / totalRows : srcWidth;
+            int sizeFromStride = (strideFromData * srcHeight * 3) / 2;
+            bool strideFits = Math.Abs(sizeFromStride - frameData.Length) <= 16 && strideFromData > srcWidth;
+
+            if (strideFits)
+            {
+                srcStride = strideFromData;
+            }
+            // Otherwise: oversized buffer with no stride padding — use declared dimensions
+        }
+
+        // Sanity check: stride should be >= source width
+        if (srcStride < srcWidth)
+            srcStride = srcWidth;
+
+        // Log crop parameters once for debugging
+        if (_lastLoggedSize != frameData.Length)
+        {
+            Log.Info("H264", $"CropAndDestride: src={srcWidth}x{srcHeight} actual={srcStride}x{actualSrcHeight}, dst={dstWidth}x{dstHeight}, data={frameData.Length}");
+        }
+
+        // If source and dest are same resolution and no stride padding, return as-is
+        if (srcStride == dstWidth && actualSrcHeight == dstHeight && frameData.Length == dstSize)
+            return frameData;
+
+        // Fast path: no stride padding and width matches — contiguous crop
+        if (srcStride == dstWidth && srcWidth == dstWidth && actualSrcHeight >= dstHeight)
+        {
+            byte[] result = new byte[dstSize];
+            // Copy Y plane: first dstHeight rows contiguously
+            int yBytes = dstWidth * dstHeight;
+            System.Buffer.BlockCopy(frameData, 0, result, 0, yBytes);
+            // Copy UV plane: starts at srcWidth * srcHeight (declared height, not buffer height)
+            int srcUvStart = srcWidth * srcHeight;
+            int uvBytes = dstWidth * (dstHeight / 2);
+            if (srcUvStart + uvBytes <= frameData.Length)
+            {
+                System.Buffer.BlockCopy(frameData, srcUvStart, result, yBytes, uvBytes);
+            }
+            return result;
+        }
+
+        // General path: row-by-row copy for stride and/or width mismatch
+        {
+            byte[] result = new byte[dstSize];
+            int copyWidth = Math.Min(srcWidth, dstWidth);
+            int copyHeight = Math.Min(actualSrcHeight, dstHeight);
+
+            // Copy Y plane: row by row, taking top-left crop
+            int srcOffset = 0;
+            int dstOffset = 0;
+            for (int row = 0; row < copyHeight; row++)
+            {
+                if (srcOffset + copyWidth > frameData.Length) break;
+                System.Buffer.BlockCopy(frameData, srcOffset, result, dstOffset, copyWidth);
+                srcOffset += srcStride;
+                dstOffset += dstWidth;
+            }
+
+            // Copy VU plane (NV21 interleaved): row by row, taking top-left crop
+            // VU plane starts at srcStride * srcHeight (declared height, not buffer height)
+            int srcUvStart = srcStride * srcHeight;
+            int dstUvStart = dstWidth * dstHeight;
+            int copyUvHeight = Math.Min(srcHeight / 2, dstHeight / 2);
+            int copyUvWidth = (copyWidth / 2) * 2;
+
+            srcOffset = srcUvStart;
+            dstOffset = dstUvStart;
+            for (int row = 0; row < copyUvHeight; row++)
+            {
+                if (srcOffset + copyUvWidth > frameData.Length) break;
+                System.Buffer.BlockCopy(frameData, srcOffset, result, dstOffset, copyUvWidth);
+                srcOffset += srcStride;
+                dstOffset += dstWidth;
+            }
+
+            return result;
+        }
     }
 
     private byte[] ConvertNV21ToNV12Pooled(byte[] nv21)
@@ -834,8 +1161,8 @@ public class H264Encoder : IDisposable
 
         try
         {
-            // Wait up to 5ms for output (reduced for lower latency)
-            var outputIndex = _encoder.DequeueOutputBuffer(bufferInfo, 5000);
+            // Wait up to 1ms for output (low latency)
+            var outputIndex = _encoder.DequeueOutputBuffer(bufferInfo, 1000);
             
             if (outputIndex >= 0)
             {
@@ -1123,9 +1450,9 @@ public class H264Encoder : IDisposable
             // This prevents SIGSEGV from encoder thread accessing disposed objects
             if (_encoderThread != null && _encoderThread.IsAlive)
             {
-                if (!_encoderThread.Join(3000))
+                if (!_encoderThread.Join(500))
                 {
-                    Log.Warn("H264MTK", "Encoder thread did not stop within 3s timeout");
+                    Log.Warn("H264MTK", "Encoder thread did not stop within 500ms timeout");
                 }
             }
 
@@ -1141,9 +1468,9 @@ public class H264Encoder : IDisposable
                     catch { }
                 });
 
-                if (!releaseTask.Wait(TimeSpan.FromSeconds(3)))
+                if (!releaseTask.Wait(TimeSpan.FromSeconds(0.5)))
                 {
-                    Log.Warn("H264MTK", "Encoder.Release() timed out (3s) - may cause resource leak");
+                    Log.Warn("H264MTK", "Encoder.Release() timed out (500ms) - may cause resource leak");
                 }
             }
             catch (System.Exception ex)

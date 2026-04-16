@@ -47,18 +47,20 @@ public class SdpGenerator : ISdpGenerator
     {
         var serverIp = GetLocalIpAddress();
         var sdp = new StringBuilder();
-        sdp.AppendLine("v=0");
-        sdp.AppendLine($"o=- {DateTime.UtcNow.Ticks} 1 IN IP4 {serverIp}");
-        sdp.AppendLine("s=RTSP Server Stream");
-        sdp.AppendLine("t=0 0");
-        sdp.AppendLine("a=tool:BaluMediaServer");
-        sdp.AppendLine("a=sendonly");
+        // RFC 4566 requires CRLF line endings — AppendLine() uses platform-native
+        // endings (\n on Android), so we use explicit \r\n instead
+        sdp.Append("v=0\r\n");
+        sdp.Append($"o=- {DateTime.UtcNow.Ticks} 1 IN IP4 {serverIp}\r\n");
+        sdp.Append("s=RTSP Server Stream\r\n");
+        sdp.Append("t=0 0\r\n");
+        sdp.Append("a=tool:BaluMediaServer\r\n");
+        sdp.Append("a=sendonly\r\n");
 
         if (codec == CodecType.H264)
         {
-            sdp.AppendLine("m=video 0 RTP/AVP 96");
-            sdp.AppendLine($"c=IN IP4 {serverIp}");
-            sdp.AppendLine("a=rtpmap:96 H264/90000");
+            sdp.Append("m=video 0 RTP/AVP 96\r\n");
+            sdp.Append($"c=IN IP4 {serverIp}\r\n");
+            sdp.Append("a=rtpmap:96 H264/90000\r\n");
 
             // Build fmtp line with sprop-parameter-sets for VLC and other players
             var fmtpParams = new StringBuilder("profile-level-id=42e01e;packetization-mode=1");
@@ -75,15 +77,15 @@ public class SdpGenerator : ISdpGenerator
             {
                 fmtpParams.Append($";sprop-parameter-sets={spropParams}");
             }
-            sdp.AppendLine($"a=fmtp:96 {fmtpParams}");
-            sdp.AppendLine("a=control:trackID=0");
+            sdp.Append($"a=fmtp:96 {fmtpParams}\r\n");
+            sdp.Append("a=control:trackID=0\r\n");
         }
         else
         {
-            sdp.AppendLine("m=video 0 RTP/AVP 26");
-            sdp.AppendLine($"c=IN IP4 {serverIp}");
-            sdp.AppendLine("a=rtpmap:26 JPEG/90000");
-            sdp.AppendLine("a=control:trackID=0");
+            sdp.Append("m=video 0 RTP/AVP 26\r\n");
+            sdp.Append($"c=IN IP4 {serverIp}\r\n");
+            sdp.Append("a=rtpmap:26 JPEG/90000\r\n");
+            sdp.Append("a=control:trackID=0\r\n");
         }
 
         return sdp.ToString();

@@ -193,7 +193,10 @@ public class Client : IDisposable
     /// Gets or sets the timestamp of the last successful network activity.
     /// Used for connection health monitoring.
     /// </summary>
-    public DateTime LastActivityTime { get; set; } = DateTime.UtcNow;
+    /// <summary>
+    /// Monotonic millisecond timestamp of last successful send (from Environment.TickCount64).
+    /// </summary>
+    public long LastActivityTick { get; set; } = Environment.TickCount64;
 
     /// <summary>
     /// Gets or sets the count of consecutive send errors.

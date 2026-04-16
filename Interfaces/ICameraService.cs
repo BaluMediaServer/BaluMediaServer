@@ -1,4 +1,4 @@
-using Com.BaluMedia.CameraStreamer;
+using BaluMediaServer.Models;
 
 namespace BaluMediaServer.Interfaces;
 
@@ -21,10 +21,10 @@ public interface ICameraService : IDisposable
     public void StopCapture();
 
     /// <summary>
-    /// Processes a single video frame from the camera.
+    /// Processes a single pre-marshaled frame and raises the FrameReceived event.
     /// </summary>
-    /// <param name="frame">The video frame to process.</param>
-    public void ProcessFrame(VideoFrame frame);
+    /// <param name="args">The managed frame data.</param>
+    public void ProcessFrame(FrameEventArgs args);
 
     /// <summary>
     /// Asynchronously processes frames from the frame queue.
