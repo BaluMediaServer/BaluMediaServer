@@ -22,7 +22,7 @@ public class H264Encoder : IDisposable
     private int _height;
     private int _bitrate;
     private readonly int _frameRate;
-    private bool _isRunning;
+    private volatile bool _isRunning;
 
     /// <summary>
     /// Gets whether the encoder is currently running.
@@ -34,6 +34,12 @@ public class H264Encoder : IDisposable
 
     private readonly object _lock = new();
     private volatile bool _disposed;  // Prevents JNI access after disposal
+
+    /// <summary>
+    /// Optional text overlay stamped into each frame's Y plane before encoding.
+    /// Set after construction; reads are lock-free (reference assignment is atomic on ARM).
+    /// </summary>
+    public Services.FrameOverlay? Overlay { get; set; }
 
     // Color formats supported by your device
     private const int COLOR_FormatYUV420Planar = 19;
@@ -415,14 +421,14 @@ public class H264Encoder : IDisposable
     /// Probes the hardware encoder to find the nearest supported resolution without
     /// actually creating or starting an encoder. Use this to configure the camera at
     /// a resolution the encoder can handle, avoiding a costly camera restart.
+    /// Uses the cached encoder selection — does not re-scan the codec list.
     /// </summary>
     public static (int width, int height) ProbeSupportedResolution(int requestedWidth, int requestedHeight)
     {
         try
         {
-            var codecList = new MediaCodecList(new());
-            var codecInfos = codecList.GetCodecInfos();
-            var best = SelectBestEncoder(codecInfos!);
+            // Reuse the cached encoder selection — scanning all codecs again wastes 200-700ms.
+            var best = GetCachedBestEncoder();
             if (best?.Capabilities?.VideoCapabilities == null)
                 return (requestedWidth, requestedHeight);
 
@@ -774,6 +780,7 @@ public class H264Encoder : IDisposable
         try
         {
             bufferInfo = new MediaCodec.BufferInfo();
+            SpinWait spinWait = default; // persisted across iterations so escalation (spin→yield→sleep) works correctly
 
             // Check both _isRunning and _disposed to ensure clean shutdown
             while (_isRunning && !_disposed)
@@ -840,10 +847,15 @@ public class H264Encoder : IDisposable
 
                     // SpinWait auto-escalates: spin → yield → short sleep, giving sub-ms
                     // wake-up instead of Thread.Sleep(1) which sleeps 1-15ms on Android.
+                    // The SpinWait is declared outside the loop so its count accumulates and
+                    // it properly escalates from spinning to yielding/sleeping when idle.
                     if (!processedInput && !processedOutput)
                     {
-                        var sw = new SpinWait();
-                        sw.SpinOnce();
+                        spinWait.SpinOnce();
+                    }
+                    else
+                    {
+                        spinWait.Reset(); // had work — reset so next idle period starts fresh
                     }
 
                     // Reset error counter on successful iteration
@@ -923,6 +935,12 @@ public class H264Encoder : IDisposable
 
                     byte[] frameData = frame.Data;
 
+                    // Stamp text overlay into Y plane before encoding (if set).
+                    // Uses the source width as the Y-plane row stride (NV21: UV at width*height).
+                    Overlay?.StampInto(frameData,
+                        frame.SourceWidth  > 0 ? frame.SourceWidth  : _width,
+                        frame.SourceHeight > 0 ? frame.SourceHeight : _height);
+
                     // One-time diagnostic log
                     if (!_loggedFirstFeed)
                     {
@@ -947,9 +965,10 @@ public class H264Encoder : IDisposable
     }
     /// <summary>
     /// Writes camera frame data directly to the encoder's input buffer.
-    /// Handles all transformations in one pass:
-    /// 1. Convert NV21 (camera) → NV12 (encoder) by swapping V/U bytes
-    /// 2. Write with correct stride/sliceHeight layout for the encoder
+    /// Performs NV21 → NV12 conversion (V/U byte swap) and stride/sliceHeight layout
+    /// in a single pass. Only zeroes unwritten padding bytes — the hot path (camera
+    /// resolution == encoder resolution, no stride) writes every byte and calls no
+    /// <see cref="Array.Clear"/> at all.
     ///
     /// Important: MediaTek cameras may produce oversized buffers (e.g., 1843198 bytes for
     /// a 1280x720 frame) but the NV21 UV plane always starts at width * height — right after
@@ -1008,7 +1027,8 @@ public class H264Encoder : IDisposable
         // Build the output in a pooled byte array matching the encoder's expected layout
         int encoderDataSize = Math.Min(totalDstSize, inputBuffer.Capacity());
         byte[] encoderData = _bufferPool.Rent(encoderDataSize);
-        Array.Clear(encoderData, 0, encoderDataSize);
+        // Do NOT clear the entire buffer — only zero bytes that won't be overwritten.
+        // Hot path (camera res == encoder res, stride == width): every byte is written → no clearing at all.
 
         // Copy Y plane: crop top-left of source into encoder layout
         for (int row = 0; row < copyHeight; row++)
@@ -1018,6 +1038,15 @@ public class H264Encoder : IDisposable
             if (srcOff + copyWidth > frameData.Length) break;
             if (dstOff + copyWidth > encoderDataSize) break;
             System.Buffer.BlockCopy(frameData, srcOff, encoderData, dstOff, copyWidth);
+            // Zero right-side column padding only when stride > copyWidth
+            if (stride > copyWidth)
+                Array.Clear(encoderData, dstOff + copyWidth, stride - copyWidth);
+        }
+        // Zero bottom Y padding rows only when sliceHeight > copyHeight
+        if (copyHeight < sliceHeight)
+        {
+            int yPadStart = copyHeight * stride;
+            Array.Clear(encoderData, yPadStart, dstYPlaneSize - yPadStart);
         }
 
         // Copy UV plane: NV21 (VU interleaved) → NV12 (UV interleaved) with U/V swap
@@ -1035,6 +1064,15 @@ public class H264Encoder : IDisposable
                 encoderData[dstOff + i] = frameData[srcOff + i + 1];     // U
                 encoderData[dstOff + i + 1] = frameData[srcOff + i];     // V
             }
+            // Zero UV column padding only when stride > copyUvWidth
+            if (stride > copyUvWidth)
+                Array.Clear(encoderData, dstOff + copyUvWidth, stride - copyUvWidth);
+        }
+        // Zero bottom UV padding rows only when sliceHeight/2 > copyUvHeight
+        if (copyUvHeight < sliceHeight / 2)
+        {
+            int uvPadStart = dstYPlaneSize + copyUvHeight * stride;
+            Array.Clear(encoderData, uvPadStart, dstUvPlaneSize - uvPadStart);
         }
 
         int writeSize = Math.Min(encoderDataSize, inputBuffer.Capacity());
@@ -1159,42 +1197,6 @@ public class H264Encoder : IDisposable
         }
     }
 
-    private byte[] ConvertNV21ToNV12Pooled(byte[] nv21)
-    {
-        int ySize = _width * _height;
-        int totalSize = ySize + (ySize / 2);
-        
-        var nv12 = _bufferPool.Rent(totalSize);
-        
-        try
-        {
-            // Y plane copy
-            System.Buffer.BlockCopy(nv21, 0, nv12, 0, ySize);
-            
-            // UV swap - vectorized if possible
-            unsafe
-            {
-                fixed (byte* srcPtr = &nv21[ySize], dstPtr = &nv12[ySize])
-                {
-                    int uvLength = totalSize - ySize;
-                    for (int i = 0; i < uvLength - 1; i += 2)
-                    {
-                        dstPtr[i] = srcPtr[i + 1];
-                        dstPtr[i + 1] = srcPtr[i];
-                    }
-                }
-            }
-            var result = new byte[totalSize];
-            Array.Copy(nv12, 0, result, 0, totalSize);
-            _bufferPool.Return(nv12);
-            return result;
-        }
-        catch
-        {
-            _bufferPool.Return(nv12);
-            throw;
-        }
-    }
     private bool DrainOutputBuffer(MediaCodec.BufferInfo bufferInfo, ref byte[]? sps, ref byte[]? pps, ref bool gotFirstOutput)
     {
         // Check disposed flag BEFORE any JNI calls to prevent SIGSEGV

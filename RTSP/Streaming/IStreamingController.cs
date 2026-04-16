@@ -16,6 +16,8 @@ public interface IStreamingController
 
     /// <summary>
     /// Gets whether streaming is currently active.
+    /// Backed by an <see cref="System.Threading.Interlocked"/>-managed integer flag;
+    /// reading this property is safe from any thread.
     /// </summary>
     bool IsStreaming { get; }
 

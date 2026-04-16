@@ -1,3 +1,7 @@
+#if ANDROID
+using BaluMediaServer.Services;
+#endif
+
 namespace BaluMediaServer.Models;
 
 /// <summary>
@@ -163,6 +167,27 @@ public class ServerConfiguration
     /// Gets or sets the password for the SSL certificate.
     /// </summary>
     public string? CertificatePassword { get; set; }
+
+#if ANDROID
+    /// <summary>
+    /// Optional text overlay slots burned into the back camera H.264 stream.
+    /// <list type="bullet">
+    ///   <item><c>null</c> — use the default layout (device name + clock in bottom-left).</item>
+    ///   <item>Empty array — disable all overlays.</item>
+    ///   <item>Non-empty array — use the supplied slots (up to 4).</item>
+    /// </list>
+    /// </summary>
+    public OverlaySlot[]? BackCameraOverlaySlots { get; set; }
+
+    /// <summary>
+    /// Optional text overlay slots burned into the front camera H.264 stream.
+    /// <list type="bullet">
+    ///   <item><c>null</c> — no overlay (front camera has no default).</item>
+    ///   <item>Non-empty array — use the supplied slots (up to 4).</item>
+    /// </list>
+    /// </summary>
+    public OverlaySlot[]? FrontCameraOverlaySlots { get; set; }
+#endif
 
     /// <summary>
     /// Gets or sets a value indicating whether the server is enabled and allowed to start.

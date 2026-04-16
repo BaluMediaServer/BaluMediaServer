@@ -45,10 +45,13 @@ public class Client : IDisposable
     /// </summary>
     public byte RtcpChannel { get; set; }
 
+    // Volatile backing field: IsPlaying is written under lock(client) in TransportManager
+    // but read lock-free in the StreamingController streaming loop.
+    private volatile bool _isPlaying;
     /// <summary>
     /// Gets or sets a value indicating whether the client is currently receiving stream data.
     /// </summary>
-    public bool IsPlaying { get; set; }
+    public bool IsPlaying { get => _isPlaying; set => _isPlaying = value; }
 
     /// <summary>
     /// Gets or sets the video width for this client's stream.
@@ -198,11 +201,14 @@ public class Client : IDisposable
     /// </summary>
     public long LastActivityTick { get; set; } = Environment.TickCount64;
 
+    // Volatile backing field: ConsecutiveSendErrors is incremented under lock(client) in
+    // TransportManager but read lock-free in the StreamingController streaming loop.
+    private volatile int _consecutiveSendErrors;
     /// <summary>
     /// Gets or sets the count of consecutive send errors.
     /// Used to detect broken connections.
     /// </summary>
-    public int ConsecutiveSendErrors { get; set; } = 0;
+    public int ConsecutiveSendErrors { get => _consecutiveSendErrors; set => _consecutiveSendErrors = value; }
 
     /// <summary>
     /// Serializes all RTP/RTCP sends for this client to prevent interleaved TCP framing corruption.

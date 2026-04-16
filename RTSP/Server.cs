@@ -32,9 +32,9 @@ public class Server : IDisposable
     private readonly string _address;
     private readonly int _port;
     private readonly int _maxClients;
-    private bool _isStreaming;
-    private bool _isCapturingFront;
-    private bool _isCapturingBack;
+    private volatile bool _isStreaming;
+    private volatile bool _isCapturingFront;
+    private volatile bool _isCapturingBack;
     private bool _mjpegServerEnabled;
 
     // Camera configuration
@@ -54,6 +54,16 @@ public class Server : IDisposable
     private FrameEventArgs? _latestBackFrame;
     private readonly object _frameFrontLock = new();
     private readonly object _frameBackLock = new();
+
+#if ANDROID
+    // Raw-frame overlay — stamped once per frame before all consumers (H264, MJPEG, event callbacks)
+    private OverlaySlot[]? _backOverlaySlots;
+    private OverlaySlot[]? _frontOverlaySlots;
+    private FrameOverlay? _backFrameOverlay;
+    private FrameOverlay? _frontFrameOverlay;
+    private bool _backOverlayInitialized;
+    private bool _frontOverlayInitialized;
+#endif
 
     // Per-camera locks to prevent races between resolution changes and concurrent SETUP/PLAY
     private readonly object _backCameraLock = new();
@@ -168,6 +178,7 @@ public class Server : IDisposable
         _streamingController.CameraStartRequested += OnCameraStartRequested;
         _streamingController.EncoderResolutionFallback += OnEncoderResolutionFallback;
         _streamingController.GetLatestFrame = GetLatestFrame;
+        _streamingController.RestartCamera = RestartCameraForStallRecovery;
         _rtcpManager.ClientCleanupRequired += (_, client) => _clientManager.CleanupClient(client);
         _rtcpManager.BitrateAdjustmentRequired += OnBitrateAdjustmentRequired;
         _encoderManager.FrameEncoded += OnEncoderFrameEncoded;
@@ -205,6 +216,13 @@ public class Server : IDisposable
         _enabled = configuration.EnableServer;
         if (configuration.StartMjpegServer)
             _mjpegServer?.Start(true);
+
+#if ANDROID
+        // Store overlay slots — applied to raw frames in OnBackFrameAvailable/OnFrontFrameAvailable
+        // so all consumers (H264, MJPEG, event callbacks) receive pre-stamped frames.
+        _backOverlaySlots  = configuration.BackCameraOverlaySlots;
+        _frontOverlaySlots = configuration.FrontCameraOverlaySlots;
+#endif
     }
 
     /// <summary>
@@ -483,6 +501,21 @@ public class Server : IDisposable
                 _loggedFirstBackFrame = true;
                 Log.Info("[RTSP Server]", $"First back frame received: {arg.Width}x{arg.Height}, {arg.Data.Length} bytes");
             }
+#if ANDROID
+            // Lazy-init overlay on first frame (dimensions only known at runtime).
+            if (!_backOverlayInitialized)
+            {
+                _backOverlayInitialized = true;
+                _backFrameOverlay = _backOverlaySlots == null
+                    ? FrameOverlay.Default(arg.Width, arg.Height)
+                    : _backOverlaySlots.Length > 0
+                        ? new FrameOverlay(arg.Width, arg.Height, _backOverlaySlots)
+                        : null; // empty array = overlay disabled
+            }
+            // Stamp in-place before all consumers so H264, MJPEG, and event subscribers
+            // all receive frames with the overlay already burned in.
+            _backFrameOverlay?.StampInto(arg.Data, arg.Width, arg.Height);
+#endif
             lock (_frameBackLock)
             {
                 var wasNull = _latestBackFrame == null;
@@ -515,6 +548,16 @@ public class Server : IDisposable
     {
         if (arg?.Data != null && arg.Data.Length > 0)
         {
+#if ANDROID
+            if (!_frontOverlayInitialized)
+            {
+                _frontOverlayInitialized = true;
+                _frontFrameOverlay = _frontOverlaySlots?.Length > 0
+                    ? new FrameOverlay(arg.Width, arg.Height, _frontOverlaySlots)
+                    : null; // no overlay on front by default
+            }
+            _frontFrameOverlay?.StampInto(arg.Data, arg.Width, arg.Height);
+#endif
             lock (_frameFrontLock)
             {
                 _latestFrontFrame = arg;
@@ -606,6 +649,44 @@ public class Server : IDisposable
         }
     }
 
+    /// <summary>
+    /// Restarts the camera and clears the latest cached frame.
+    /// Called by the stall-recovery path in StreamingController so that
+    /// WaitForFrameAndStartEncoder blocks on a fresh live frame instead of
+    /// immediately returning the stale cached frame from before the stall.
+    /// </summary>
+    private void RestartCameraForStallRecovery(int cameraId)
+    {
+        if (cameraId == 0)
+        {
+            var w = _backCameraWidth;
+            var h = _backCameraHeight;
+            lock (_backCameraLock)
+            {
+                Log.Info("[RTSP Server]", $"Stall recovery: restarting back camera {w}x{h}");
+                _backService.StopCapture();
+                lock (_frameBackLock) { _latestBackFrame = null; }
+                _isCapturingBack = false;
+                _backService.StartCapture(w, h);
+                _isCapturingBack = true;
+            }
+        }
+        else
+        {
+            var w = _frontCameraWidth;
+            var h = _frontCameraHeight;
+            lock (_frontCameraLock)
+            {
+                Log.Info("[RTSP Server]", $"Stall recovery: restarting front camera {w}x{h}");
+                _frontService.StopCapture();
+                lock (_frameFrontLock) { _latestFrontFrame = null; }
+                _isCapturingFront = false;
+                _frontService.StartCapture(w, h);
+                _isCapturingFront = true;
+            }
+        }
+    }
+
     private void OnCameraStartRequested(object? sender, int cameraId)
     {
         if (cameraId == 1)
@@ -668,7 +749,7 @@ public class Server : IDisposable
                 _encoderManager.StopEncoder(cameraId);
                 _encoderManager.ClearSpsPps();
                 _sdpGenerator.ClearSpsPps();
-                _latestFrontFrame = null;
+                lock (_frameFrontLock) { _latestFrontFrame = null; }
                 _frontService.StopCapture();
                 _isCapturingFront = false;
                 _frontService.StartCapture(actualW, actualH);
@@ -888,10 +969,28 @@ public class Server : IDisposable
                     _clientManager.CleanupClient(client);
                 }
 
-                // NOTE: Auto-stop functionality disabled for continuous streaming
-                // Cameras and encoders will keep running even when no clients are connected
-                // This prevents stream interruptions and frame drops
-                // To manually stop, use the Stop() method or stop commands via EventBus
+                // Stop H.264 encoder(s) when no clients are connected at all.
+                // "No clients" (not "no playing clients") guards the SETUP→PLAY window:
+                // a client in SETUP counts as connected, so the encoder stays warm.
+                // Camera capture is intentionally left running for fast reconnects.
+                if (_clientManager.ClientCount == 0)
+                {
+                    if (_encoderManager.IsEncoderRunning(0))
+                    {
+                        Log.Info("[RTSP Server]", "WatchDog: no clients — stopping back H264 encoder (idle stall prevention)");
+                        _encoderManager.StopEncoder(0);
+                    }
+                    if (_encoderManager.IsEncoderRunning(1))
+                    {
+                        Log.Info("[RTSP Server]", "WatchDog: no clients — stopping front H264 encoder (idle stall prevention)");
+                        _encoderManager.StopEncoder(1);
+                    }
+                    if (_isStreaming)
+                    {
+                        _isStreaming = false;
+                        _streamingController.SetStreamingState(false);
+                    }
+                }
 
                 var mjpegClientCount = _mjpegServer?.ClientCount ?? 0;
                 Log.Debug("[RTSP Server]", $"WatchDog: Active clients: RTSP={playingClients}, MJPEG={mjpegClientCount}, Cameras: Back={_isCapturingBack}, Front={_isCapturingFront}, Streaming={_isStreaming}");

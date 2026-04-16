@@ -1,4 +1,6 @@
+using System.Threading.Channels;
 using BaluMediaServer.Models;
+using BaluMediaServer.Services;
 
 namespace BaluMediaServer.RTSP.Streaming;
 
@@ -139,4 +141,11 @@ public interface IH264EncoderManager
     /// </summary>
     /// <param name="cameraId">The camera ID.</param>
     void RequestKeyFrame(int cameraId);
+
+    /// <summary>
+    /// Returns the raw channel reference for a registered client.
+    /// Cache this at session start to avoid per-frame dictionary lookups.
+    /// Returns null if the client is not registered.
+    /// </summary>
+    Channel<H264FrameEventArgs>? GetClientChannelRef(int cameraId, string clientId);
 }
