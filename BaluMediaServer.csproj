@@ -9,7 +9,7 @@
 		<!-- NuGet Package Properties -->
 		<GeneratePackageOnBuild>false</GeneratePackageOnBuild>
 		<PackageId>BaluMediaServer.CameraStreamer</PackageId>
-		<PackageVersion>1.5.16</PackageVersion>
+		<PackageVersion>1.5.25</PackageVersion>
 		<Authors>Nakano Miku 13</Authors>
 		<Company>Balu Media Server</Company>
 		<Product>Balu Media Camera Streamer</Product>
@@ -20,7 +20,7 @@
 		<RepositoryUrl>https://github.com/BaluMediaServer/BaluMediaServer</RepositoryUrl>
 		<RepositoryType>git</RepositoryType>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
-		<PackageReleaseNotes>v1.5.16: H.264 Stream Freeze Fix — Fixed critical MediaTek encoder stall caused by SetFloat(KeyIFrameInterval) being misinterpreted as 0 (all-IDR output); replaced with SetInteger. Fixed RTP timestamps 1000x too fast due to MediaCodec PresentationTimeUs units varying across SoCs; now uses Stopwatch wall-clock time for cross-device reliability. Hardened client lifecycle with graduated error counting (10 TCP / 5 UDP threshold), IsPlaying-first dead client checks, safe cleanup ordering to prevent ObjectDisposedException, and 2-second frame dequeue timeout to prevent blocking on encoder stalls. Fixed FramePacer inverted drop logic (now correctly drops burst frames, not post-stall frames). Encoding loop reordered to drain output before feeding input, reducing frame loss on resource-constrained SoCs.</PackageReleaseNotes>
+		<PackageReleaseNotes>v1.5.25: Performance, Stability &amp; FrameOverlay — Added YUV-level text burn-in (FrameOverlay) via ServerConfiguration.BackCameraOverlaySlots / FrontCameraOverlaySlots; BT.601 limited-range color conversion, drop-shadow, configurable anchor, font size, color, and alpha; H.264 only, per-frame hot path ~2µs. Fixed simultaneous-connect race: replaced volatile bool _isStreaming with Interlocked.CompareExchange on int flag so CameraStartRequested and StreamingStateChanged(true) each fire exactly once regardless of concurrent SETUP requests. Replaced Thread.Sleep in FramePacer with SpinWait for sub-millisecond precision. Added per-CameraId Channel caching in EncoderManager to avoid repeated allocation on reconnect. Selective buffer zeroing: only pad bytes written to encoder input buffer rather than zeroing the full stride-aligned region. Narrowed fan-out lock in RtpPacketBuilder to cover only the client list snapshot, not the entire send loop. Removed unreachable dead-code paths in StreamingController. Build: replaced all CA1416 Build.VERSION guards with OperatingSystem.IsAndroidVersionAtLeast(); removed stale XML doc param tags (CS1572); fixed CS8603 null-forgiving on cached encoder field; removed unused dropped-frame counters (CS0169); pinned Xamarin.AndroidX.Collection.Ktx 1.5.0.1 to silence NU1608; rewrote Transforms/Metadata.xml removing ~30 stale rules that produced BG8A00 noise.</PackageReleaseNotes>
 		
 		<!-- Include symbols for debugging -->
 		<IncludeSymbols>true</IncludeSymbols>
