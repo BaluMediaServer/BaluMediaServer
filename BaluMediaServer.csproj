@@ -40,6 +40,8 @@
 	<ItemGroup>
 		<PackageReference Include="Microsoft.Maui.Essentials" Version="$(MauiVersion)" />
 		<PackageReference Include="Microsoft.Maui.Controls" Version="9.0.51" />
+		<!-- Pin to match the version resolved by Microsoft.Maui.Controls, silencing NU1608 -->
+		<PackageReference Include="Xamarin.AndroidX.Collection.Ktx" Version="1.5.0.1" />
 	</ItemGroup>
 	<ItemGroup>
 		<AndroidLibrary Include="Jar\camerastreamer-release.aar" />

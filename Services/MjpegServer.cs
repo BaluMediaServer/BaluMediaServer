@@ -73,7 +73,6 @@ public class MjpegServer : IDisposable
     private int _backFrameCount, _frontFrameCount;
     private double _backCurrentFps, _frontCurrentFps;
     private long _totalBackFrames, _totalFrontFrames;
-    private long _droppedBackFrames, _droppedFrontFrames;
 
     // Pre-computed boundary bytes to avoid repeated allocations
     private static readonly byte[] BoundaryBytes = Encoding.ASCII.GetBytes("\r\n--frame\r\n");

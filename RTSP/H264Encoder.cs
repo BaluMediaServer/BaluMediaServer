@@ -160,7 +160,7 @@ public class H264Encoder : IDisposable
                 _cachedBestEncoder = SelectBestEncoder(codecInfos!);
                 Log.Info("H264MTK", $"Encoder selection cached: {_cachedBestEncoder?.Name ?? "none"}");
             }
-            return _cachedBestEncoder;
+            return _cachedBestEncoder!;
         }
     }
 
@@ -239,7 +239,7 @@ public class H264Encoder : IDisposable
     }
     private static bool IsHardwareAccelerated(MediaCodecInfo codecInfo)
     {
-        if (Build.VERSION.SdkInt >= BuildVersionCodes.Q)
+        if (OperatingSystem.IsAndroidVersionAtLeast(29))
         {
             return codecInfo.IsHardwareAccelerated;
         }
@@ -305,7 +305,7 @@ public class H264Encoder : IDisposable
             if (encoderCaps != null)
             {
                 // Check for low latency support
-                if (Build.VERSION.SdkInt >= BuildVersionCodes.R)
+                if (OperatingSystem.IsAndroidVersionAtLeast(31))
                 {
                     if (encoderCaps.IsBitrateModeSupported(BitrateMode.CbrFd))
                     {
@@ -315,7 +315,7 @@ public class H264Encoder : IDisposable
                 }
 
                 // Check for quality levels support
-                if (encoderCaps.QualityRange != null)
+                if (OperatingSystem.IsAndroidVersionAtLeast(28) && encoderCaps.QualityRange != null)
                 {
                     encoderInfo.Score += 5;
                 }
@@ -542,7 +542,7 @@ public class H264Encoder : IDisposable
 #pragma warning restore CA1416
                 }
 
-                if (Build.VERSION.SdkInt >= BuildVersionCodes.R) // API 30+
+                if (OperatingSystem.IsAndroidVersionAtLeast(30)) // API 30+
                 {
                     format.SetInteger(MediaFormat.KeyLowLatency, 1);
                 }
@@ -573,7 +573,7 @@ public class H264Encoder : IDisposable
                 // Reinforce bitrate after Start() — SetParameters requires a started codec.
                 // The bitrate was already set in MediaFormat before Configure(), but some
                 // SoCs (MediaTek) may ignore it; this dynamic update ensures compliance.
-                if (Build.VERSION.SdkInt >= BuildVersionCodes.R)
+                if (OperatingSystem.IsAndroidVersionAtLeast(30))
                 {
                     var bundle = new Bundle();
                     bundle.PutInt(MediaCodec.ParameterKeyVideoBitrate, _bitrate);
@@ -592,14 +592,16 @@ public class H264Encoder : IDisposable
                     var inputFormat = encoder.InputFormat;
                     if (inputFormat != null)
                     {
-                        _encoderStride = inputFormat.GetInteger(MediaFormat.KeyStride, _width);
-                        _encoderSliceHeight = inputFormat.GetInteger(MediaFormat.KeySliceHeight, _height);
+                        if (OperatingSystem.IsAndroidVersionAtLeast(29))
+                        {
+                            _encoderStride = inputFormat.GetInteger(MediaFormat.KeyStride, _width);
+                            _encoderSliceHeight = inputFormat.GetInteger(MediaFormat.KeySliceHeight, _height);
+                            Log.Info("H264", $"Encoder input: stride={_encoderStride}, sliceHeight={_encoderSliceHeight} (video={_width}x{_height})");
+                        }
 
                         // Some encoders return 0 meaning "same as configured"
                         if (_encoderStride <= 0) _encoderStride = _width;
                         if (_encoderSliceHeight <= 0) _encoderSliceHeight = _height;
-
-                        Log.Info("H264", $"Encoder input: stride={_encoderStride}, sliceHeight={_encoderSliceHeight} (video={_width}x{_height})");
                     }
                 }
                 catch (Exception ex)
@@ -896,7 +898,6 @@ public class H264Encoder : IDisposable
     /// Feeds a frame into the encoder's input buffer.
     /// Handles color format conversion and stride padding as needed.
     /// </summary>
-    /// <param name="frame">The frame data to encode.</param>
     private bool _loggedFirstFeed = false;
     private bool _loggedFirstWriteFrame = false;
 

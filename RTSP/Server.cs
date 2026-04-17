@@ -1187,11 +1187,6 @@ public class Server : IDisposable
     /// Encodes raw image data to JPEG format.
     /// Thread-safe: Creates and disposes Java objects within the same call to prevent JNI crashes.
     /// </summary>
-    /// <param name="rawImageData">The raw image data.</param>
-    /// <param name="width">The image width.</param>
-    /// <param name="height">The image height.</param>
-    /// <param name="format">The image format.</param>
-    /// <param name="quality">The JPEG quality (0-100).</param>
     /// <returns>The JPEG encoded data.</returns>
     // Per-thread reusable MemoryStream to reduce GC pressure from JPEG encoding
     [ThreadStatic]
