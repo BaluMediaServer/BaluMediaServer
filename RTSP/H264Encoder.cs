@@ -22,7 +22,7 @@ public class H264Encoder : IDisposable
     private int _height;
     private int _bitrate;
     private readonly int _frameRate;
-    private bool _isRunning;
+    private volatile bool _isRunning;
 
     /// <summary>
     /// Gets whether the encoder is currently running.
@@ -34,6 +34,12 @@ public class H264Encoder : IDisposable
 
     private readonly object _lock = new();
     private volatile bool _disposed;  // Prevents JNI access after disposal
+
+    /// <summary>
+    /// Optional text overlay stamped into each frame's Y plane before encoding.
+    /// Set after construction; reads are lock-free (reference assignment is atomic on ARM).
+    /// </summary>
+    public Services.FrameOverlay? Overlay { get; set; }
 
     // Color formats supported by your device
     private const int COLOR_FormatYUV420Planar = 19;
@@ -103,6 +109,12 @@ public class H264Encoder : IDisposable
         /// Gets or sets the source frame height (camera resolution, may differ from encoder).
         /// </summary>
         public int SourceHeight { get; set; }
+
+        /// <summary>
+        /// Stopwatch ticks when this frame was queued to the encoder input channel.
+        /// Used for encoder pipeline latency diagnostics.
+        /// </summary>
+        public long QueuedAt { get; set; }
     }
 
     /// <summary>
@@ -148,7 +160,7 @@ public class H264Encoder : IDisposable
                 _cachedBestEncoder = SelectBestEncoder(codecInfos!);
                 Log.Info("H264MTK", $"Encoder selection cached: {_cachedBestEncoder?.Name ?? "none"}");
             }
-            return _cachedBestEncoder;
+            return _cachedBestEncoder!;
         }
     }
 
@@ -227,7 +239,7 @@ public class H264Encoder : IDisposable
     }
     private static bool IsHardwareAccelerated(MediaCodecInfo codecInfo)
     {
-        if (Build.VERSION.SdkInt >= BuildVersionCodes.Q)
+        if (OperatingSystem.IsAndroidVersionAtLeast(29))
         {
             return codecInfo.IsHardwareAccelerated;
         }
@@ -293,7 +305,7 @@ public class H264Encoder : IDisposable
             if (encoderCaps != null)
             {
                 // Check for low latency support
-                if (Build.VERSION.SdkInt >= BuildVersionCodes.R)
+                if (OperatingSystem.IsAndroidVersionAtLeast(31))
                 {
                     if (encoderCaps.IsBitrateModeSupported(BitrateMode.CbrFd))
                     {
@@ -303,7 +315,7 @@ public class H264Encoder : IDisposable
                 }
 
                 // Check for quality levels support
-                if (encoderCaps.QualityRange != null)
+                if (OperatingSystem.IsAndroidVersionAtLeast(28) && encoderCaps.QualityRange != null)
                 {
                     encoderInfo.Score += 5;
                 }
@@ -409,14 +421,14 @@ public class H264Encoder : IDisposable
     /// Probes the hardware encoder to find the nearest supported resolution without
     /// actually creating or starting an encoder. Use this to configure the camera at
     /// a resolution the encoder can handle, avoiding a costly camera restart.
+    /// Uses the cached encoder selection — does not re-scan the codec list.
     /// </summary>
     public static (int width, int height) ProbeSupportedResolution(int requestedWidth, int requestedHeight)
     {
         try
         {
-            var codecList = new MediaCodecList(new());
-            var codecInfos = codecList.GetCodecInfos();
-            var best = SelectBestEncoder(codecInfos!);
+            // Reuse the cached encoder selection — scanning all codecs again wastes 200-700ms.
+            var best = GetCachedBestEncoder();
             if (best?.Capabilities?.VideoCapabilities == null)
                 return (requestedWidth, requestedHeight);
 
@@ -497,35 +509,52 @@ public class H264Encoder : IDisposable
                 // Use SetInteger (not SetFloat) — MediaTek MT6768 misinterprets sub-second float
                 // values as 0, causing EVERY frame to be an IDR keyframe, which exhausts the
                 // encoder's internal buffers and causes it to stall after ~1000 frames.
-                // Value of 1 = IDR every 1 second (~25 frames at 25fps).
-                format.SetInteger(MediaFormat.KeyIFrameInterval, 1);
+                // Value 2 = IDR every 2 seconds. IDR frames cause 120-220ms encoding stalls on
+                // MT6768; halving their frequency halves the jitter. New clients still get an IDR
+                // within ~40ms via RequestKeyFrame(). IntraRefresh every 10 frames provides
+                // continuous partial recovery for packet-loss robustness.
+                format.SetInteger(MediaFormat.KeyIFrameInterval, 2);
                 
                 // Set profile and level for better compatibility
                 format.SetInteger(MediaFormat.KeyProfile, (int)MediaCodecProfileType.Avcprofilebaseline);
                 format.SetInteger(MediaFormat.KeyLevel, 0x100);
 
                 // Low latency configuration
-                if (Build.VERSION.SdkInt >= BuildVersionCodes.R) // API 30+
-                {
-                    format.SetInteger(MediaFormat.KeyLowLatency, 1);
-                    format.SetInteger(MediaFormat.KeyPriority, 0); // Real-time priority
-                }
-
                 if (Build.VERSION.SdkInt >= BuildVersionCodes.M) // API 23+
                 {
+                    format.SetInteger(MediaFormat.KeyPriority, 0); // Real-time priority (added in API 23)
                     format.SetInteger(MediaFormat.KeyOperatingRate, short.MaxValue);
-                    
+
                     // Only set intra refresh if supported
                     if (_bestEncoder.SupportsIntraRefresh)
                     {
                         format.SetInteger(MediaFormat.KeyIntraRefreshPeriod, 10);
                     }
                 }
+
+                if (Build.VERSION.SdkInt >= BuildVersionCodes.P) // API 28+
+                {
+                    // Explicitly request 0-frame encoder pipeline depth. Without this, hardware
+                    // encoders buffer N frames internally before outputting the first result,
+                    // adding N × frame_interval of latency. This forces immediate output.
+#pragma warning disable CA1416
+                    format.SetInteger(MediaFormat.KeyLatency, 0);
+#pragma warning restore CA1416
+                }
+
+                if (OperatingSystem.IsAndroidVersionAtLeast(30)) // API 30+
+                {
+                    format.SetInteger(MediaFormat.KeyLowLatency, 1);
+                }
+
                 if (_bestEncoder.Name.Contains("MTK"))
                 {
                     try
                     {
                         format.SetInteger("vendor.mtk-ext-enc-low-latency.enable", 1);
+                        // Non-reference P-frames: encoder can drop them under load without
+                        // breaking the reference chain, reducing encoding stalls.
+                        format.SetInteger("vendor.mtk-ext-enc-nonrefp.enable", 1);
                     }
                     catch { }
                 }
@@ -544,7 +573,7 @@ public class H264Encoder : IDisposable
                 // Reinforce bitrate after Start() — SetParameters requires a started codec.
                 // The bitrate was already set in MediaFormat before Configure(), but some
                 // SoCs (MediaTek) may ignore it; this dynamic update ensures compliance.
-                if (Build.VERSION.SdkInt >= BuildVersionCodes.R)
+                if (OperatingSystem.IsAndroidVersionAtLeast(30))
                 {
                     var bundle = new Bundle();
                     bundle.PutInt(MediaCodec.ParameterKeyVideoBitrate, _bitrate);
@@ -563,14 +592,16 @@ public class H264Encoder : IDisposable
                     var inputFormat = encoder.InputFormat;
                     if (inputFormat != null)
                     {
-                        _encoderStride = inputFormat.GetInteger(MediaFormat.KeyStride, _width);
-                        _encoderSliceHeight = inputFormat.GetInteger(MediaFormat.KeySliceHeight, _height);
+                        if (OperatingSystem.IsAndroidVersionAtLeast(29))
+                        {
+                            _encoderStride = inputFormat.GetInteger(MediaFormat.KeyStride, _width);
+                            _encoderSliceHeight = inputFormat.GetInteger(MediaFormat.KeySliceHeight, _height);
+                            Log.Info("H264", $"Encoder input: stride={_encoderStride}, sliceHeight={_encoderSliceHeight} (video={_width}x{_height})");
+                        }
 
                         // Some encoders return 0 meaning "same as configured"
                         if (_encoderStride <= 0) _encoderStride = _width;
                         if (_encoderSliceHeight <= 0) _encoderSliceHeight = _height;
-
-                        Log.Info("H264", $"Encoder input: stride={_encoderStride}, sliceHeight={_encoderSliceHeight} (video={_width}x{_height})");
                     }
                 }
                 catch (Exception ex)
@@ -722,7 +753,7 @@ public class H264Encoder : IDisposable
         _frameNumber++;
 
         // Channel with DropOldest automatically handles frame dropping
-        _frameChannel.Writer.TryWrite(new() { Data = frameData, Timestamp = timestamp });
+        _frameChannel.Writer.TryWrite(new() { Data = frameData, Timestamp = timestamp, QueuedAt = Stopwatch.GetTimestamp() });
     }
 
     /// <summary>
@@ -743,12 +774,15 @@ public class H264Encoder : IDisposable
         long now = Stopwatch.GetTimestamp();
         _lastOutputTicks = now;
         _lastInputTicks = 0;
+        int _outputFrameCount = 0;
+        long _prevOutputTicks = 0;
 
         Log.Debug("H264MTK", "Encoding loop started");
 
         try
         {
             bufferInfo = new MediaCodec.BufferInfo();
+            SpinWait spinWait = default; // persisted across iterations so escalation (spin→yield→sleep) works correctly
 
             // Check both _isRunning and _disposed to ensure clean shutdown
             while (_isRunning && !_disposed)
@@ -767,7 +801,23 @@ public class H264Encoder : IDisposable
 
                     if (processedOutput)
                     {
-                        _lastOutputTicks = Stopwatch.GetTimestamp();
+                        long outputNow = Stopwatch.GetTimestamp();
+                        _outputFrameCount++;
+
+                        // Log encoder output interval every 25 frames to diagnose pipeline depth.
+                        // Expected: ~40ms at 25fps. If consistently >80ms, encoder is buffering multiple frames.
+                        if (_outputFrameCount % 25 == 0 && _prevOutputTicks > 0)
+                        {
+                            double intervalMs = (_lastOutputTicks > 0)
+                                ? (outputNow - _prevOutputTicks) * 1000.0 / Stopwatch.Frequency / 25.0
+                                : 0;
+                            double inputToOutputMs = (_lastInputTicks > 0)
+                                ? (outputNow - _lastInputTicks) * 1000.0 / Stopwatch.Frequency
+                                : 0;
+                            Log.Info("H264Latency", $"Encoder: avg output interval={intervalMs:F1}ms, last input→output={inputToOutputMs:F1}ms, frames={_outputFrameCount}");
+                        }
+                        _prevOutputTicks = outputNow;
+                        _lastOutputTicks = outputNow;
                     }
 
                     // Check disposed again before feeding input
@@ -799,10 +849,15 @@ public class H264Encoder : IDisposable
 
                     // SpinWait auto-escalates: spin → yield → short sleep, giving sub-ms
                     // wake-up instead of Thread.Sleep(1) which sleeps 1-15ms on Android.
+                    // The SpinWait is declared outside the loop so its count accumulates and
+                    // it properly escalates from spinning to yielding/sleeping when idle.
                     if (!processedInput && !processedOutput)
                     {
-                        var sw = new SpinWait();
-                        sw.SpinOnce();
+                        spinWait.SpinOnce();
+                    }
+                    else
+                    {
+                        spinWait.Reset(); // had work — reset so next idle period starts fresh
                     }
 
                     // Reset error counter on successful iteration
@@ -843,7 +898,6 @@ public class H264Encoder : IDisposable
     /// Feeds a frame into the encoder's input buffer.
     /// Handles color format conversion and stride padding as needed.
     /// </summary>
-    /// <param name="frame">The frame data to encode.</param>
     private bool _loggedFirstFeed = false;
     private bool _loggedFirstWriteFrame = false;
 
@@ -882,6 +936,12 @@ public class H264Encoder : IDisposable
 
                     byte[] frameData = frame.Data;
 
+                    // Stamp text overlay into Y plane before encoding (if set).
+                    // Uses the source width as the Y-plane row stride (NV21: UV at width*height).
+                    Overlay?.StampInto(frameData,
+                        frame.SourceWidth  > 0 ? frame.SourceWidth  : _width,
+                        frame.SourceHeight > 0 ? frame.SourceHeight : _height);
+
                     // One-time diagnostic log
                     if (!_loggedFirstFeed)
                     {
@@ -906,9 +966,10 @@ public class H264Encoder : IDisposable
     }
     /// <summary>
     /// Writes camera frame data directly to the encoder's input buffer.
-    /// Handles all transformations in one pass:
-    /// 1. Convert NV21 (camera) → NV12 (encoder) by swapping V/U bytes
-    /// 2. Write with correct stride/sliceHeight layout for the encoder
+    /// Performs NV21 → NV12 conversion (V/U byte swap) and stride/sliceHeight layout
+    /// in a single pass. Only zeroes unwritten padding bytes — the hot path (camera
+    /// resolution == encoder resolution, no stride) writes every byte and calls no
+    /// <see cref="Array.Clear"/> at all.
     ///
     /// Important: MediaTek cameras may produce oversized buffers (e.g., 1843198 bytes for
     /// a 1280x720 frame) but the NV21 UV plane always starts at width * height — right after
@@ -967,7 +1028,8 @@ public class H264Encoder : IDisposable
         // Build the output in a pooled byte array matching the encoder's expected layout
         int encoderDataSize = Math.Min(totalDstSize, inputBuffer.Capacity());
         byte[] encoderData = _bufferPool.Rent(encoderDataSize);
-        Array.Clear(encoderData, 0, encoderDataSize);
+        // Do NOT clear the entire buffer — only zero bytes that won't be overwritten.
+        // Hot path (camera res == encoder res, stride == width): every byte is written → no clearing at all.
 
         // Copy Y plane: crop top-left of source into encoder layout
         for (int row = 0; row < copyHeight; row++)
@@ -977,6 +1039,15 @@ public class H264Encoder : IDisposable
             if (srcOff + copyWidth > frameData.Length) break;
             if (dstOff + copyWidth > encoderDataSize) break;
             System.Buffer.BlockCopy(frameData, srcOff, encoderData, dstOff, copyWidth);
+            // Zero right-side column padding only when stride > copyWidth
+            if (stride > copyWidth)
+                Array.Clear(encoderData, dstOff + copyWidth, stride - copyWidth);
+        }
+        // Zero bottom Y padding rows only when sliceHeight > copyHeight
+        if (copyHeight < sliceHeight)
+        {
+            int yPadStart = copyHeight * stride;
+            Array.Clear(encoderData, yPadStart, dstYPlaneSize - yPadStart);
         }
 
         // Copy UV plane: NV21 (VU interleaved) → NV12 (UV interleaved) with U/V swap
@@ -994,6 +1065,15 @@ public class H264Encoder : IDisposable
                 encoderData[dstOff + i] = frameData[srcOff + i + 1];     // U
                 encoderData[dstOff + i + 1] = frameData[srcOff + i];     // V
             }
+            // Zero UV column padding only when stride > copyUvWidth
+            if (stride > copyUvWidth)
+                Array.Clear(encoderData, dstOff + copyUvWidth, stride - copyUvWidth);
+        }
+        // Zero bottom UV padding rows only when sliceHeight/2 > copyUvHeight
+        if (copyUvHeight < sliceHeight / 2)
+        {
+            int uvPadStart = dstYPlaneSize + copyUvHeight * stride;
+            Array.Clear(encoderData, uvPadStart, dstUvPlaneSize - uvPadStart);
         }
 
         int writeSize = Math.Min(encoderDataSize, inputBuffer.Capacity());
@@ -1118,42 +1198,6 @@ public class H264Encoder : IDisposable
         }
     }
 
-    private byte[] ConvertNV21ToNV12Pooled(byte[] nv21)
-    {
-        int ySize = _width * _height;
-        int totalSize = ySize + (ySize / 2);
-        
-        var nv12 = _bufferPool.Rent(totalSize);
-        
-        try
-        {
-            // Y plane copy
-            System.Buffer.BlockCopy(nv21, 0, nv12, 0, ySize);
-            
-            // UV swap - vectorized if possible
-            unsafe
-            {
-                fixed (byte* srcPtr = &nv21[ySize], dstPtr = &nv12[ySize])
-                {
-                    int uvLength = totalSize - ySize;
-                    for (int i = 0; i < uvLength - 1; i += 2)
-                    {
-                        dstPtr[i] = srcPtr[i + 1];
-                        dstPtr[i + 1] = srcPtr[i];
-                    }
-                }
-            }
-            var result = new byte[totalSize];
-            Array.Copy(nv12, 0, result, 0, totalSize);
-            _bufferPool.Return(nv12);
-            return result;
-        }
-        catch
-        {
-            _bufferPool.Return(nv12);
-            throw;
-        }
-    }
     private bool DrainOutputBuffer(MediaCodec.BufferInfo bufferInfo, ref byte[]? sps, ref byte[]? pps, ref bool gotFirstOutput)
     {
         // Check disposed flag BEFORE any JNI calls to prevent SIGSEGV
@@ -1222,7 +1266,8 @@ public class H264Encoder : IDisposable
                             IsKeyFrame = (bufferInfo.Flags & MediaCodecBufferFlags.KeyFrame) != 0,
                             Timestamp = bufferInfo.PresentationTimeUs,
                             Sps = sps,
-                            Pps = pps
+                            Pps = pps,
+                            EncodedAt = Stopwatch.GetTimestamp()
                         };
 
                         FrameEncoded?.Invoke(this, frameEvent);

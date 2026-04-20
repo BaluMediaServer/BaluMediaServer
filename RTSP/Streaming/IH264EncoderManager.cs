@@ -1,4 +1,6 @@
+using System.Threading.Channels;
 using BaluMediaServer.Models;
+using BaluMediaServer.Services;
 
 namespace BaluMediaServer.RTSP.Streaming;
 
@@ -73,6 +75,21 @@ public interface IH264EncoderManager
     ValueTask<H264FrameEventArgs> DequeueFrameAsync(int cameraId, string clientId, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Synchronously blocks the calling thread until a frame is available, a timeout elapses,
+    /// or cancellation is requested. Returns null on timeout/cancellation/channel-closed.
+    /// <para>
+    /// Must only be called from dedicated OS threads (LongRunning tasks, Thread class) — never
+    /// from thread-pool threads. Avoids the 10–70ms async-continuation scheduling latency that
+    /// occurs when using <see cref="DequeueFrameAsync"/> on Android's busy thread pool.
+    /// </para>
+    /// </summary>
+    /// <param name="cameraId">The camera ID.</param>
+    /// <param name="clientId">The client ID.</param>
+    /// <param name="timeoutMs">Maximum wait in milliseconds before returning null.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    H264FrameEventArgs? WaitDequeueFrame(int cameraId, string clientId, int timeoutMs, CancellationToken cancellationToken);
+
+    /// <summary>
     /// Clears the cached SPS/PPS values.
     /// Should be called when the encoder is restarted with new dimensions.
     /// </summary>
@@ -124,4 +141,11 @@ public interface IH264EncoderManager
     /// </summary>
     /// <param name="cameraId">The camera ID.</param>
     void RequestKeyFrame(int cameraId);
+
+    /// <summary>
+    /// Returns the raw channel reference for a registered client.
+    /// Cache this at session start to avoid per-frame dictionary lookups.
+    /// Returns null if the client is not registered.
+    /// </summary>
+    Channel<H264FrameEventArgs>? GetClientChannelRef(int cameraId, string clientId);
 }

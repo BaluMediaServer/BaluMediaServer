@@ -5,7 +5,7 @@
 [![Android](https://img.shields.io/badge/Android-8.0%2B-green.svg)](https://developer.android.com/)
 [![Platform](https://img.shields.io/badge/Platform-Android-brightgreen.svg)](https://developer.android.com/)
 
-A powerful, lightweight, and easy-to-integrate RTSP server library for .NET MAUI on Android. Stream live camera feeds with MJPEG and H.264 codecs, featuring both RTSP and HTTP streaming capabilities.
+A powerful, lightweight, and easy-to-integrate RTSP server library for .NET MAUI on Android. Stream live camera feeds with MJPEG and H.264 codecs, featuring both RTSP and HTTP streaming capabilities, text overlay burn-in, and sub-100ms end-to-end latency.
 
 ## 🚀 Project Motivation
 
@@ -34,6 +34,7 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 - Automatic encoder resolution validation with graceful fallback
 - Ultra-low latency pipeline with minimal buffering (capacity=1 channels, batch RTP sends)
 - Default frame rate: 45 FPS (adjusts dynamically)
+- **Text overlay burn-in**: up to 4 configurable text slots stamped directly into encoded video frames (device name, IP, clock, custom text)
 
 ### 🔹 RTSP Server (Pure C#)
 - **Full RTSP Protocol Compliance**: Follows RTSP, RTP, and RTCP specifications
@@ -48,6 +49,7 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 - **Robust Client Lifecycle**: Graduated error counting, timeout protection, and race-free cleanup
 - **Cross-SoC Compatibility**: Wall-clock RTP timestamps and MediaTek-safe encoder configuration
 - **VLC Compatible**: Full RFC 2326/4566 compliance — works with VLC, ffplay, OBS, and any standards-compliant RTSP client
+- **Text Overlay**: Configurable multi-slot text burned into video frames at the YUV level (zero decode overhead for clients)
 
 ### 🔹 MJPEG HTTP Server
 - Simple, independent MJPEG server for easy HTML display
@@ -61,8 +63,9 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 - Built-in foreground service for background compatibility
 - Simple demo project included
 - Callbacks available to monitor connected clients, stream status, etc.
-- Advanced watchdog system with 60-second inactivity timeout and comprehensive health monitoring
+- Advanced watchdog system with 60-second inactivity timeout, idle encoder shutdown, and comprehensive health monitoring
 - Automatic resource cleanup and memory management
+- **FrameOverlay**: text overlay stamped into YUV frames — up to 4 slots, 6 content types, 7 anchor positions, full RGB color, configurable size
 
 ### 🔹 Modular RTSP Architecture (v1.5.8+)
 
@@ -75,11 +78,11 @@ RTSP/
 │   ├── RtspProtocolHandler.cs   # RTSP request parsing and response handling
 │   └── SdpGenerator.cs          # SDP generation for H.264/MJPEG
 ├── Transport/
-│   ├── TransportManager.cs      # UDP/TCP sending, port management
+│   ├── TransportManager.cs      # UDP/TCP sending, port management (sync + async)
 │   ├── RtpPacketBuilder.cs      # RTP packet creation and NAL fragmentation
 │   └── RtcpManager.cs           # RTCP sender reports and receiver feedback
 ├── Streaming/
-│   ├── StreamingController.cs   # Main streaming orchestration with timeout protection
+│   ├── StreamingController.cs   # Main streaming orchestration (synchronous hot path)
 │   ├── H264EncoderManager.cs    # H.264 encoder lifecycle management
 │   ├── JpegEncoderService.cs    # Shared JPEG encoding for MJPEG clients
 │   └── FramePacer.cs            # Frame delivery timing and burst throttling
@@ -87,6 +90,12 @@ RTSP/
 │   └── AuthenticationManager.cs # Digest/Basic authentication
 └── ClientManagement/
     └── ClientManager.cs         # Client lifecycle and cleanup
+
+Services/
+├── BackCameraService.cs         # Back camera capture (JNI-free processing thread)
+├── FrontCameraService.cs        # Front camera capture (JNI-free processing thread)
+├── MjpegServer.cs               # HTTP MJPEG streaming server
+└── FrameOverlay.cs              # YUV-level text overlay burn-in (up to 4 slots)
 ```
 
 **Benefits:**
@@ -106,7 +115,7 @@ RTSP/
 
 ### NuGet Package
 ```xml
-<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.17" />
+<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.25" />
 ```
 
 ### Manual Installation
@@ -328,8 +337,9 @@ All classes in this library include comprehensive XML documentation comments for
 | Category | Classes |
 |----------|---------|
 | **Models** | `Client`, `FrameEventArgs`, `H264FrameEventArgs`, `VideoProfile`, `VideoResolution`, `ServerConfiguration`, `RtspRequest`, `RtspAuth`, `EncoderInfo` |
-| **Enums** | `AuthType`, `CodecType`, `BussCommand`, `TransportMode`, `VideoResolution` |
-| **Services** | `Server`, `MjpegServer`, `FrontCameraService`, `BackCameraService` |
+| **Enums** | `AuthType`, `CodecType`, `BussCommand`, `TransportMode`, `VideoResolution`, `OverlayContent`, `AnchorPoint` |
+| **Services** | `Server`, `MjpegServer`, `FrontCameraService`, `BackCameraService`, `FrameOverlay` |
+| **Overlay Types** | `OverlaySlot`, `OverlayColor` |
 | **Encoders** | `H264Encoder`, `MediaTekH264Encoder` |
 | **Utilities** | `EventBuss`, `FrameConverterHelper`, `FrameCallback` |
 | **Interfaces** | `ICameraService`, `IAuthenticationManager`, `IClientManager`, `IH264EncoderManager`, `IRtcpManager`, `IRtpPacketBuilder`, `IRtspProtocolHandler`, `ISdpGenerator`, `IStreamingController`, `ITransportManager` |
@@ -402,6 +412,15 @@ public class ServerConfiguration
     public bool UseHttps { get; set; } = false;                     // Enable HTTPS
     public string? CertificatePath { get; set; }                    // SSL certificate path
     public string? CertificatePassword { get; set; }                // Certificate password
+
+    // Text overlay (Android only, H.264 streams only)
+    // null  → back camera uses the default layout (device name + clock, bottom-left)
+    // []    → overlay disabled
+    // [...] → custom slots (up to 4)
+    public OverlaySlot[]? BackCameraOverlaySlots { get; set; }      // Back camera H.264 overlay
+    // null  → no overlay on front camera (no default)
+    // [...] → custom slots (up to 4)
+    public OverlaySlot[]? FrontCameraOverlaySlots { get; set; }     // Front camera H.264 overlay
 }
 ```
 
@@ -504,6 +523,146 @@ public (int Width, int Height) GetFrontCameraResolution()
 
 // Static method to encode YUV data to JPEG
 public static byte[] EncodeToJpeg(byte[] rawImageData, int width, int height, Android.Graphics.ImageFormatType format)
+```
+
+### Text Overlay (FrameOverlay)
+
+`FrameOverlay` stamps configurable text directly into the Y (luma) and UV (chroma) planes of NV21 frame buffers **before** MediaCodec encodes them. Clients receive text as part of the video — no extra decode work, no network overhead.
+
+> **H.264 only.** The overlay is applied to frames fed to the hardware H.264 encoder. MJPEG streams are not affected.
+
+- Up to **4 independent text slots** per overlay instance
+- **Content types**: `DeviceName`, `IpAddress`, `DateTime`, `Date`, `Time`, `Custom`
+- **Anchor positions**: `TopLeft`, `TopCenter`, `TopRight`, `BottomLeft`, `BottomCenter`, `BottomRight`, `Absolute`
+- **Full RGB color** via `OverlayColor` (pre-built: White, Yellow, Orange, Red, Green, Cyan, Gray)
+- **Dynamic refresh**: static slots rendered once; `Time`/`DateTime` refresh each second; `IpAddress` each minute
+- **Per-frame hot path ≈ 2 µs** at 1280×720 (byte-level stamp, no allocation)
+- **BT.601 limited-range** YUV conversion (Y ∈ [16,235], Cb/Cr ∈ [16,240])
+- **Drop shadow** (1 px black offset) rendered automatically for readability on any background
+
+#### Integration via ServerConfiguration
+
+The overlay is configured through `ServerConfiguration` — the server lazily constructs the `FrameOverlay` instance when the first frame arrives (so the frame dimensions are known).
+
+```csharp
+var config = new ServerConfiguration
+{
+    // null  → default layout: device name + clock stacked in bottom-left
+    // []    → overlay disabled
+    // [..] → custom slots (see below)
+    BackCameraOverlaySlots  = null,   // use default for back camera
+    FrontCameraOverlaySlots = null,   // null = no overlay on front camera (no default)
+};
+```
+
+#### Quick Start — Default Layout
+
+The default layout places the device name and a live clock in the bottom-left corner, auto-spaced so they don't overlap:
+
+```csharp
+// Back camera: device name + clock in bottom-left (default when null)
+BackCameraOverlaySlots = null,
+
+// Back camera: explicitly use the default layout
+BackCameraOverlaySlots = null,  // same thing — null always means "use default"
+
+// Disable overlay entirely
+BackCameraOverlaySlots = Array.Empty<OverlaySlot>(),
+```
+
+#### Custom Overlay
+
+```csharp
+BackCameraOverlaySlots = new[]
+{
+    // Slot 1 — live clock, bottom-left
+    new OverlaySlot
+    {
+        Content  = OverlayContent.Time,
+        Anchor   = AnchorPoint.BottomLeft,
+        MarginX  = 10, MarginY = 10,
+        TextSize = 28f,
+        Color    = OverlayColor.White,
+    },
+
+    // Slot 2 — device name above clock
+    new OverlaySlot
+    {
+        Content  = OverlayContent.DeviceName,
+        Anchor   = AnchorPoint.BottomLeft,
+        MarginX  = 10, MarginY = 48,   // 48 px above bottom edge
+        TextSize = 32f,
+        Color    = OverlayColor.Yellow,
+    },
+
+    // Slot 3 — IP address, top-right corner
+    new OverlaySlot
+    {
+        Content  = OverlayContent.IpAddress,
+        Anchor   = AnchorPoint.TopRight,
+        MarginX  = 10, MarginY = 10,
+        TextSize = 24f,
+        Color    = OverlayColor.Cyan,
+    },
+
+    // Slot 4 — custom label at exact pixel position
+    new OverlaySlot
+    {
+        Content    = OverlayContent.Custom,
+        CustomText = "CAM-1",
+        Anchor     = AnchorPoint.Absolute,
+        MarginX    = 20, MarginY = 20,  // raw (x, y) of the text box top-left
+        TextSize   = 20f,
+        Color      = new OverlayColor(255, 165, 0),  // custom orange
+    },
+},
+```
+
+#### OverlaySlot Properties
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `Content` | `OverlayContent` | `Custom` | What text to display |
+| `CustomText` | `string?` | `null` | Text shown when `Content == Custom` |
+| `Anchor` | `AnchorPoint` | `BottomLeft` | Which corner/edge the slot is anchored to |
+| `MarginX` | `int` | `10` | px from the anchor edge (horizontal); raw X when `Absolute` |
+| `MarginY` | `int` | `10` | px from the anchor edge (vertical); raw Y when `Absolute` |
+| `TextSize` | `float` | `32f` | Font size in points |
+| `Color` | `OverlayColor` | `White` | Text color |
+
+#### OverlayContent Enum
+
+| Value | Description | Refresh |
+|-------|-------------|---------|
+| `DeviceName` | `Build.Manufacturer` + `Build.Model` | Static (once) |
+| `IpAddress` | Local LAN IPv4 address | Every minute |
+| `DateTime` | `yyyy-MM-dd HH:mm:ss` | Every second |
+| `Date` | `yyyy-MM-dd` | Every day |
+| `Time` | `HH:mm:ss` | Every second |
+| `Custom` | Text from `OverlaySlot.CustomText` | Static (once) |
+
+#### AnchorPoint Enum
+
+| Value | Description |
+|-------|-------------|
+| `TopLeft` / `TopCenter` / `TopRight` | Anchored to top edge; `MarginY` = px from top |
+| `BottomLeft` / `BottomCenter` / `BottomRight` | Anchored to bottom edge; `MarginY` = px from bottom |
+| `Absolute` | `MarginX`/`MarginY` are raw pixel coordinates (top-left of text bounding box) |
+
+#### OverlayColor
+
+```csharp
+// Named presets
+OverlayColor.White   // (255, 255, 255)
+OverlayColor.Yellow  // (255, 255,   0)
+OverlayColor.Orange  // (255, 165,   0)
+OverlayColor.Red     // (255,   0,   0)
+OverlayColor.Green   // (  0, 220,   0)
+OverlayColor.Cyan    // (  0, 255, 255)
+OverlayColor.Gray    // (180, 180, 180)
+
+// Custom RGB
+new OverlayColor(r: 128, g: 0, b: 255)
 ```
 
 #### Events
@@ -653,8 +812,8 @@ The H.264 encoder automatically optimizes for MediaTek and other Android devices
 // - Bitrate: 2,000,000 bps (2 Mbps)
 // - Frame rate: 25 FPS
 // - Profile: Baseline
-// - Keyframe interval: 1 second (IDR every ~25 frames)
-// - I-frame interval: SetInteger (not SetFloat — critical for MediaTek compatibility)
+// - Keyframe interval: 2 seconds (IDR every ~50 frames, set via SetInteger not SetFloat — critical for MediaTek)
+// - IntraRefresh every 10 frames for partial packet-loss recovery between IDR frames
 // - RTP timestamps: Wall-clock based (Stopwatch) for cross-SoC reliability
 
 // Dynamic bitrate adjustment happens automatically based on network conditions
@@ -664,7 +823,7 @@ The H.264 encoder automatically optimizes for MediaTek and other Android devices
 - The encoder uses `SetInteger(KeyIFrameInterval, 1)` instead of `SetFloat()`. MediaTek MT6768 (and possibly other MediaTek SoCs) misinterprets sub-second float values as `0`, causing every frame to become an IDR keyframe. This exhausts the encoder's internal buffers after ~1000 frames and causes a permanent stall.
 - RTP timestamps are derived from `Stopwatch` wall-clock time instead of the encoder's `PresentationTimeUs`. The MT6768 reports `PresentationTimeUs` in units ~1000x larger than microseconds, which would cause RTP timestamp deltas of ~3,000,000 per frame instead of the expected ~3,600 (at 25fps/90kHz). Players would buffer forever waiting for "future" frames.
 - The encoding loop drains output buffers before feeding new input to prevent buffer starvation on resource-constrained SoCs.
-- The encoding loop uses `SpinWait` (v1.5.23) instead of `Thread.Sleep(1)` for sub-millisecond responsiveness when polling for encoder output.
+- The encoding loop uses a persistent `SpinWait` (declared outside the loop) that escalates from spinning → yielding → sleeping as idle time accumulates. Resetting it on each productive iteration ensures the next idle period starts fresh. This avoids both `Thread.Sleep(1)` jitter (1–15 ms on Android) and the pure busy-spin of a per-iteration `new SpinWait()` (which never escalates past level 0).
 - All pipeline channels (camera → encoder input → per-client output) use capacity=1 with `DropOldest` to minimize buffering latency. This ensures the encoder always processes the freshest camera frame.
 
 ### Video Resolution Configuration
@@ -1008,14 +1167,20 @@ Server.OnClientsChange += (clients) => {
 **Connection Stability Notes:**
 - The server uses graduated error counting: TCP clients tolerate up to 10 consecutive send failures before being disconnected, UDP clients tolerate 5. This prevents premature disconnection from transient network issues.
 - Playing clients are protected from the WatchDog — they are never marked as dead while actively streaming.
-- Frame dequeue uses a 200ms timeout with automatic encoder restart after consecutive timeouts.
+- Frame dequeue uses a 200ms timeout; a stall is declared after **5 seconds** (25 consecutive timeouts) — wide enough for slow/padded cameras (e.g. VGA on MediaTek at ~0.3 fps) without false restarts.
 - Per-client `SemaphoreSlim` (SendLock) serializes all sends to prevent TCP interleaved framing corruption. Batch RTP sends acquire the lock once per frame instead of per packet.
+- The WatchDog stops the H.264 encoder when no clients are connected, preventing an idle stall loop from consuming resources. The camera stays running for fast reconnects.
+- Simultaneous client connects are race-free: `_isStreamingFlag` uses `Interlocked.CompareExchange` (v1.5.25) so `CameraStartRequested` and `StreamingStateChanged(true)` are each fired exactly once, even when two clients arrive at the same millisecond.
 
-**Latency Optimization Notes (v1.5.23):**
+**Latency Optimization Notes (v1.5.23–v1.5.25):**
 - All frame channels use capacity=1 with `DropOldest` — the encoder always processes the freshest frame, eliminating queue-induced latency.
-- RTP packets for an entire H.264 frame are built into a batch and sent with a single `socket.SendAsync` call (TCP), reducing per-frame network overhead from 10-15 syscalls to 1.
-- The encoder loop uses `SpinWait` for sub-millisecond responsiveness instead of `Thread.Sleep(1)` (which sleeps 1-15ms on Android).
-- Per-packet `CancellationTokenSource` allocations are eliminated using `TryReset()` and `socket.SendTimeout`.
+- The H.264 streaming loop is fully **synchronous**: `WaitDequeueFrame` blocks the OS thread with a kernel futex (~1 ms wake latency) instead of async continuation scheduling (10–70 ms on Android's busy thread pool). `SendBatchSync` uses a blocking `socket.Send()` call.
+- RTP packets for an entire H.264 frame are built into a batch and sent with a single `socket.Send()` call (TCP), reducing per-frame network overhead from 10–15 syscalls to 1.
+- The encoder loop uses a persistent `SpinWait` (v1.5.25) that properly escalates from spinning to yielding to sleeping across idle iterations, preventing CPU burn between frames.
+- Per-client channel references are cached at session start — the per-frame dictionary lock that was acquired on every `TryDequeueFrame`/`WaitDequeueFrame` call is eliminated entirely (v1.5.25).
+- H.264 encoder input buffer zeroing is now selective: only stride-gap padding bytes are cleared, not the entire 1.4 MB buffer. The hot path (camera res == encoder res) performs zero `Array.Clear` calls per frame (v1.5.25).
+- Fan-out to client channels snapshots the channel list under the lock then writes outside the lock, so registering/unregistering clients does not wait for all `TryWrite` calls to complete (v1.5.25).
+- Typical server-side path: **queue ≈ 0.2–0.6 ms · build ≈ 0.2–0.4 ms · send ≈ 1–3 ms**.
 
 #### Transport Protocol Recommendations
 ```csharp
@@ -1136,6 +1301,11 @@ Unit tests cover pure C# components. Android-dependent classes (camera services,
 - ✅ **H.264 green corruption fix — NV21 UV plane offset, NV12 color format, resolution change support** (v1.5.20)
 - ✅ **Long-running stability fix — JNI-free processing thread, immediate native frame release, bitrate fix, latency reduction** (v1.5.21)
 - ✅ **Ultra-low latency pipeline — buffer depth reduction, batch RTP sends, allocation elimination, SpinWait encoder loop** (v1.5.23)
+- ✅ **Text overlay burn-in — configurable multi-slot YUV-level text stamped into video frames** (v1.5.24)
+- ✅ **Synchronous streaming hot path — WaitDequeueFrame + SendBatchSync eliminate async scheduling latency** (v1.5.24)
+- ✅ **Thread-safety hardening — volatile flags, volatile backing fields for IsPlaying/ConsecutiveSendErrors, missing lock fix** (v1.5.24)
+- ✅ **Idle encoder stall loop fix — WatchDog stops encoder when no clients connected; wider stall timeout for slow cameras** (v1.5.24)
+- ✅ **Hot-path CPU & memory optimisation + simultaneous-connect race fix — SpinWait escalation, cached channel refs, selective buffer zeroing, fan-out lock reduction, atomic CAS start gate** (v1.5.25)
 
 ### Planned (v1.6+)
 - ⬜ Fix image rotation on some devices
@@ -1188,12 +1358,20 @@ There are few (if any) options to integrate RTSP servers with Android using C# a
 
 ## Patch Notes
 
-- v1.1.2: Adding at Server CTOR two new variables to handle if the front or back camera should be enabled, this avoid the problem that only one camera start on devices that can not handle both cameras at same time. 
+- v1.5.25: **Hot-Path CPU & Memory Optimisation + Simultaneous-Connect Race Fix**
+  - **SpinWait escalation fix** (`H264Encoder.EncodingLoop`): the `SpinWait` is now declared once outside the encoding loop. Its spin count accumulates across idle iterations so it correctly escalates from spinning → yielding → sleeping. Previously a fresh `new SpinWait()` was created each idle iteration — it never advanced past level-0 spinning, burning 100% CPU during the 40 ms gaps between frames on the highest-priority encoder thread.
+  - **Per-client channel caching** (`StreamingController`): the `Channel<H264FrameEventArgs>` reference is retrieved once after `RegisterClientChannel` and reused for the entire session. Previously `TryDequeueFrame` and `WaitDequeueFrame` both acquired a dictionary lock on every call (50 lock acquisitions/second/client) just to look up the same stable reference.
+  - **Selective encoder buffer zeroing** (`H264Encoder.WriteFrameToEncoderBuffer`): replaced `Array.Clear(buf, 0, 1.4 MB)` with targeted clearing of only the stride-gap padding bytes at the end of each row and any sliceHeight padding rows. The hot path (camera resolution == encoder resolution, no stride padding) now performs zero `Array.Clear` calls, eliminating 35 MB/s of unnecessary RAM writes at 1280×720 / 25 fps.
+  - **Fan-out lock reduction** (`H264EncoderManager`): `OnH264BackFrameEncoded` / `OnH264FrontFrameEncoded` snapshot the client channel list into a pooled `ArrayPool<Channel>` array under the lock, then release the lock before calling `TryWrite`. Unregistering clients no longer wait for all fan-out writes to complete.
+  - **Removed dead code**: deleted `ConvertNV21ToNV12Pooled` — it rented a pooled buffer then immediately allocated a new heap array and copied into it, giving the pool no benefit. The NV21 → NV12 conversion is handled inline by `WriteFrameToEncoderBuffer`.
+  - **`ProbeSupportedResolution` startup fix**: now calls `GetCachedBestEncoder()` instead of performing a full O(N) codec re-scan. Saves 200–700 ms at every server `Start()` call.
+  - **Atomic streaming start gate** (`StreamingController`): replaced `volatile bool _isStreaming` + plain `if (!_isStreaming) { _isStreaming = true; }` with `volatile int _isStreamingFlag` guarded by `Interlocked.CompareExchange(ref _isStreamingFlag, 1, 0) == 0`. The CAS instruction is atomic at the CPU level, so exactly one thread can transition the flag from 0→1. With the previous code, two clients connecting within the same scheduler timeslice could both read `_isStreaming == false` before either wrote `true`, causing `CameraStartRequested` and `StreamingStateChanged(true)` to fire twice — observed in device logs as double `[STREAMING] State changed: ACTIVE`. `SetStreamingState` updated to use `Interlocked.Exchange` for consistency.
 
-- v1.1.3: Adding handling for auto-quality adjust based on rtcp control for MJPEG codec, allowing to increase or decrease the image quality to guarantee video stability over this codec.
--- Adding a preview (WIP) for video profiles allowing to create custom paths for this new profiles, will allow to set a custom resolution, bitrate and more.
-
-- v1.1.4: Adding auth option into CTOR of Server class, to enable or disable auth on stream rtsp, adding feature to determina video quality into mjpeg server
+- v1.5.24: **Text Overlay, Synchronous Streaming, Thread-Safety & Stall Loop Fixes**
+  - **Text overlay burn-in** (`Services/FrameOverlay.cs`): up to 4 configurable text slots stamped into NV21/NV12 YUV frames before MediaCodec encodes them. Content types: `DeviceName`, `IpAddress`, `DateTime`, `Date`, `Time`, `Custom`. Anchor positions: all four corners, three top/bottom edge centers, and `Absolute` pixel coordinates. Full RGB color via `OverlayColor` (7 presets + custom). Static slots rendered once; `Time`/`DateTime` refresh each second; `IpAddress` refreshes each minute. Per-frame hot path ≈ 2 µs at 1280×720 (byte-level Y+UV stamp, zero allocation).
+  - **Synchronous streaming hot path**: Replaced `await DequeueFrameAsync()` + `await SendBatchAsync()` with synchronous `WaitDequeueFrame()` (OS futex, ~1 ms wake) + `SendBatchSync()` (blocking `socket.Send()`). Eliminates 10–70 ms of async continuation scheduling latency on Android's saturated thread pool. Also removed the 33 ms `FramePacer` sleep that was the dominant latency source once async overhead was fixed. Typical server-side path reduced from ~80 ms to queue ≈ 0.2–0.6 ms · build ≈ 0.2–0.4 ms · send ≈ 1–3 ms.
+  - **Thread-safety hardening**: `_isRunning` (H264Encoder), `_isStreaming`/`_isCapturingFront`/`_isCapturingBack` (Server) changed to `volatile`. `Client.IsPlaying` and `Client.ConsecutiveSendErrors` given volatile backing fields — these are written under `lock(client)` in TransportManager but read lock-free in the streaming loop. Fixed missing `lock (_frameFrontLock)` on `_latestFrontFrame = null` in `OnEncoderResolutionFallback`. (Note: `_isStreaming` in `StreamingController` was later upgraded from `volatile bool` to `Interlocked.CompareExchange` in v1.5.25 to close a simultaneous-connect race.)
+  - **Idle encoder stall loop fix**: WatchDog now stops H.264 encoders when `ClientCount == 0`, preventing the 200 ms dequeue timeout from looping indefinitely with no clients (triggered by SETUP-without-PLAY health-check connections). Camera capture stays running for fast reconnects. Separately, `activeTimeoutCount` raised from 2 (400 ms) to 25 (5 s) — accommodates cameras that deliver frames at low rates (e.g. VGA on this MediaTek device at ~0.3 fps) without triggering false stall restarts.
 
 - v1.5.23: **Ultra-Low Latency Pipeline Overhaul** — Reduces end-to-end streaming latency from 2-3 seconds to ~100-300ms on LAN.
   - **Buffer depth reduction**: All pipeline channels (camera, encoder input, per-client output) reduced to capacity=1 with `DropOldest`. Eliminates 280-600ms of queue-induced latency — the encoder always processes the freshest frame.
@@ -1201,6 +1379,11 @@ There are few (if any) options to integrate RTSP servers with Android using C# a
   - **Encoder loop SpinWait**: Replaced `Thread.Sleep(1)` (1-15ms on Android) with `SpinWait.SpinOnce()` for sub-millisecond encoder responsiveness. Stall detection uses `Stopwatch.GetTimestamp()` instead of `DateTime.UtcNow.Ticks`.
   - **Allocation elimination**: Reusable `CancellationTokenSource` with `TryReset()` for frame dequeue timeouts. Per-send CTS replaced with `socket.SendTimeout = 3000` set at connection time. Activity tracking uses `Environment.TickCount64` instead of `DateTime.UtcNow`. Eliminates ~300+ allocations/sec from the hot path.
   - **Hot-path cleanup**: Removed `Log.Debug` from `FramePacer.RecordDrop()` (JNI + string alloc per dropped frame). Encoder is fed before event subscribers in frame callbacks. Redundant `DateTime.UtcNow` calls removed from H264 streaming loop.
+
+- v1.5.22: **Intermediate Stability & Channel Tuning**
+  - **Reduced manager output channel capacity**: `H264EncoderManager` per-client output channel capacity reduced further (from 3 to 2) to keep pipeline depth minimal and latency low.
+  - **MediaCodec dequeue timeout reduction**: Input and output buffer dequeue timeouts reduced from 3 ms to 1 ms, cutting worst-case encoder loop sleep time and improving frame throughput on the MediaTek MT6768.
+  - **Preliminary SpinWait work in encoder loop**: Introduced initial `SpinWait` usage in `EncodingLoop` to reduce idle wait overhead between frames. (Later replaced by the persistent `SpinWait` instance fix in v1.5.25 to prevent level-0 spin reset on each iteration.)
 
 - v1.5.21: **Long-Running Stability & Latency Fix** — Eliminates overnight SIGABRT crashes and reduces streaming latency.
   - **JNI-free processing thread**: `BackCameraService` and `FrontCameraService` now marshal all `VideoFrame` data into managed `FrameEventArgs` in the `OnFrameAvailable` callback (JNI context) and recycle the native frame immediately. The `ProcessFramesAsync` thread makes zero JNI calls, preventing Mono GC thread-state corruption (`Cannot transition thread from RUNNING with DONE_BLOCKING`).
@@ -1217,6 +1400,14 @@ There are few (if any) options to integrate RTSP servers with Android using C# a
   - **Resolution change support**: Added `ApplyResolutionChange()` pipeline — stops encoder, clears SPS/PPS, restarts camera at new resolution, disconnects affected clients, and pre-warms encoder.
   - Fixed same UV offset bug in `CropAndDestrideFrame()` fallback path.
 
+- v1.5.19: **Resolution-Change Refinements**
+  - **Refined encoder fallback resolution selection**: `GetNearestSupportedResolution()` improved to prefer aspect-ratio-matching resolutions when stepping down from a requested size that the encoder does not support, reducing distortion on non-standard frame sizes.
+  - **Improved stride-padding handling**: `WriteFrameToEncoderBuffer` now correctly computes the UV-plane source offset for frames whose buffer stride is not a simple multiple of the width, fixing subtle color banding at non-standard resolutions following a resolution change.
+
+- v1.5.18: **Multi-Resolution Selection Scaffolding**
+  - **Added multi-resolution selection via `ServerConfiguration`**: `BackCameraResolution` and `FrontCameraResolution` can now be changed at runtime; a resolution-change request is queued and applied on the next WatchDog cycle.
+  - **Initial `ApplyResolutionChange()` pipeline**: Stops the encoder, clears cached SPS/PPS, restarts the camera at the new resolution, disconnects affected clients, and pre-warms the encoder. Note: UV plane color corruption at resolutions above 720p was present in this initial implementation and was fixed in v1.5.20.
+
 - v1.5.17: **VLC Compatibility Release** — Full RFC 2326/4566 compliance for standards-compliant RTSP clients.
   - Case-insensitive RTSP header parsing (`StringComparer.OrdinalIgnoreCase`) — VLC may send headers with varying casing
   - OPTIONS method handled before authentication per RFC 2326 §10.1 — VLC sends unauthenticated OPTIONS as capability probe
@@ -1227,534 +1418,357 @@ There are few (if any) options to integrate RTSP servers with Android using C# a
   - H.264 encoder pre-warming at SETUP time — prevents live555 timeout on first connect by having the encoder ready before PLAY
   - Encoder stall recovery — automatically restarts stalled encoders when subsequent clients connect
 
-- v1.1.5: Fixing EventBuss command on Server class, if the server was started do not raise the flag into it, and sometimes make the app crash due to "Port already in use" or even using excesive CPU on multiple MJPEG servers.
-Adding to MJPEGServer preview of EventBuss to handle it by there, but needs sync with main server to avoid duplicate instances or commands.
+- v1.5.16: H.264 Stream Freeze Fix — MediaTek Encoder Quirks, RTP Timestamps, and Client Lifecycle. This release resolves the remaining causes of H.264 stream freezing on MediaTek devices through a combination of encoder configuration fixes, RTP timestamp correction, and client lifecycle hardening.
 
-- v1.1.6: Adding ArrayPool to avoid ovearhead at GC with multiple byte[] creations like in RTP Packets.
-Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, theorical from 100ms to 100 us, increase performance on fewer CPU resources devices.
+  - **Encoder Stall from All-IDR Output (PRIMARY ROOT CAUSE)**:
 
-- v1.1.7: Fixing MJPEG Codec bugs avoiding crashes, fixing Watchdog that close prematurly some connections, fixing some issues with the preview.
+  - Problem: `SetFloat(KeyIFrameInterval, 0.25f)` was misinterpreted by the MediaTek MT6768 as `0`, causing every single frame to become an IDR keyframe. After ~1000 frames, the encoder's internal buffers were exhausted and it stalled permanently — no more output, but input still accepted.
 
-- v1.1.8: Fixing issues related with Camera Services, making that on camera or service closure do not allow to restart them.
+  - Diagnostic: Encoder output logs showed `key=True` on every frame. After frame ~1000, `Frame dequeue timeout (2000ms)` appeared every 2 seconds with no further encoder output.
 
-- v1.1.9: Adding user/password handling options.
+  - Fix: Changed to `SetInteger(KeyIFrameInterval, 1)`. Always use `SetInteger` (not `SetFloat`) for I-frame interval on Android MediaCodec. Sub-second float values are unreliable on many SoCs. Value of 1 = one IDR keyframe per second (~25 frames at 25fps).
 
-- v1.1.10: Adding a custom class 'ServerConfiguration' to handle more easily all the server configurations.
+  - **RTP Timestamps 1000x Too Fast (CRITICAL)**:
 
-- v1.1.11: Fixing Server to allow Configuration Class, fixing MjpegServer disposal on Server class, fixing MjpegServer to set a fixed bitrate to 30 fps and fixing CPU leaks.
+  - Problem: `EncoderTimestampToRtp` treated MediaCodec's `PresentationTimeUs` as microseconds, but the MT6768 reports values in units approximately 1000x larger than microseconds. This produced RTP timestamp deltas of ~3,000,000 per frame instead of the expected ~3,600 (at 25fps/90kHz clock). Players like VLC interpreted frames as being 33 seconds apart and buffered forever, appearing frozen.
 
-- v1.2.0: Adding new global encoder for compatiblity with multiple devices not only Mediatek and fixing some features from the server to handle clients.
+  - Diagnostic: Added NAL diagnostic logging that revealed encoder timestamp deltas of ~33,333,000 between 25fps frames (should be ~40,000 if microseconds).
 
-- v1.3.1: Major H.264 Stability and Stutter Fix This release targets and resolves a series of core issues in the H.264 streaming logic that caused stutter, frame overlapping, and "two-frame" freezes. The stream is now significantly smoother and more stable.
+  - Fix: Replaced encoder-timestamp-based RTP derivation with `Stopwatch` wall-clock time. `BaseEncoderTimestamp` is repurposed to store the `Stopwatch.GetTimestamp()` start tick. RTP offset is calculated as `elapsedSeconds * 90000.0`, which produces correct ~3,600 deltas regardless of encoder timestamp units. This approach is robust across all SoCs.
 
-  - Fixed Critical Timestamp Conversion:
+  - **Client Lifecycle Killing Active Streams**:
 
-  - Problem: The server was incorrectly converting the camera encoder's timestamps. We discovered the encoder provides timestamps in nanoseconds, but the server was treating them as microseconds. This resulted in RTP timestamps being 1000x too large, causing players to think a single frame should last for 30+ seconds, leading to a "two-frame" freeze.
+  - Problem: Multiple lifecycle mechanisms (WatchDog, HandleClient, RTCP, TransportManager) were prematurely terminating streaming clients due to unreliable `Socket.Connected` checks, single-error disconnection, and disposal race conditions that caused `ObjectDisposedException` in streaming tasks.
 
-  - Fix: The timestamp conversion logic in EncoderTimestampToRtp has been corrected to divide by 1,000,000,000.0 (nanoseconds) instead of 1,000,000.0 (microseconds).
+  - Fixes:
+    - `GetDeadClients()` checks `IsPlaying` first — playing clients are never marked as dead, only non-playing clients are subject to socket checks and grace period timeouts
+    - `TransportManager` uses graduated error counting with a threshold of 10 consecutive failures (TCP) or 5 failures / unreachable host (UDP), instead of immediate disconnection on first error
+    - `CleanupClient` sets `IsPlaying = false` before calling `Dispose()` to prevent `ObjectDisposedException` in streaming tasks that may still be running on separate threads
+    - `HandleClient` uses `ReadLineAsync()` null detection instead of `Socket.Connected` to detect disconnection, avoiding false positives from the unreliable `Connected` property
+    - Frame dequeue uses a 2-second timeout to prevent blocking forever on encoder stalls
+    - `FramePacer.ShouldDropFrame` fixed: now correctly drops frames arriving too fast (less than half a frame interval), not frames arriving after a gap — the previous inverted logic caused recovery from stalls to be even slower
 
-  - Corrected RTP Marker Bit Logic:
+  - **Encoding Loop Reorder**:
 
-  - Problem: The RTP "Marker Bit" (M-bit), which signals the end of a video frame, was being set incorrectly (e.g., on every small NAL unit). This confused decoders, causing them to render frames on top of each other or get stuck.
+  - Problem: The encoding loop fed input first, then drained output. When the encoder's internal input queue was full (because output hadn't been drained), `FeedInputBuffer` would fail and the frame was lost.
 
-  - Fix: The server now correctly tracks all NAL units and fragments belonging to a single frame. The M-bit is now set only on the absolute last RTP packet of the last NAL unit for that frame, as required by the H.264 spec.
+  - Fix: Swapped the order in `EncodingLoop` to drain output before feeding input. This frees encoder resources before attempting to queue new input, reducing unnecessary frame loss on resource-constrained SoCs.
 
-  - Removed Conflicting Stream Pacing:
+  - **Files Changed**:
+    - `RTSP/H264Encoder.cs`: I-frame interval fix (`SetFloat` → `SetInteger`), encoding loop drain-before-feed reorder
+    - `RTSP/Transport/RtpPacketBuilder.cs`: Wall-clock `Stopwatch`-based RTP timestamp derivation
+    - `RTSP/Transport/TransportManager.cs`: Graduated error counting (10 threshold for TCP, 5 for UDP), SendLock timeout logging
+    - `RTSP/Streaming/StreamingController.cs`: 2-second frame dequeue timeout, `ObjectDisposedException` and `ChannelClosedException` handling
+    - `RTSP/Streaming/FramePacer.cs`: Inverted drop logic fix (drops fast frames, not slow ones)
+    - `RTSP/ClientManagement/ClientManager.cs`: Safe cleanup ordering (`IsPlaying = false` before `Dispose()`), `IsPlaying`-first dead client check
+    - `RTSP/Server.cs`: `HandleClient` socket lifecycle fix using `ReadLineAsync` null detection
 
-  - Problem: The streaming loop had two "pacemakers" fighting each other:
+  - **Debugging Methodology**:
 
-  - A fixed Task.Delay trying to send at 45 FPS (22ms).
+  - This fix was identified through a systematic "debug mode" approach:
+    1. Disabled all lifecycle management (WatchDog, RTCP cleanup, HandleClient socket closing) to isolate the actual streaming issue
+    2. Added frame counter logging to track frame flow through the entire pipeline (camera → encoder → channel → streaming controller → RTP → transport)
+    3. Discovered all-IDR output from encoder logs (`key=True` on every frame)
+    4. After I-frame fix, added detailed NAL diagnostic logging (NAL type, size, encoder timestamp, RTP timestamp, SPS/PPS info)
+    5. Discovered RTP timestamp delta of ~3,000,000 instead of expected ~3,600
+    6. Applied wall-clock timestamp fix — stream became fluid
 
-  - The H.264 encoder, which was producing frames at 25 FPS (40ms).
+  - **Performance Metrics**:
 
-  - Fix: The fixed Task.Delay has been removed for H.264 streaming. The loop is now event-driven: it sends a frame as soon as the encoder provides one and loops immediately. If no new frame is ready, it waits a tiny 10ms (to prevent 100% CPU usage) and checks again. This lets the encoder, not the server loop, dictate the stream's framerate.
+  | Metric | Before | After |
+  |--------|--------|-------|
+  | H.264 Stream Duration | ~30 seconds then freeze | Continuous, unlimited |
+  | Encoder Output | Stall after ~1000 frames | Continuous encoding |
+  | RTP Timestamp Delta | ~3,000,000 (833x too large) | ~3,600 (correct) |
+  | Client Reconnection | Frequent false disconnections | Stable with graduated error tolerance |
+  | Frame Recovery After Stall | Slow (drops first frames) | Immediate (drops only bursts) |
 
-  - Eliminated Network Send Latency (Nagle's Algorithm):
+  - **Impact**: H.264 RTSP streaming now runs continuously without freezing on MediaTek MT6768 and likely other MediaTek SoCs that share these encoder quirks. The combination of correct I-frame interval configuration, robust RTP timestamp derivation, and hardened client lifecycle management eliminates the three root causes of the freeze. Transient network errors no longer kill the stream, and the encoder no longer stalls from all-IDR output.
 
-  - Problem: For TCP streams, the OS was likely bundling small RTP packets together before sending them (Nagle's Algorithm). This is good for file transfers but terrible for real-time video, as it introduces small, random delays perceived as micro-stutter.
+- v1.5.15: H.264 Thread Safety Fix and Connection Stability. This release fixes a critical threading bug that caused H.264 streams to freeze after ~2 frames, along with several connection reliability improvements.
 
-  - Fix: Nagle's Algorithm is now explicitly disabled (NoDelay = true) on all accepted client sockets, ensuring every RTP packet is sent to the network immediately.
+  - **H.264 Streaming Freeze Fix (Thread Safety)**:
 
-  - Removed H.264 Frame Lock Contention:
+  - Problem: `FeedFrame()` was calling `FeedInputBuffer()` directly on the camera callback thread while `DrainOutputBuffer()` ran on the encoder thread. These concurrent JNI calls to MediaCodec caused the encoder to stall after ~2 frames.
 
-  - Problem: The encoder thread (writing a new frame) and the network thread (reading that frame) were using the same lock. This meant one thread often had to wait for the other, causing a "hiccup" in frame delivery.
+  - Fix: `FeedFrame()` now routes frames through `_frameChannel` so that both `FeedInputBuffer()` and `DrainOutputBuffer()` are serialized on the encoder thread. This eliminates concurrent JNI access to MediaCodec.
 
-  - Fix: This lock has been completely replaced with a high-performance, lock-free Interlocked.Exchange operation. This allows the encoder and network threads to swap frame data atomically without ever blocking each other, resulting in a smoother handoff from camera to network.
+  - **Encoder Channel Capacity**:
 
-- v1.4.0: Major H.264 Codec Overhaul and VLC Compatibility Fix. This release addresses critical issues in the H.264 implementation that caused stutter, timing problems, and complete playback failure on VLC and other strict players.
+  - Fix: Increased `_frameChannel` bounded capacity from 2 to 5 frames, providing better buffering headroom and reducing frame drops during brief processing spikes.
 
-  - Fixed Critical Timestamp Unit Mismatch:
+  - **TOCTOU Socket Race Fix**:
 
-  - Problem: The encoder outputs timestamps in microseconds (PresentationTimeUs), but the server was treating them as nanoseconds. This resulted in RTP timestamps being 1000x smaller than expected, causing massive stutter, frame overlap, and timing desynchronization.
+  - Problem: The streaming loop called `IsSocketConnected` (using `Socket.Poll`) on the same RTSP socket that `HandleClient` was reading from. This created a time-of-check-to-time-of-use race where the poll would consume data intended for the RTSP reader, causing false disconnection detection.
 
-  - Fix: The timestamp conversion in `EncoderTimestampToRtp` now correctly converts microseconds to RTP units using fixed-point arithmetic: `(deltaUs * 9 + 50) / 100` (equivalent to `deltaUs * 90000 / 1_000_000`).
+  - Fix: Removed `IsSocketConnected` from the streaming loop. Connection health is now determined solely by send error counting, which is inherently race-free.
 
-  - Added VLC Compatibility (sprop-parameter-sets in SDP):
+  - **SPS/PPS Deduplication**:
 
-  - Problem: VLC and many strict players require `sprop-parameter-sets` in the SDP to initialize the H.264 decoder. Without this, VLC would fail to decode the stream entirely.
+  - Problem: SPS/PPS NAL units were being sent redundantly — both as separate parameter sets before keyframes and embedded within the keyframe data itself.
 
-  - Fix: The SDP now dynamically includes base64-encoded SPS and PPS in the `a=fmtp` line when available. The server caches these parameter sets as they're received from the encoder.
+  - Fix: Added deduplication logic to skip SPS/PPS NAL units when they have already been sent separately before the keyframe, reducing bandwidth waste.
 
-  - Fixed NAL Unit Extraction (Multiple NALs per Frame):
+  - **Transport SendLock Timeout**:
 
-  - Problem: The encoder was treating each output buffer as a single NAL unit, even when it contained multiple NAL units (e.g., SEI + IDR, or SPS + PPS combined). This caused incomplete frames and decoder confusion.
+  - Problem: The `_sendLock` in `TransportManager` used a CancellationToken-linked timeout. During server lifecycle events (shutdown, restart), the CTS could be cancelled, causing sends to fail silently instead of timing out normally.
 
-  - Fix: Added `ExtractNalUnitsFromFrame` method that properly parses start codes and extracts all NAL units from encoder output. The server now sends each NAL unit as a separate RTP packet (or FU-A fragmented if large).
+  - Fix: Changed to a fixed 3-second timeout (`TimeSpan.FromSeconds(3)`) that is independent of the server CancellationTokenSource.
 
-  - Fixed SPS/PPS Start Code Handling:
+  - **Standalone Send CTS**:
 
-  - Problem: When extracting SPS/PPS from MediaFormat's csd-0/csd-1 buffers, the code assumed specific start code formats. Some encoders provide raw NAL data without start codes, others use 3-byte or 4-byte start codes.
+  - Problem: The send CancellationTokenSource was coupled to the server CTS, meaning server shutdown would immediately cancel in-flight sends without allowing graceful client cleanup.
 
-  - Fix: Added robust `GetStartCodeLength`, `GetNalType`, and `EnsureStartCode` helper methods that handle all cases. Parameter sets are now normalized to 4-byte start codes for consistent handling.
-
-  - Fixed Multi-Client Frame Delivery:
-
-  - Problem: Using `Interlocked.Exchange` with null replacement caused frames to be consumed by one client, leaving other clients without frames.
-
-  - Fix: Changed to non-destructive frame reading where each client tracks its own last-sent timestamp. Multiple clients can now receive the same frame, and per-client timestamp tracking prevents duplicate sends.
-
-  - Improved Frame Dropping Strategy:
-
-  - Problem: The encoder was aggressively dropping frames (keeping only 2 max), which could break B-frame prediction chains and cause visible stutter.
-
-  - Fix: Frame queue limit increased to 3 with single-frame-at-a-time dropping. This provides better buffering while maintaining low latency.
-
-  - Added RTCP Sender Reports:
-
-  - Problem: VLC and other players use RTCP Sender Reports (SR) for clock synchronization and jitter buffer management. Without SR packets, players may exhibit poor sync and choppy playback.
-
-  - Fix: The server now sends RTCP Sender Reports every 5 seconds. Each SR includes NTP timestamp, RTP timestamp, packet count, and octet count as per RFC 3550.
-
-  - Enhanced Code Documentation:
-
-  - Added XML documentation comments to all major methods explaining their purpose, parameters, and behavior.
-  - Improved code readability with clear comments explaining RTP/RTCP protocol details.
-
-- v1.4.1: Client Connection Management Overhaul and H.264 Reliability Fix. This release addresses critical issues with abrupt client disconnection handling and encoder buffer size mismatches that caused delayed reconnections and missing video.
-
-  - Fixed Critical Client Collection Bug (ConcurrentBag → ConcurrentDictionary):
-
-  - Problem: The server used `ConcurrentBag<Client>` with `TryTake()` for client cleanup. `TryTake()` removes a **random** element, not the specific client being cleaned up. This corrupted the client list over time, causing ghost clients and preventing proper cleanup.
-
-  - Fix: Replaced `ConcurrentBag<Client>` with `ConcurrentDictionary<string, Client>`. Client cleanup now uses `TryRemove(client.Id, out _)` to remove the exact client being disconnected.
-
-  - Added TCP Connection Timeout Detection:
-
-  - Problem: `Socket.Connected` does not detect abrupt disconnections (network failure, process kill). The server would continue trying to stream to dead clients, blocking resources and preventing new clients from receiving video.
-
-  - Fix: Added comprehensive connection health tracking:
-    - `LastActivityTime` tracks last successful send per client
-    - `ConsecutiveSendErrors` counts sequential failures
-    - 5-second send timeout using `CancellationTokenSource` detects stuck connections
-    - 30-second inactivity timeout in streaming loop catches zombie connections
-    - Client marked as disconnected after 3 consecutive errors or socket exception
-
-  - Fixed H.264 Encoder Buffer Size Mismatch:
-
-  - Problem: The encoder was initialized with camera-reported dimensions (e.g., 640x480), but some cameras send frames with different actual sizes (e.g., 640x640). This caused `Input buffer too small` errors and dropped frames.
-
-  - Fix: Added `CalculateDimensionsFromFrameSize()` method that:
-    - Checks common resolutions against actual YUV420 frame size
-    - Calculates dimensions using width/height hints when possible
-    - Falls back to square aspect ratio calculation
-    - Ensures encoder is always initialized with correct frame dimensions
-
-  - Improved UDP Error Handling:
-
-  - Problem: UDP send errors weren't properly tracked, allowing broken connections to persist.
-
-  - Fix: UDP sends now track activity time and consecutive errors. Clients are disconnected after 5 consecutive UDP errors or when network is unreachable.
-
-  - Enhanced Error Logging:
-
-  - Added detailed logging for connection timeouts, send failures, and dimension mismatches to aid debugging.
-
-- v1.5.0: Stability and Performance Improvements. This release focuses on connection reliability, faster disconnection detection, smoother video playback, and reduced latency.
-
-  - Improved Socket Disconnection Detection:
-
-  - Problem: `Socket.Connected` property doesn't reliably detect abrupt TCP disconnections (client crash, network loss, etc.). The server would continue streaming to dead connections for extended periods.
-
-  - Fix: Added `IsSocketConnected()` method that uses `Socket.Poll()` to actively probe connection state. If poll returns readable but no data is available, the connection is confirmed closed. This detects dead connections within seconds instead of minutes.
-
-  - Reduced Reconnection Time (WatchDog Optimization):
-
-  - Problem: WatchDog ran every 60 seconds, causing long delays before the server detected all clients were gone and could reset state for new connections.
-
-  - Fix: WatchDog interval reduced to 5 seconds. Also improved logic to check `IsPlaying` status alongside socket connection, actively clean up dead clients, and clear SPS/PPS caches when resetting streaming state.
-
-  - Fixed Frame Queue for Smoother Playback:
-
-  - Problem: H.264 frames were stored in single variables (`_latestH264FrameBack/Front`) using `Interlocked.Exchange`. If the encoder produced frames faster than they could be sent, frames would be overwritten and lost, causing stuttering.
-
-  - Fix: Replaced single frame variables with `ConcurrentQueue<H264FrameEventArgs>` (max 5 frames buffer). Frames are now queued and sent in order, preventing loss during brief processing delays.
-
-  - Optimized Encoder Input/Output Handling:
-
-  - Problem: Encoder used 0ms timeout for buffer operations, causing missed buffers and aggressive frame dropping (max 1 frame in queue).
-
-  - Fix:
-    - Input buffer dequeue timeout increased to 10ms
-    - Output buffer dequeue timeout increased to 10ms
-    - Frame queue limit increased from 1 to 3 frames
-    - Re-enabled sleep in encoding loop to prevent CPU spinning
-
-  - Reduced Streaming Latency:
-
-  - Fix: Multiple latency optimizations applied:
-    - Socket buffers reduced from 256KB to 64KB (less buffering delay)
-    - TCP_NODELAY explicitly set on all connections
-    - I-frame interval reduced from 2s to 1s (faster stream recovery)
-    - Inactivity timeout reduced from 30s to 10s (faster dead connection cleanup)
-
-  - Enhanced Connection Health Checks:
-
-  - Fix: Streaming loop now checks three conditions before each frame:
-    - `IsSocketConnected()` for active connection state
-    - Inactivity timeout (10 seconds with no successful send)
-    - Consecutive send errors (disconnects after 3 failures)
-
-  - Fixed Frame Stride Padding Handling:
-
-  - Problem: Android cameras may include row stride padding in YUV frames, causing buffer size mismatches (e.g., 640x480 camera sending 614,398 bytes instead of expected 460,800).
-
-  - Fix: Added frame size normalization via truncation to expected size. While this may cause minor artifacts on some devices, it prevents encoder crashes and ensures video delivery.
-
-- v1.5.1: MJPEG Server External Access and Improvements. This release enables external device access to the MJPEG stream, making it usable from any device on the network via a simple `<img>` tag.
-
-  - Enabled External Network Access:
-
-  - Problem: MJPEG server was hardcoded to bind to `127.0.0.1` (localhost only), making it impossible for external devices to access the stream.
-
-  - Fix: Changed default binding to `0.0.0.0` (all interfaces). Added configurable `bindAddress` parameter and wildcard prefix support for broader compatibility.
-
-  - Added Optional Basic Authentication:
-
-  - Problem: When exposed to the network, the MJPEG stream had no authentication, creating a security risk.
-
-  - Fix: Added optional Basic HTTP authentication. When `AuthRequired` is enabled, clients must provide valid credentials. Authentication uses the same user database as the RTSP server.
-
-  - Added CORS Headers for Web Integration:
-
-  - Fix: MJPEG responses now include proper CORS headers (`Access-Control-Allow-Origin: *`) and cache control headers, enabling seamless integration with web pages on any domain.
-
-  - Fixed Front Camera Client Handling:
-
-  - Problem: `WriteDataAsync` only checked `_clientsBack` dictionary for client ID lookup, causing Front camera clients to not receive frames properly.
-
-  - Fix: Added `isBackCamera` parameter to correctly handle both Front and Back camera clients with proper dictionary lookups.
-
-  - Added Per-Client Timeout with Slow Client Protection:
-
-  - Problem: One slow client could block frame delivery to all other clients due to `Task.WhenAll()` waiting for everyone.
-
-  - Fix: Added `WriteDataAsyncWithTimeout()` wrapper with 2-second timeout per client. Slow clients are automatically disconnected without affecting others.
-
-  - Fixed Memory Leak in Client Tracking:
-
-  - Problem: `_clientLastFrameTime` dictionary was never cleaned up when clients disconnected, causing memory accumulation.
-
-  - Fix: Client IDs are now properly removed from `_clientLastFrameTime` in all cleanup paths (normal disconnect, timeout, error).
-
-  - Added Client Count Properties:
-
-  - Fix: Added `ClientCount`, `BackClientCount`, and `FrontClientCount` properties for monitoring connected MJPEG clients.
-
-  - Added MjpegServerPort Configuration:
-
-  - Fix: MJPEG server port is now configurable via `ServerConfiguration.MjpegServerPort` (default: 8089) or constructor parameter.
-
-  **Usage Example (External Access)**:
-  ```html
-  <!-- From any device on the network -->
-  <img src="http://192.168.1.100:8089/Back/" alt="Live Stream" />
-
-  <!-- With authentication -->
-  <img src="http://admin:password123@192.168.1.100:8089/Back/" alt="Live Stream" />
-  ```
-
-- v1.5.2: Comprehensive Code Documentation. Added XML documentation comments to all public classes, methods, properties, and events.
-
-  - **Models**: `FrameEventArgs`, `H264FrameEventArgs`, `Client`, `VideoProfile`, `ServerConfiguration`, `RtspRequest`, `RtspAuth`, `EncoderInfo`, `AuthType`, `CodecType`, `BussCommand`, `TransportMode`
-
-  - **Services**: `Server`, `MjpegServer`, `FrontCameraService`, `BackCameraService`
-
-  - **Encoders**: `H264Encoder` (general-purpose), `MediaTekH264Encoder` (MediaTek-optimized)
-
-  - **Utilities**: `EventBuss`, `FrameConverterHelper`, `FrameCallback`, `ICameraService`
-
-  - Benefits:
-    - Full IntelliSense support in Visual Studio and VS Code
-    - Auto-generated API documentation capability
-    - Improved code maintainability and developer experience
-
-- v1.5.3: Unit Testing Infrastructure. Added comprehensive unit test suite using xUnit and FluentAssertions.
-
-  - **Test Project**: `BaluMediaServer.Tests` targeting `net9.0` with file linking approach for cross-targeting compatibility
-
-  - **Test Coverage (134 tests)**:
-    - `VideoProfileTests` (22 tests): Quality clamping, name sanitization, default values
-    - `ServerConfigurationTests` (27 tests): All property defaults, HTTPS config, camera settings
-    - `EventBussTests` (7 tests): Command propagation, multiple subscribers, unsubscribe handling
-    - `RtspRequestTests` (21 tests): CSeq parsing, header handling, property initialization
-    - `EnumTests` (57 tests): AuthType, CodecType, BussCommand value validation and parsing
-
-  - **Tools**: xUnit, FluentAssertions, Coverlet for code coverage
-
-  - **Run Tests**:
-    ```bash
-    cd BaluMediaServer.Tests
-    dotnet test
-    dotnet test --collect:"XPlat Code Coverage"
+  - Fix: Decoupled the send timeout CTS from the server CTS, allowing in-progress sends to complete or timeout naturally during shutdown.
+
+  - **Files Changed**:
+    - `RTSP/H264Encoder.cs`: Thread safety fix — `FeedFrame()` routes through channel; channel capacity increased to 5
+    - `RTSP/Streaming/H264EncoderManager.cs`: SPS/PPS deduplication logic
+    - `RTSP/Streaming/StreamingController.cs`: Removed `IsSocketConnected` TOCTOU race; standalone send CTS
+    - `RTSP/Transport/TransportManager.cs`: Fixed `_sendLock` timeout to 3 seconds
+
+  - **Impact**: H.264 streaming is now stable and no longer freezes after the first few frames. The thread safety fix resolves the root cause of MediaCodec JNI contention. Connection detection is more reliable without the TOCTOU race, and transport timeouts behave correctly during server lifecycle events.
+
+- v1.5.14: Client Reconnection Bug Fix. This release fixes a critical race condition that caused streams to crash when clients disconnected and reconnected.
+
+  - **Problem**: After a client disconnected and reconnected (or a new client connected), the stream would completely stop:
+    - Cameras appeared to crash (flashlight could be enabled, indicating camera release)
+    - New clients would block forever waiting for frames
+    - The issue occurred due to a semaphore race condition in the frame signaling mechanism
+
+  - **Root Cause Analysis**:
+    - The semaphore release logic only released N times where N = current client count
+    - When client disconnected, count dropped to 0, so encoder released 0 times
+    - New clients connecting between frames would call `WaitAsync()` but never receive a signal
+    - This created a deadlock where new clients could never receive frames
+    - Additionally, `_streamStarted` flag was never reset, preventing on-demand camera restart
+
+  - **Solution**: Two-part fix for robust client handling:
+
+  - **Semaphore Always Releases At Least Once**:
+    ```csharp
+    // Before (buggy):
+    var clientCount = _clientsBack.Count;  // Could be 0!
+
+    // After (fixed):
+    var clientCount = System.Math.Max(1, _clientsBack.Count);  // Always >= 1
+    ```
+    - Ensures new clients connecting between frames can acquire the semaphore
+    - Prevents deadlock when client count temporarily drops to zero
+    - `SemaphoreFullException` still prevents overflow
+
+  - **Reset Stream State on Last Client Disconnect**:
+    ```csharp
+    // In HandleClient finally block:
+    if (_clientsBack.Count == 0 && _clientsFront.Count == 0)
+    {
+        lock (_streamLock)
+        {
+            if (_clientsBack.Count == 0 && _clientsFront.Count == 0)
+            {
+                _streamStarted = false;  // Allow on-demand restart
+            }
+        }
+    }
+    ```
+    - Double-checked locking pattern for thread safety
+    - Allows cameras to restart on-demand when new clients connect
+    - Logs state change for debugging
+
+  - **Files Changed**:
+    - `Services/MjpegServer.cs`:
+      - Lines 371, 419: Changed `Math.Max(1, count)` for semaphore release
+      - Lines 657-668: Added `_streamStarted` reset in client cleanup
+
+  - **Testing**:
+    - Connect MJPEG client, verify streaming works
+    - Disconnect client, wait a few seconds
+    - Reconnect (same or different device) - stream should resume immediately
+    - Verify no "flashlight available" state (cameras stay ready or restart on-demand)
+
+  - **Impact**: Client reconnection now works reliably. The race condition that caused streams to appear "crashed" after disconnect/reconnect cycles is eliminated. This was a critical fix for production deployments where clients may frequently connect and disconnect.
+
+- v1.5.13: MJPEG Streaming Smoothness Improvements. This release significantly improves MJPEG streaming smoothness with architectural improvements inspired by MauiJpegServer.
+
+  - **Problem**: MJPEG streaming could feel choppy or have inconsistent frame delivery:
+    - Encoder pushed frames to all clients synchronously
+    - No per-client frame rate limiting
+    - Clients could starve each other on slow networks
+    - No real-time FPS tracking for diagnostics
+
+  - **Solution**: New per-client streaming architecture:
+
+  - **SemaphoreSlim-Based Frame Signaling**:
+    - Each client has its own streaming task that waits on a semaphore
+    - When encoder produces a frame, it signals all waiting clients simultaneously
+    - More efficient than polling-based approaches
+    - Clients wake up exactly when frames are available
+
+  - **Per-Client Frame Rate Limiting**:
+    - Each client respects a configurable max frame rate (default 30 FPS)
+    - Prevents frame bursting that can cause network congestion
+    - Smoother, more consistent frame delivery
+    - New constructor parameter: `maxFrameRate`
+
+  - **Real-Time FPS Tracking**:
+    - Accurate FPS calculation using `Stopwatch`
+    - Watchdog logs FPS: `FPS: Back=29.8, Front=30.1`
+    - New properties: `BackCameraFps`, `FrontCameraFps`
+    - Total frame counters: `TotalBackFrames`, `TotalFrontFrames`
+
+  - **Per-Client Streaming Tasks**:
+    - Each client runs its own async streaming loop
+    - Clients are independent - slow client doesn't affect others
+    - Individual timeout and cleanup per client
+    - Better client lifecycle management with `ClientInfo` class
+
+  - **Latest Frame Access**:
+    - New methods: `GetLatestBackFrame()`, `GetLatestFrontFrame()`
+    - Useful for snapshot endpoints
+    - Instant frame access without waiting
+
+  - **API Changes**:
+    ```csharp
+    // New constructor parameter
+    var server = new MjpegServer(
+        port: 8089,
+        quality: 75,
+        maxFrameRate: 30  // NEW: Limit FPS per client
+    );
+
+    // New properties
+    double backFps = server.BackCameraFps;
+    double frontFps = server.FrontCameraFps;
+    long totalFrames = server.TotalBackFrames;
+
+    // New methods for snapshots
+    byte[]? latestFrame = server.GetLatestBackFrame();
     ```
 
-- v1.5.4: Critical Bug Fixes for Server Startup and MJPEG Streaming. This release addresses multiple issues that could cause the server to fail silently or MJPEG streaming to not transmit video.
+  - **Files Changed**:
+    - `Services/MjpegServer.cs`: Complete rewrite of client streaming architecture
 
-  - **Fixed Wrong Event Unsubscription in Server.cs**:
+  - **Performance Impact**:
+    - Smoother frame delivery with consistent intervals
+    - Reduced jitter on variable network conditions
+    - Better multi-client performance (clients don't block each other)
+    - Lower latency for responsive clients
 
-  - Problem: When stopping the back camera via `BussCommand.STOP_CAMERA_BACK`, the code was incorrectly unsubscribing from `OnFrontFrameAvailable` instead of `OnBackFrameAvailable`. This caused event handler leaks and potential memory issues.
+  - **Impact**: MJPEG streaming is now significantly smoother with consistent frame pacing. The new architecture ensures each client receives frames at a controlled rate, preventing the choppy playback that could occur with the previous push-based approach. Inspired by the clean architecture of MauiJpegServer while retaining BaluMediaServer's advanced features (authentication, HTTPS, etc.).
 
-  - Fix: Corrected the event unsubscription to use `OnBackFrameAvailable` for the back camera service.
+- v1.5.12: Native Library Frame Delivery Fix - Resolved Stream Stopping Issue. This release fixes a critical bug in the native Android camera library that caused streams to stop completely after running for a short time.
 
-  - **Fixed MJPEG Server Initialization Issues**:
+  - **Problem**: MJPEG streams would stop receiving frames after the native library's internal queue filled up:
+    - Logs showed: `Back camera queue backing up (81/100), dropping frame`
+    - After queue reached 80% capacity, ALL frames were dropped
+    - The queue was never consumed by any code (dead/unused feature)
+    - Once full, the queue stayed full forever, permanently blocking frame delivery
+    - Result: Stream worked initially, then stopped completely with no recovery
 
-  - Problem: The `MjpegServer` was being created with default parameters at field initialization, causing:
-    - Memory leak from orphaned event subscriptions (the initial instance subscribed to static events but was replaced in the constructor)
-    - Lost configuration when MJPEG server was recreated (only `quality` parameter was passed, losing port, authentication, HTTPS settings, etc.)
-
-  - Fix:
-    - Added stored fields for all MJPEG server settings (`_mjpegServerPort`, `_mjpegUseHttps`, `_mjpegCertificatePath`, `_mjpegCertificatePassword`)
-    - Created `CreateMjpegServer()` helper method that uses all stored configuration
-    - Changed `_mjpegServer` to nullable with proper null checks throughout
-    - All MJPEG server recreation points now use the helper method with full configuration
-
-  - **Fixed Channel Initialization Race Condition in Camera Services**:
-
-  - Problem: In both `BackCameraService` and `FrontCameraService`, the camera capture was started BEFORE the frame channel was created. This caused:
-    - `NullReferenceException` if frames arrived immediately after starting capture
-    - Potential frame loss during the race window
-    - The `BoundedChannelFullMode.Wait` setting could block the native camera callback thread
-
-  - Fix:
-    - Reordered initialization to create the channel BEFORE starting camera capture
-    - Changed `BoundedChannelFullMode.Wait` to `DropOldest` to prevent blocking the camera callback thread (real-time video should drop old frames, not block)
-    - Added null checks in `OnFrameAvailable()`, `StopCapture()`, and `Dispose()` methods
-
-  - **Impact**: These fixes resolve issues where the server would appear to start successfully but:
-    - MJPEG streaming would not transmit any video
-    - Camera services could crash on first frame
-    - Event handlers could leak memory over time
-
-- v1.5.5: Critical Server Startup Fix (EnableServer Flag). This release fixes a critical bug where servers created using `ServerConfiguration` would never start.
-
-  - **Fixed Missing EnableServer Configuration Property**:
-
-  - Problem: When using the `Server(ServerConfiguration config)` constructor, the internal `_enabled` flag was always set to `false`. This caused `Server.Start()` to return immediately without actually starting the server, as the start logic checks `if (_enabled && !IsRunning)` before proceeding.
-
-  - Root Cause: The `ServerConfiguration` class was missing the `EnableServer` property. Since `bool` defaults to `false` in C#, any server created via the configuration constructor would have `_enabled = false`, silently preventing startup.
-
-  - Fix:
-    - Added `EnableServer` property to `ServerConfiguration` class with default value of `true`
-    - Server constructor now correctly reads this value: `_enabled = configuration.EnableServer`
-    - Added comprehensive XML documentation explaining the property's purpose
-
-  - **Impact**: This was a critical bug that caused servers initialized with `ServerConfiguration` to appear to start (no errors thrown) but never actually accept connections. The `Start()` method would return `false` silently. This fix ensures servers start correctly by default.
-
-  - **Migration Note**: Existing code using `ServerConfiguration` will now work correctly without any changes, as `EnableServer` defaults to `true`. If you need to disable a server, explicitly set `EnableServer = false`.
-
-- v1.5.6: Camera Resource Management Fix. This release fixes a critical bug where cameras would continue running after all clients disconnected, wasting device resources.
-
-  - **Fixed Camera Not Stopping When Clients Disconnect**:
-
-  - Problem: When RTSP streaming started, the code set `_isCapturingBack = true` (or `_isCapturingFront`), but these flags were never reset when clients disconnected. The WatchDog checked `if (!_isCapturingBack)` before stopping cameras, so it would skip stopping them because the flag was still `true`.
-
-  - Fix:
-    - Removed the broken condition that prevented cameras from stopping
-    - Now properly resets `_isCapturingBack` and `_isCapturingFront` to `false` when stopping cameras
-    - Cameras now correctly stop when all RTSP clients disconnect
-
-  - **Improved MJPEG Client Detection**:
-
-  - Problem: The WatchDog only checked if MJPEG server was enabled (`_mjpegServerEnabled`), not if it actually had connected clients. This meant cameras would keep running even when MJPEG server had no clients.
-
-  - Fix: Now checks `_mjpegServer?.ClientCount` to determine if MJPEG has active clients before deciding to keep cameras running.
-
-  - **Added Catch-All Resource Cleanup**:
-
-  - Fix: Added a second condition to catch the case where cameras are running (started by EventBuss or MJPEG) but all clients have disconnected:
-    - If no RTSP clients are playing AND no MJPEG clients are connected AND cameras are running, cameras will now stop
-    - Logs clearly indicate when cameras are stopped or kept running for clients
-
-  - **Impact**: This fix prevents unnecessary battery drain and CPU usage when no clients are connected to the stream.
-
-- v1.5.7: Configurable Video Resolution. This release adds full support for configuring camera resolution, allowing users to select from predefined presets or specify custom resolutions.
-
-  - **New VideoResolution Enum**:
-
-  - Added `VideoResolution` enum with common presets: QVGA (320x240), Low (480x360), VGA (640x480), SVGA (800x600), HD (1280x720), Full HD (1920x1080)
-  - Each preset includes recommended bitrate settings for H.264 encoding
-  - Extension methods provide helper functions: `GetWidth()`, `GetHeight()`, `GetRecommendedMinBitrate()`, `GetRecommendedMaxBitrate()`, `GetFrameBufferSize()`, `GetDisplayName()`
-
-  - **ServerConfiguration Resolution Support**:
-
-  - Added `BackCameraResolution` and `FrontCameraResolution` properties for preset selection
-  - Added `BackCameraWidth`, `BackCameraHeight`, `FrontCameraWidth`, `FrontCameraHeight` for custom resolutions
-  - Helper methods `GetBackCameraWidth()`, `GetBackCameraHeight()`, etc. resolve effective resolution
-
-  - **Server Class Enhancements**:
-
-  - Constructor now accepts `BackCameraResolution` and `FrontCameraResolution` parameters
-  - New methods: `SetBackCameraResolution()`, `SetFrontCameraResolution()`, `GetBackCameraResolution()`, `GetFrontCameraResolution()`
-  - Camera capture and H.264 encoder now use configured resolution
-
-  - **VideoProfile Updates**:
-
-  - Added `Resolution` property for preset-based configuration
-  - Setting `Resolution` automatically updates `Width`, `Height`, `MinBitrate`, and `MaxBitrate`
-  - Helper methods: `GetFrameBufferSize()`, `GetDimensions()`
-
-  - **H.264 Encoder Considerations**:
-
-  - Resolution directly affects encoder buffer size: `(width * height * 3) / 2` for YUV420
-  - Higher resolutions require more processing power and bandwidth
-  - Bitrate recommendations scale with resolution for optimal quality
-
-  - **Impact**: Users can now easily configure video resolution to balance quality, bandwidth, and device performance. Default resolution remains VGA (640x480) for backward compatibility.
-
-- v1.5.8: Modular Architecture Refactoring and High Resolution Support. This release refactors the monolithic Server.cs into focused, testable modules and adds support for resolutions up to 4K UHD.
-
-  - **Major RTSP Server Modular Refactoring**:
-
-  - Problem: The original `Server.cs` was 2,621 lines with 68 methods handling too many responsibilities (networking, protocol parsing, authentication, encoding, streaming, transport, etc.), making it difficult to maintain, test, and debug.
-
-  - Fix: Refactored into 9 focused modules with clear interfaces:
-
-    | Module | Responsibility | Lines |
-    |--------|---------------|-------|
-    | `RtspProtocolHandler` | RTSP request parsing and response generation | ~326 |
-    | `SdpGenerator` | SDP generation for H.264 and MJPEG | ~173 |
-    | `AuthenticationManager` | Digest/Basic authentication, nonce management | ~275 |
-    | `TransportManager` | UDP/TCP transport, port allocation | ~254 |
-    | `RtpPacketBuilder` | RTP packet creation, NAL fragmentation | ~292 |
-    | `RtcpManager` | RTCP sender reports, receiver feedback | ~242 |
-    | `H264EncoderManager` | H.264 encoder lifecycle, frame queues | ~435 |
-    | `StreamingController` | Main streaming orchestration | ~340 |
-    | `ClientManager` | Client lifecycle, cleanup, caching | ~153 |
-    | `Server` (reduced) | Composition root, wiring | ~700 |
-
-  - **New Directory Structure**:
+  - **Root Cause Analysis**:
+    ```kotlin
+    // BEFORE (Broken) - in CameraFrameServicev2.kt
+    if (queueSize > queueCapacity * 0.8) {  // 80 frames
+        Log.w(TAG, "Back camera queue backing up...")
+        return  // ← DROPS FRAME ENTIRELY - never sent to callback!
+    }
+    backCameraCallback?.onFrameAvailable(frame)  // Only reached if queue < 80%
+    backCameraFrameQueue.offer(frame)  // Queue never consumed!
     ```
-    RTSP/
-    ├── Server.cs
-    ├── Protocol/
-    │   ├── IRtspProtocolHandler.cs, RtspProtocolHandler.cs
-    │   └── ISdpGenerator.cs, SdpGenerator.cs
-    ├── Transport/
-    │   ├── ITransportManager.cs, TransportManager.cs
-    │   ├── IRtpPacketBuilder.cs, RtpPacketBuilder.cs
-    │   └── IRtcpManager.cs, RtcpManager.cs
-    ├── Streaming/
-    │   ├── IH264EncoderManager.cs, H264EncoderManager.cs
-    │   ├── IStreamingController.cs, StreamingController.cs
-    │   └── FramePacer.cs
-    ├── Security/
-    │   └── IAuthenticationManager.cs, AuthenticationManager.cs
-    └── ClientManagement/
-        └── IClientManager.cs, ClientManager.cs
+    The frame dropping check was placed BEFORE sending to callbacks. When the unused queue filled up, it blocked the primary frame delivery path.
+
+  - **Solution**: Restructured frame delivery to prioritize callbacks:
+    ```kotlin
+    // AFTER (Fixed)
+    // Send to callback FIRST - this is the primary consumer (MJPEG streaming)
+    backCameraCallback?.onFrameAvailable(frame)
+
+    // Queue is optional secondary storage - only add if there's room
+    if (!backCameraFrameQueue.offer(frame)) {
+        // Queue full - drop oldest, but callback already received the frame
+        val droppedFrame = backCameraFrameQueue.poll()
+        droppedFrame?.let { backBufferPool.release(it.data) }
+        backCameraFrameQueue.offer(frame)
+    }
     ```
+
+  - **Files Changed**:
+    - `AndroidLib/camerastreamer/src/main/java/CameraFrameServicev2.kt`: Fixed frame delivery for both front and back cameras
+    - Native library version bumped to v2.0.1
+
+  - **How to Update**:
+    1. Rebuild the AndroidLib: `./gradlew :camerastreamer:assembleRelease`
+    2. Copy `camerastreamer-release.aar` to `BaluMediaServer/Jar/`
+    3. Rebuild your application
+
+  - **Impact**: This was the actual root cause of stream stopping issues. The fix ensures frames are always delivered to .NET regardless of internal queue state. Streams now run continuously without any frame drops or interruptions. The internal queue remains available for future use cases but no longer blocks primary frame delivery.
+
+- v1.5.11: Continuous Streaming Mode - Eliminated Stream Interruptions. This release disables all automatic stop mechanisms to ensure fluid, uninterrupted streaming without cuts or frame drops.
+
+  - **Problem**: The WatchDog and auto-stop mechanisms were causing stream interruptions:
+    - Cameras stopped when last client disconnected
+    - Encoders stopped and restarted frequently
+    - Camera restart commands triggered by MJPEG watchdog
+    - Stream cuts and frame drops during client transitions
+    - Reconnection delays due to encoder restarts
+
+  - **Solution**: Disabled all automatic stop mechanisms for continuous operation:
+
+  - **Disabled WatchDog Auto-Stop**:
+    - WatchDog now only cleans up dead/disconnected clients (preserves important cleanup)
+    - Cameras keep running regardless of client count
+    - Encoders keep running regardless of client count
+    - Streaming state persists once started
+    - No more automatic encoder/camera stops
+
+  - **Disabled EventBus Camera Stop Commands**:
+    - `STOP_CAMERA_FRONT` and `STOP_CAMERA_BACK` commands logged but ignored
+    - Prevents external code from interrupting streams
+    - Cameras stay active for instant client connections
+
+  - **Disabled MJPEG Watchdog Restarts**:
+    - Watchdog logs frame delays but doesn't restart cameras
+    - No more camera restarts after temporary delays
+    - Eliminates stream cuts from camera restarts
 
   - **Benefits**:
-    - **Single Responsibility**: Each module handles one specific concern
-    - **Testability**: Interfaces enable dependency injection and unit testing
-    - **Maintainability**: Smaller files (~150-350 lines) are easier to navigate
-    - **Error Tracking**: Stack traces now point to specific modules
-    - **Extensibility**: Modules can be extended or replaced independently
+    - ✅ **Zero Interruptions**: Streams never cut when clients disconnect/reconnect
+    - ✅ **Instant Reconnection**: No encoder restart delay (was ~1-2 seconds)
+    - ✅ **Fluid Experience**: No frame drops during client transitions
+    - ✅ **Production Ready**: Reliable, predictable behavior
+    - ✅ **Better Multi-Client**: New clients can connect instantly without affecting others
 
-  - **Added 4K UHD and QHD Resolution Support**:
+  - **Trade-offs**:
+    - ⚠️ **Continuous Resource Usage**: Cameras and encoders run even with no clients
+    - ⚠️ **Battery Drain**: Continuous operation uses more power on mobile devices
+    - ⚠️ **Manual Control**: Must explicitly call `Stop()` or `Dispose()` to stop streaming
 
-  - New resolution presets: QHD/2K (2560x1440) and 4K UHD (3840x2160)
-  - Encoder now supports fallback resolutions including 4K, QHD+, QHD, and FHD+
-  - EncoderInfo now tracks `Supports4K`, `SupportsQHD`, `SupportsFullHD`, and `SupportsHD` capabilities
+  - **How to Stop**:
+    - Call `server.Stop()` to stop everything
+    - Call `server.Dispose()` to release all resources
+    - Application exit automatically stops everything
 
-  - **Fixed High Resolution OOM Crashes**:
+  - **Monitoring**:
+    - WatchDog now logs status: `Active clients: RTSP=0, MJPEG=2, Cameras: Back=True, Front=False, Streaming=True`
+    - Helps monitor server state without auto-stop interference
 
-  - Problem: Streaming at resolutions higher than HD 720p (e.g., FullHD, 1920x1440, 4K) caused `OutOfMemoryError` crashes due to excessive frame buffer memory usage.
+  - **Configuration**:
+    - Currently hardcoded for maximum reliability
+    - See `CONTINUOUS_STREAMING_MODE.md` for instructions to restore auto-stop if needed
+    - Future: Configuration flag for hybrid mode (auto-stop on battery, continuous on power)
 
-  - Root Causes Identified:
-    - Fixed 25-frame camera buffer caused ~78MB memory usage at FullHD
-    - No encoder resolution validation before MediaCodec configuration
-    - No graceful fallback when encoder didn't support requested resolution
+  - **Files Changed**:
+    - `RTSP/Server.cs`: Disabled WatchDog auto-stop and EventBus camera stop commands
+    - `Services/MjpegServer.cs`: Disabled watchdog camera restarts
+    - `CONTINUOUS_STREAMING_MODE.md`: Complete documentation
 
-  - Fix:
-    - **Dynamic Channel Capacity**: Camera services now calculate buffer capacity based on resolution. Target ~8MB max buffer with 2-10 frames depending on resolution (vs. fixed 25 frames before)
-    - **Encoder Resolution Validation**: `IsResolutionSupported()` method checks if encoder supports the requested resolution before configuration
-    - **Graceful Fallback**: `GetNearestSupportedResolution()` finds the nearest supported resolution if requested resolution isn't available
-    - **ActualWidth/ActualHeight Properties**: Encoder exposes actual resolution being used after any fallback
-    - **Server Dimension Updates**: Server tracks and updates stored dimensions when encoder falls back to different resolution
+  - **Performance Impact**:
+    - CPU: Minimal - encoders efficient, H.264 only encodes when frames available
+    - Memory: Minimal - bounded buffers with DropOldest prevent buildup
+    - Battery: Moderate increase on mobile (camera always on)
+    - Network: Zero impact when no clients (no data sent)
 
-  - **EncoderInfo Enhancements**:
-
-  - Added `MaxSupportedWidth` and `MaxSupportedHeight` properties
-  - Added `Supports4K`, `SupportsQHD`, `SupportsFullHD`, `SupportsHD` boolean flags
-  - These are populated during encoder evaluation for capability reporting
-
-  - **Camera Library Improvements** (Kotlin AAR):
-
-  - Dynamic ImageReader buffer sizing based on resolution
-  - Memory pressure detection to prevent OOM in camera capture layer
-  - Optimized buffer pool management for high-resolution frames
-
-  - **Impact**: The codebase is now more maintainable and testable. Users can safely request high resolutions (including 4K) without crashes. The library will automatically fall back to the nearest supported resolution if the device's encoder doesn't support the requested resolution.
-
-- v1.5.9: Connection Stability and Timeout Improvements. This release addresses premature disconnections by improving timeout handling, activity tracking, and error logging across all transport modes.
-
-  - **Fixed Premature Client Disconnections**:
-
-  - Problem: The 10-second inactivity timeout was too aggressive and would disconnect stable clients during network congestion or when TCP sends were timing out. Combined with a 5-second TCP send timeout, clients could be disconnected after just 2 consecutive send delays (10 seconds total).
-
-  - Fix:
-    - **Increased Inactivity Timeout**: From 10 seconds to 60 seconds
-    - **Improved Activity Tracking**: `LastActivityTime` is now updated at the start of each streaming loop iteration, not just on successful sends. This prevents false inactivity timeouts as long as the streaming loop is actively running.
-    - **Reduced TCP Send Timeout**: From 5 seconds to 3 seconds for faster stuck connection detection
-    - With the new settings, clients can experience up to 20 consecutive TCP send timeouts (~60 seconds) before being disconnected, providing much better tolerance for temporary network issues.
-
-  - **Enhanced RTCP Timeout Handling (UDP Mode)**:
-
-  - Problem: The 60-second RTCP timeout was too aggressive for UDP clients that don't send RTCP packets regularly, causing premature disconnection of valid clients.
-
-  - Fix:
-    - **Increased RTCP Timeout**: From 60 seconds to 120 seconds
-    - Added detailed logging for RTCP events (BYE packets, Receiver Reports, timeouts)
-    - Better distinction between server shutdown and client timeout in error handling
-
-  - **Improved Socket Health Detection**:
-
-  - Problem: Socket.Poll() was using a 1ms timeout which could be too aggressive for slower but stable connections.
-
-  - Fix:
-    - **Increased Socket Poll Timeout**: From 1ms to 10ms
-    - More forgiving detection of socket disconnection while still catching dead connections quickly
-
-  - **Comprehensive Logging Enhancements**:
-
-  - Added detailed logging throughout the connection lifecycle:
-    - All disconnection events now log the specific reason (socket disconnected, inactivity timeout, consecutive errors)
-    - Transport mode (TCP/UDP) included in disconnection logs
-    - TCP/UDP send errors now log client IDs and consecutive error counts
-    - Socket error codes logged for better debugging
-    - Dead client detection logs explain why each client is marked as dead
-    - WatchDog cleanup operations are now logged with counts
-
-  - **Summary of New Timeout Values**:
-
-    | Setting | Old Value | New Value | Purpose |
-    |---------|-----------|-----------|---------|
-    | Inactivity Timeout | 10s | 60s | Time before disconnecting idle clients |
-    | TCP Send Timeout | 5s | 3s | Timeout for individual TCP send operations |
-    | RTCP Timeout (UDP) | 60s | 120s | Timeout waiting for RTCP packets from UDP clients |
-    | Socket Poll Timeout | 1ms | 10ms | Timeout for socket connectivity checks |
-
-  - **Impact**: RTSP connections are now significantly more stable, especially over congested networks or with clients that have slower connections. The enhanced logging makes it much easier to diagnose any connection issues that do occur. Device connections remain stable even during temporary network hiccups or when send operations experience delays.
+  - **Impact**: Streams are now completely fluid with zero interruptions. Perfect for scenarios where reliability is critical (security cameras, monitoring systems, live broadcasts). The server maintains ready state for instant client connections. Trade-off of continuous resource usage is acceptable for server/desktop deployments and provides significantly better user experience.
 
 - v1.5.10: Major Performance Improvements - Event-Driven Architecture and Shared Encoding. This release addresses critical performance bottlenecks identified in performance analysis, delivering significantly improved frame rates, reduced CPU usage, and lower latency.
 
@@ -1849,357 +1863,541 @@ Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, the
 
   - **Impact**: This release delivers the most significant performance improvements in the project's history. RTSP-MJPEG is now viable for production use with multiple concurrent clients. H.264 streaming has reduced latency and CPU overhead. The codebase uses modern .NET async patterns throughout for better efficiency and maintainability. See `PERFORMANCE_IMPROVEMENTS.md` for detailed technical analysis.
 
-- v1.5.11: Continuous Streaming Mode - Eliminated Stream Interruptions. This release disables all automatic stop mechanisms to ensure fluid, uninterrupted streaming without cuts or frame drops.
+- v1.5.9: Connection Stability and Timeout Improvements. This release addresses premature disconnections by improving timeout handling, activity tracking, and error logging across all transport modes.
 
-  - **Problem**: The WatchDog and auto-stop mechanisms were causing stream interruptions:
-    - Cameras stopped when last client disconnected
-    - Encoders stopped and restarted frequently
-    - Camera restart commands triggered by MJPEG watchdog
-    - Stream cuts and frame drops during client transitions
-    - Reconnection delays due to encoder restarts
+  - **Fixed Premature Client Disconnections**:
 
-  - **Solution**: Disabled all automatic stop mechanisms for continuous operation:
+  - Problem: The 10-second inactivity timeout was too aggressive and would disconnect stable clients during network congestion or when TCP sends were timing out. Combined with a 5-second TCP send timeout, clients could be disconnected after just 2 consecutive send delays (10 seconds total).
 
-  - **Disabled WatchDog Auto-Stop**:
-    - WatchDog now only cleans up dead/disconnected clients (preserves important cleanup)
-    - Cameras keep running regardless of client count
-    - Encoders keep running regardless of client count
-    - Streaming state persists once started
-    - No more automatic encoder/camera stops
+  - Fix:
+    - **Increased Inactivity Timeout**: From 10 seconds to 60 seconds
+    - **Improved Activity Tracking**: `LastActivityTime` is now updated at the start of each streaming loop iteration, not just on successful sends. This prevents false inactivity timeouts as long as the streaming loop is actively running.
+    - **Reduced TCP Send Timeout**: From 5 seconds to 3 seconds for faster stuck connection detection
+    - With the new settings, clients can experience up to 20 consecutive TCP send timeouts (~60 seconds) before being disconnected, providing much better tolerance for temporary network issues.
 
-  - **Disabled EventBus Camera Stop Commands**:
-    - `STOP_CAMERA_FRONT` and `STOP_CAMERA_BACK` commands logged but ignored
-    - Prevents external code from interrupting streams
-    - Cameras stay active for instant client connections
+  - **Enhanced RTCP Timeout Handling (UDP Mode)**:
 
-  - **Disabled MJPEG Watchdog Restarts**:
-    - Watchdog logs frame delays but doesn't restart cameras
-    - No more camera restarts after temporary delays
-    - Eliminates stream cuts from camera restarts
+  - Problem: The 60-second RTCP timeout was too aggressive for UDP clients that don't send RTCP packets regularly, causing premature disconnection of valid clients.
+
+  - Fix:
+    - **Increased RTCP Timeout**: From 60 seconds to 120 seconds
+    - Added detailed logging for RTCP events (BYE packets, Receiver Reports, timeouts)
+    - Better distinction between server shutdown and client timeout in error handling
+
+  - **Improved Socket Health Detection**:
+
+  - Problem: Socket.Poll() was using a 1ms timeout which could be too aggressive for slower but stable connections.
+
+  - Fix:
+    - **Increased Socket Poll Timeout**: From 1ms to 10ms
+    - More forgiving detection of socket disconnection while still catching dead connections quickly
+
+  - **Comprehensive Logging Enhancements**:
+
+  - Added detailed logging throughout the connection lifecycle:
+    - All disconnection events now log the specific reason (socket disconnected, inactivity timeout, consecutive errors)
+    - Transport mode (TCP/UDP) included in disconnection logs
+    - TCP/UDP send errors now log client IDs and consecutive error counts
+    - Socket error codes logged for better debugging
+    - Dead client detection logs explain why each client is marked as dead
+    - WatchDog cleanup operations are now logged with counts
+
+  - **Summary of New Timeout Values**:
+
+    | Setting | Old Value | New Value | Purpose |
+    |---------|-----------|-----------|---------|
+    | Inactivity Timeout | 10s | 60s | Time before disconnecting idle clients |
+    | TCP Send Timeout | 5s | 3s | Timeout for individual TCP send operations |
+    | RTCP Timeout (UDP) | 60s | 120s | Timeout waiting for RTCP packets from UDP clients |
+    | Socket Poll Timeout | 1ms | 10ms | Timeout for socket connectivity checks |
+
+  - **Impact**: RTSP connections are now significantly more stable, especially over congested networks or with clients that have slower connections. The enhanced logging makes it much easier to diagnose any connection issues that do occur. Device connections remain stable even during temporary network hiccups or when send operations experience delays.
+
+- v1.5.8: Modular Architecture Refactoring and High Resolution Support. This release refactors the monolithic Server.cs into focused, testable modules and adds support for resolutions up to 4K UHD.
+
+  - **Major RTSP Server Modular Refactoring**:
+
+  - Problem: The original `Server.cs` was 2,621 lines with 68 methods handling too many responsibilities (networking, protocol parsing, authentication, encoding, streaming, transport, etc.), making it difficult to maintain, test, and debug.
+
+  - Fix: Refactored into 9 focused modules with clear interfaces:
+
+    | Module | Responsibility | Lines |
+    |--------|---------------|-------|
+    | `RtspProtocolHandler` | RTSP request parsing and response generation | ~326 |
+    | `SdpGenerator` | SDP generation for H.264 and MJPEG | ~173 |
+    | `AuthenticationManager` | Digest/Basic authentication, nonce management | ~275 |
+    | `TransportManager` | UDP/TCP transport, port allocation | ~254 |
+    | `RtpPacketBuilder` | RTP packet creation, NAL fragmentation | ~292 |
+    | `RtcpManager` | RTCP sender reports, receiver feedback | ~242 |
+    | `H264EncoderManager` | H.264 encoder lifecycle, frame queues | ~435 |
+    | `StreamingController` | Main streaming orchestration | ~340 |
+    | `ClientManager` | Client lifecycle, cleanup, caching | ~153 |
+    | `Server` (reduced) | Composition root, wiring | ~700 |
+
+  - **New Directory Structure**:
+    ```
+    RTSP/
+    ├── Server.cs
+    ├── Protocol/
+    │   ├── IRtspProtocolHandler.cs, RtspProtocolHandler.cs
+    │   └── ISdpGenerator.cs, SdpGenerator.cs
+    ├── Transport/
+    │   ├── ITransportManager.cs, TransportManager.cs
+    │   ├── IRtpPacketBuilder.cs, RtpPacketBuilder.cs
+    │   └── IRtcpManager.cs, RtcpManager.cs
+    ├── Streaming/
+    │   ├── IH264EncoderManager.cs, H264EncoderManager.cs
+    │   ├── IStreamingController.cs, StreamingController.cs
+    │   └── FramePacer.cs
+    ├── Security/
+    │   └── IAuthenticationManager.cs, AuthenticationManager.cs
+    └── ClientManagement/
+        └── IClientManager.cs, ClientManager.cs
+    ```
 
   - **Benefits**:
-    - ✅ **Zero Interruptions**: Streams never cut when clients disconnect/reconnect
-    - ✅ **Instant Reconnection**: No encoder restart delay (was ~1-2 seconds)
-    - ✅ **Fluid Experience**: No frame drops during client transitions
-    - ✅ **Production Ready**: Reliable, predictable behavior
-    - ✅ **Better Multi-Client**: New clients can connect instantly without affecting others
+    - **Single Responsibility**: Each module handles one specific concern
+    - **Testability**: Interfaces enable dependency injection and unit testing
+    - **Maintainability**: Smaller files (~150-350 lines) are easier to navigate
+    - **Error Tracking**: Stack traces now point to specific modules
+    - **Extensibility**: Modules can be extended or replaced independently
 
-  - **Trade-offs**:
-    - ⚠️ **Continuous Resource Usage**: Cameras and encoders run even with no clients
-    - ⚠️ **Battery Drain**: Continuous operation uses more power on mobile devices
-    - ⚠️ **Manual Control**: Must explicitly call `Stop()` or `Dispose()` to stop streaming
+  - **Added 4K UHD and QHD Resolution Support**:
 
-  - **How to Stop**:
-    - Call `server.Stop()` to stop everything
-    - Call `server.Dispose()` to release all resources
-    - Application exit automatically stops everything
+  - New resolution presets: QHD/2K (2560x1440) and 4K UHD (3840x2160)
+  - Encoder now supports fallback resolutions including 4K, QHD+, QHD, and FHD+
+  - EncoderInfo now tracks `Supports4K`, `SupportsQHD`, `SupportsFullHD`, and `SupportsHD` capabilities
 
-  - **Monitoring**:
-    - WatchDog now logs status: `Active clients: RTSP=0, MJPEG=2, Cameras: Back=True, Front=False, Streaming=True`
-    - Helps monitor server state without auto-stop interference
+  - **Fixed High Resolution OOM Crashes**:
 
-  - **Configuration**:
-    - Currently hardcoded for maximum reliability
-    - See `CONTINUOUS_STREAMING_MODE.md` for instructions to restore auto-stop if needed
-    - Future: Configuration flag for hybrid mode (auto-stop on battery, continuous on power)
+  - Problem: Streaming at resolutions higher than HD 720p (e.g., FullHD, 1920x1440, 4K) caused `OutOfMemoryError` crashes due to excessive frame buffer memory usage.
 
-  - **Files Changed**:
-    - `RTSP/Server.cs`: Disabled WatchDog auto-stop and EventBus camera stop commands
-    - `Services/MjpegServer.cs`: Disabled watchdog camera restarts
-    - `CONTINUOUS_STREAMING_MODE.md`: Complete documentation
+  - Root Causes Identified:
+    - Fixed 25-frame camera buffer caused ~78MB memory usage at FullHD
+    - No encoder resolution validation before MediaCodec configuration
+    - No graceful fallback when encoder didn't support requested resolution
 
-  - **Performance Impact**:
-    - CPU: Minimal - encoders efficient, H.264 only encodes when frames available
-    - Memory: Minimal - bounded buffers with DropOldest prevent buildup
-    - Battery: Moderate increase on mobile (camera always on)
-    - Network: Zero impact when no clients (no data sent)
+  - Fix:
+    - **Dynamic Channel Capacity**: Camera services now calculate buffer capacity based on resolution. Target ~8MB max buffer with 2-10 frames depending on resolution (vs. fixed 25 frames before)
+    - **Encoder Resolution Validation**: `IsResolutionSupported()` method checks if encoder supports the requested resolution before configuration
+    - **Graceful Fallback**: `GetNearestSupportedResolution()` finds the nearest supported resolution if requested resolution isn't available
+    - **ActualWidth/ActualHeight Properties**: Encoder exposes actual resolution being used after any fallback
+    - **Server Dimension Updates**: Server tracks and updates stored dimensions when encoder falls back to different resolution
 
-  - **Impact**: Streams are now completely fluid with zero interruptions. Perfect for scenarios where reliability is critical (security cameras, monitoring systems, live broadcasts). The server maintains ready state for instant client connections. Trade-off of continuous resource usage is acceptable for server/desktop deployments and provides significantly better user experience.
+  - **EncoderInfo Enhancements**:
 
-- v1.5.12: Native Library Frame Delivery Fix - Resolved Stream Stopping Issue. This release fixes a critical bug in the native Android camera library that caused streams to stop completely after running for a short time.
+  - Added `MaxSupportedWidth` and `MaxSupportedHeight` properties
+  - Added `Supports4K`, `SupportsQHD`, `SupportsFullHD`, `SupportsHD` boolean flags
+  - These are populated during encoder evaluation for capability reporting
 
-  - **Problem**: MJPEG streams would stop receiving frames after the native library's internal queue filled up:
-    - Logs showed: `Back camera queue backing up (81/100), dropping frame`
-    - After queue reached 80% capacity, ALL frames were dropped
-    - The queue was never consumed by any code (dead/unused feature)
-    - Once full, the queue stayed full forever, permanently blocking frame delivery
-    - Result: Stream worked initially, then stopped completely with no recovery
+  - **Camera Library Improvements** (Kotlin AAR):
 
-  - **Root Cause Analysis**:
-    ```kotlin
-    // BEFORE (Broken) - in CameraFrameServicev2.kt
-    if (queueSize > queueCapacity * 0.8) {  // 80 frames
-        Log.w(TAG, "Back camera queue backing up...")
-        return  // ← DROPS FRAME ENTIRELY - never sent to callback!
-    }
-    backCameraCallback?.onFrameAvailable(frame)  // Only reached if queue < 80%
-    backCameraFrameQueue.offer(frame)  // Queue never consumed!
+  - Dynamic ImageReader buffer sizing based on resolution
+  - Memory pressure detection to prevent OOM in camera capture layer
+  - Optimized buffer pool management for high-resolution frames
+
+  - **Impact**: The codebase is now more maintainable and testable. Users can safely request high resolutions (including 4K) without crashes. The library will automatically fall back to the nearest supported resolution if the device's encoder doesn't support the requested resolution.
+
+- v1.5.7: Configurable Video Resolution. This release adds full support for configuring camera resolution, allowing users to select from predefined presets or specify custom resolutions.
+
+  - **New VideoResolution Enum**:
+
+  - Added `VideoResolution` enum with common presets: QVGA (320x240), Low (480x360), VGA (640x480), SVGA (800x600), HD (1280x720), Full HD (1920x1080)
+  - Each preset includes recommended bitrate settings for H.264 encoding
+  - Extension methods provide helper functions: `GetWidth()`, `GetHeight()`, `GetRecommendedMinBitrate()`, `GetRecommendedMaxBitrate()`, `GetFrameBufferSize()`, `GetDisplayName()`
+
+  - **ServerConfiguration Resolution Support**:
+
+  - Added `BackCameraResolution` and `FrontCameraResolution` properties for preset selection
+  - Added `BackCameraWidth`, `BackCameraHeight`, `FrontCameraWidth`, `FrontCameraHeight` for custom resolutions
+  - Helper methods `GetBackCameraWidth()`, `GetBackCameraHeight()`, etc. resolve effective resolution
+
+  - **Server Class Enhancements**:
+
+  - Constructor now accepts `BackCameraResolution` and `FrontCameraResolution` parameters
+  - New methods: `SetBackCameraResolution()`, `SetFrontCameraResolution()`, `GetBackCameraResolution()`, `GetFrontCameraResolution()`
+  - Camera capture and H.264 encoder now use configured resolution
+
+  - **VideoProfile Updates**:
+
+  - Added `Resolution` property for preset-based configuration
+  - Setting `Resolution` automatically updates `Width`, `Height`, `MinBitrate`, and `MaxBitrate`
+  - Helper methods: `GetFrameBufferSize()`, `GetDimensions()`
+
+  - **H.264 Encoder Considerations**:
+
+  - Resolution directly affects encoder buffer size: `(width * height * 3) / 2` for YUV420
+  - Higher resolutions require more processing power and bandwidth
+  - Bitrate recommendations scale with resolution for optimal quality
+
+  - **Impact**: Users can now easily configure video resolution to balance quality, bandwidth, and device performance. Default resolution remains VGA (640x480) for backward compatibility.
+
+- v1.5.6: Camera Resource Management Fix. This release fixes a critical bug where cameras would continue running after all clients disconnected, wasting device resources.
+
+  - **Fixed Camera Not Stopping When Clients Disconnect**:
+
+  - Problem: When RTSP streaming started, the code set `_isCapturingBack = true` (or `_isCapturingFront`), but these flags were never reset when clients disconnected. The WatchDog checked `if (!_isCapturingBack)` before stopping cameras, so it would skip stopping them because the flag was still `true`.
+
+  - Fix:
+    - Removed the broken condition that prevented cameras from stopping
+    - Now properly resets `_isCapturingBack` and `_isCapturingFront` to `false` when stopping cameras
+    - Cameras now correctly stop when all RTSP clients disconnect
+
+  - **Improved MJPEG Client Detection**:
+
+  - Problem: The WatchDog only checked if MJPEG server was enabled (`_mjpegServerEnabled`), not if it actually had connected clients. This meant cameras would keep running even when MJPEG server had no clients.
+
+  - Fix: Now checks `_mjpegServer?.ClientCount` to determine if MJPEG has active clients before deciding to keep cameras running.
+
+  - **Added Catch-All Resource Cleanup**:
+
+  - Fix: Added a second condition to catch the case where cameras are running (started by EventBuss or MJPEG) but all clients have disconnected:
+    - If no RTSP clients are playing AND no MJPEG clients are connected AND cameras are running, cameras will now stop
+    - Logs clearly indicate when cameras are stopped or kept running for clients
+
+  - **Impact**: This fix prevents unnecessary battery drain and CPU usage when no clients are connected to the stream.
+
+- v1.5.5: Critical Server Startup Fix (EnableServer Flag). This release fixes a critical bug where servers created using `ServerConfiguration` would never start.
+
+  - **Fixed Missing EnableServer Configuration Property**:
+
+  - Problem: When using the `Server(ServerConfiguration config)` constructor, the internal `_enabled` flag was always set to `false`. This caused `Server.Start()` to return immediately without actually starting the server, as the start logic checks `if (_enabled && !IsRunning)` before proceeding.
+
+  - Root Cause: The `ServerConfiguration` class was missing the `EnableServer` property. Since `bool` defaults to `false` in C#, any server created via the configuration constructor would have `_enabled = false`, silently preventing startup.
+
+  - Fix:
+    - Added `EnableServer` property to `ServerConfiguration` class with default value of `true`
+    - Server constructor now correctly reads this value: `_enabled = configuration.EnableServer`
+    - Added comprehensive XML documentation explaining the property's purpose
+
+  - **Impact**: This was a critical bug that caused servers initialized with `ServerConfiguration` to appear to start (no errors thrown) but never actually accept connections. The `Start()` method would return `false` silently. This fix ensures servers start correctly by default.
+
+  - **Migration Note**: Existing code using `ServerConfiguration` will now work correctly without any changes, as `EnableServer` defaults to `true`. If you need to disable a server, explicitly set `EnableServer = false`.
+
+- v1.5.4: Critical Bug Fixes for Server Startup and MJPEG Streaming. This release addresses multiple issues that could cause the server to fail silently or MJPEG streaming to not transmit video.
+
+  - **Fixed Wrong Event Unsubscription in Server.cs**:
+
+  - Problem: When stopping the back camera via `BussCommand.STOP_CAMERA_BACK`, the code was incorrectly unsubscribing from `OnFrontFrameAvailable` instead of `OnBackFrameAvailable`. This caused event handler leaks and potential memory issues.
+
+  - Fix: Corrected the event unsubscription to use `OnBackFrameAvailable` for the back camera service.
+
+  - **Fixed MJPEG Server Initialization Issues**:
+
+  - Problem: The `MjpegServer` was being created with default parameters at field initialization, causing:
+    - Memory leak from orphaned event subscriptions (the initial instance subscribed to static events but was replaced in the constructor)
+    - Lost configuration when MJPEG server was recreated (only `quality` parameter was passed, losing port, authentication, HTTPS settings, etc.)
+
+  - Fix:
+    - Added stored fields for all MJPEG server settings (`_mjpegServerPort`, `_mjpegUseHttps`, `_mjpegCertificatePath`, `_mjpegCertificatePassword`)
+    - Created `CreateMjpegServer()` helper method that uses all stored configuration
+    - Changed `_mjpegServer` to nullable with proper null checks throughout
+    - All MJPEG server recreation points now use the helper method with full configuration
+
+  - **Fixed Channel Initialization Race Condition in Camera Services**:
+
+  - Problem: In both `BackCameraService` and `FrontCameraService`, the camera capture was started BEFORE the frame channel was created. This caused:
+    - `NullReferenceException` if frames arrived immediately after starting capture
+    - Potential frame loss during the race window
+    - The `BoundedChannelFullMode.Wait` setting could block the native camera callback thread
+
+  - Fix:
+    - Reordered initialization to create the channel BEFORE starting camera capture
+    - Changed `BoundedChannelFullMode.Wait` to `DropOldest` to prevent blocking the camera callback thread (real-time video should drop old frames, not block)
+    - Added null checks in `OnFrameAvailable()`, `StopCapture()`, and `Dispose()` methods
+
+  - **Impact**: These fixes resolve issues where the server would appear to start successfully but:
+    - MJPEG streaming would not transmit any video
+    - Camera services could crash on first frame
+    - Event handlers could leak memory over time
+
+- v1.5.3: Unit Testing Infrastructure. Added comprehensive unit test suite using xUnit and FluentAssertions.
+
+  - **Test Project**: `BaluMediaServer.Tests` targeting `net9.0` with file linking approach for cross-targeting compatibility
+
+  - **Test Coverage (134 tests)**:
+    - `VideoProfileTests` (22 tests): Quality clamping, name sanitization, default values
+    - `ServerConfigurationTests` (27 tests): All property defaults, HTTPS config, camera settings
+    - `EventBussTests` (7 tests): Command propagation, multiple subscribers, unsubscribe handling
+    - `RtspRequestTests` (21 tests): CSeq parsing, header handling, property initialization
+    - `EnumTests` (57 tests): AuthType, CodecType, BussCommand value validation and parsing
+
+  - **Tools**: xUnit, FluentAssertions, Coverlet for code coverage
+
+  - **Run Tests**:
+    ```bash
+    cd BaluMediaServer.Tests
+    dotnet test
+    dotnet test --collect:"XPlat Code Coverage"
     ```
-    The frame dropping check was placed BEFORE sending to callbacks. When the unused queue filled up, it blocked the primary frame delivery path.
-
-  - **Solution**: Restructured frame delivery to prioritize callbacks:
-    ```kotlin
-    // AFTER (Fixed)
-    // Send to callback FIRST - this is the primary consumer (MJPEG streaming)
-    backCameraCallback?.onFrameAvailable(frame)
-
-    // Queue is optional secondary storage - only add if there's room
-    if (!backCameraFrameQueue.offer(frame)) {
-        // Queue full - drop oldest, but callback already received the frame
-        val droppedFrame = backCameraFrameQueue.poll()
-        droppedFrame?.let { backBufferPool.release(it.data) }
-        backCameraFrameQueue.offer(frame)
-    }
-    ```
-
-  - **Files Changed**:
-    - `AndroidLib/camerastreamer/src/main/java/CameraFrameServicev2.kt`: Fixed frame delivery for both front and back cameras
-    - Native library version bumped to v2.0.1
-
-  - **How to Update**:
-    1. Rebuild the AndroidLib: `./gradlew :camerastreamer:assembleRelease`
-    2. Copy `camerastreamer-release.aar` to `BaluMediaServer/Jar/`
-    3. Rebuild your application
-
-  - **Impact**: This was the actual root cause of stream stopping issues. The fix ensures frames are always delivered to .NET regardless of internal queue state. Streams now run continuously without any frame drops or interruptions. The internal queue remains available for future use cases but no longer blocks primary frame delivery.
-
-- v1.5.13: MJPEG Streaming Smoothness Improvements. This release significantly improves MJPEG streaming smoothness with architectural improvements inspired by MauiJpegServer.
-
-  - **Problem**: MJPEG streaming could feel choppy or have inconsistent frame delivery:
-    - Encoder pushed frames to all clients synchronously
-    - No per-client frame rate limiting
-    - Clients could starve each other on slow networks
-    - No real-time FPS tracking for diagnostics
-
-  - **Solution**: New per-client streaming architecture:
-
-  - **SemaphoreSlim-Based Frame Signaling**:
-    - Each client has its own streaming task that waits on a semaphore
-    - When encoder produces a frame, it signals all waiting clients simultaneously
-    - More efficient than polling-based approaches
-    - Clients wake up exactly when frames are available
-
-  - **Per-Client Frame Rate Limiting**:
-    - Each client respects a configurable max frame rate (default 30 FPS)
-    - Prevents frame bursting that can cause network congestion
-    - Smoother, more consistent frame delivery
-    - New constructor parameter: `maxFrameRate`
-
-  - **Real-Time FPS Tracking**:
-    - Accurate FPS calculation using `Stopwatch`
-    - Watchdog logs FPS: `FPS: Back=29.8, Front=30.1`
-    - New properties: `BackCameraFps`, `FrontCameraFps`
-    - Total frame counters: `TotalBackFrames`, `TotalFrontFrames`
-
-  - **Per-Client Streaming Tasks**:
-    - Each client runs its own async streaming loop
-    - Clients are independent - slow client doesn't affect others
-    - Individual timeout and cleanup per client
-    - Better client lifecycle management with `ClientInfo` class
-
-  - **Latest Frame Access**:
-    - New methods: `GetLatestBackFrame()`, `GetLatestFrontFrame()`
-    - Useful for snapshot endpoints
-    - Instant frame access without waiting
-
-  - **API Changes**:
-    ```csharp
-    // New constructor parameter
-    var server = new MjpegServer(
-        port: 8089,
-        quality: 75,
-        maxFrameRate: 30  // NEW: Limit FPS per client
-    );
-
-    // New properties
-    double backFps = server.BackCameraFps;
-    double frontFps = server.FrontCameraFps;
-    long totalFrames = server.TotalBackFrames;
-
-    // New methods for snapshots
-    byte[]? latestFrame = server.GetLatestBackFrame();
-    ```
-
-  - **Files Changed**:
-    - `Services/MjpegServer.cs`: Complete rewrite of client streaming architecture
-
-  - **Performance Impact**:
-    - Smoother frame delivery with consistent intervals
-    - Reduced jitter on variable network conditions
-    - Better multi-client performance (clients don't block each other)
-    - Lower latency for responsive clients
-
-  - **Impact**: MJPEG streaming is now significantly smoother with consistent frame pacing. The new architecture ensures each client receives frames at a controlled rate, preventing the choppy playback that could occur with the previous push-based approach. Inspired by the clean architecture of MauiJpegServer while retaining BaluMediaServer's advanced features (authentication, HTTPS, etc.).
-
-- v1.5.14: Client Reconnection Bug Fix. This release fixes a critical race condition that caused streams to crash when clients disconnected and reconnected.
-
-  - **Problem**: After a client disconnected and reconnected (or a new client connected), the stream would completely stop:
-    - Cameras appeared to crash (flashlight could be enabled, indicating camera release)
-    - New clients would block forever waiting for frames
-    - The issue occurred due to a semaphore race condition in the frame signaling mechanism
 
-  - **Root Cause Analysis**:
-    - The semaphore release logic only released N times where N = current client count
-    - When client disconnected, count dropped to 0, so encoder released 0 times
-    - New clients connecting between frames would call `WaitAsync()` but never receive a signal
-    - This created a deadlock where new clients could never receive frames
-    - Additionally, `_streamStarted` flag was never reset, preventing on-demand camera restart
+- v1.5.2: Comprehensive Code Documentation. Added XML documentation comments to all public classes, methods, properties, and events.
 
-  - **Solution**: Two-part fix for robust client handling:
+  - **Models**: `FrameEventArgs`, `H264FrameEventArgs`, `Client`, `VideoProfile`, `ServerConfiguration`, `RtspRequest`, `RtspAuth`, `EncoderInfo`, `AuthType`, `CodecType`, `BussCommand`, `TransportMode`
 
-  - **Semaphore Always Releases At Least Once**:
-    ```csharp
-    // Before (buggy):
-    var clientCount = _clientsBack.Count;  // Could be 0!
+  - **Services**: `Server`, `MjpegServer`, `FrontCameraService`, `BackCameraService`
 
-    // After (fixed):
-    var clientCount = System.Math.Max(1, _clientsBack.Count);  // Always >= 1
-    ```
-    - Ensures new clients connecting between frames can acquire the semaphore
-    - Prevents deadlock when client count temporarily drops to zero
-    - `SemaphoreFullException` still prevents overflow
+  - **Encoders**: `H264Encoder` (general-purpose), `MediaTekH264Encoder` (MediaTek-optimized)
 
-  - **Reset Stream State on Last Client Disconnect**:
-    ```csharp
-    // In HandleClient finally block:
-    if (_clientsBack.Count == 0 && _clientsFront.Count == 0)
-    {
-        lock (_streamLock)
-        {
-            if (_clientsBack.Count == 0 && _clientsFront.Count == 0)
-            {
-                _streamStarted = false;  // Allow on-demand restart
-            }
-        }
-    }
-    ```
-    - Double-checked locking pattern for thread safety
-    - Allows cameras to restart on-demand when new clients connect
-    - Logs state change for debugging
+  - **Utilities**: `EventBuss`, `FrameConverterHelper`, `FrameCallback`, `ICameraService`
 
-  - **Files Changed**:
-    - `Services/MjpegServer.cs`:
-      - Lines 371, 419: Changed `Math.Max(1, count)` for semaphore release
-      - Lines 657-668: Added `_streamStarted` reset in client cleanup
+  - Benefits:
+    - Full IntelliSense support in Visual Studio and VS Code
+    - Auto-generated API documentation capability
+    - Improved code maintainability and developer experience
 
-  - **Testing**:
-    - Connect MJPEG client, verify streaming works
-    - Disconnect client, wait a few seconds
-    - Reconnect (same or different device) - stream should resume immediately
-    - Verify no "flashlight available" state (cameras stay ready or restart on-demand)
+- v1.5.1: MJPEG Server External Access and Improvements. This release enables external device access to the MJPEG stream, making it usable from any device on the network via a simple `<img>` tag.
 
-  - **Impact**: Client reconnection now works reliably. The race condition that caused streams to appear "crashed" after disconnect/reconnect cycles is eliminated. This was a critical fix for production deployments where clients may frequently connect and disconnect.
+  - Enabled External Network Access:
 
-- v1.5.15: H.264 Thread Safety Fix and Connection Stability. This release fixes a critical threading bug that caused H.264 streams to freeze after ~2 frames, along with several connection reliability improvements.
+  - Problem: MJPEG server was hardcoded to bind to `127.0.0.1` (localhost only), making it impossible for external devices to access the stream.
 
-  - **H.264 Streaming Freeze Fix (Thread Safety)**:
+  - Fix: Changed default binding to `0.0.0.0` (all interfaces). Added configurable `bindAddress` parameter and wildcard prefix support for broader compatibility.
 
-  - Problem: `FeedFrame()` was calling `FeedInputBuffer()` directly on the camera callback thread while `DrainOutputBuffer()` ran on the encoder thread. These concurrent JNI calls to MediaCodec caused the encoder to stall after ~2 frames.
+  - Added Optional Basic Authentication:
 
-  - Fix: `FeedFrame()` now routes frames through `_frameChannel` so that both `FeedInputBuffer()` and `DrainOutputBuffer()` are serialized on the encoder thread. This eliminates concurrent JNI access to MediaCodec.
+  - Problem: When exposed to the network, the MJPEG stream had no authentication, creating a security risk.
 
-  - **Encoder Channel Capacity**:
+  - Fix: Added optional Basic HTTP authentication. When `AuthRequired` is enabled, clients must provide valid credentials. Authentication uses the same user database as the RTSP server.
 
-  - Fix: Increased `_frameChannel` bounded capacity from 2 to 5 frames, providing better buffering headroom and reducing frame drops during brief processing spikes.
+  - Added CORS Headers for Web Integration:
 
-  - **TOCTOU Socket Race Fix**:
+  - Fix: MJPEG responses now include proper CORS headers (`Access-Control-Allow-Origin: *`) and cache control headers, enabling seamless integration with web pages on any domain.
 
-  - Problem: The streaming loop called `IsSocketConnected` (using `Socket.Poll`) on the same RTSP socket that `HandleClient` was reading from. This created a time-of-check-to-time-of-use race where the poll would consume data intended for the RTSP reader, causing false disconnection detection.
+  - Fixed Front Camera Client Handling:
 
-  - Fix: Removed `IsSocketConnected` from the streaming loop. Connection health is now determined solely by send error counting, which is inherently race-free.
+  - Problem: `WriteDataAsync` only checked `_clientsBack` dictionary for client ID lookup, causing Front camera clients to not receive frames properly.
 
-  - **SPS/PPS Deduplication**:
+  - Fix: Added `isBackCamera` parameter to correctly handle both Front and Back camera clients with proper dictionary lookups.
 
-  - Problem: SPS/PPS NAL units were being sent redundantly — both as separate parameter sets before keyframes and embedded within the keyframe data itself.
+  - Added Per-Client Timeout with Slow Client Protection:
 
-  - Fix: Added deduplication logic to skip SPS/PPS NAL units when they have already been sent separately before the keyframe, reducing bandwidth waste.
+  - Problem: One slow client could block frame delivery to all other clients due to `Task.WhenAll()` waiting for everyone.
 
-  - **Transport SendLock Timeout**:
+  - Fix: Added `WriteDataAsyncWithTimeout()` wrapper with 2-second timeout per client. Slow clients are automatically disconnected without affecting others.
 
-  - Problem: The `_sendLock` in `TransportManager` used a CancellationToken-linked timeout. During server lifecycle events (shutdown, restart), the CTS could be cancelled, causing sends to fail silently instead of timing out normally.
+  - Fixed Memory Leak in Client Tracking:
 
-  - Fix: Changed to a fixed 3-second timeout (`TimeSpan.FromSeconds(3)`) that is independent of the server CancellationTokenSource.
+  - Problem: `_clientLastFrameTime` dictionary was never cleaned up when clients disconnected, causing memory accumulation.
 
-  - **Standalone Send CTS**:
+  - Fix: Client IDs are now properly removed from `_clientLastFrameTime` in all cleanup paths (normal disconnect, timeout, error).
 
-  - Problem: The send CancellationTokenSource was coupled to the server CTS, meaning server shutdown would immediately cancel in-flight sends without allowing graceful client cleanup.
+  - Added Client Count Properties:
 
-  - Fix: Decoupled the send timeout CTS from the server CTS, allowing in-progress sends to complete or timeout naturally during shutdown.
+  - Fix: Added `ClientCount`, `BackClientCount`, and `FrontClientCount` properties for monitoring connected MJPEG clients.
 
-  - **Files Changed**:
-    - `RTSP/H264Encoder.cs`: Thread safety fix — `FeedFrame()` routes through channel; channel capacity increased to 5
-    - `RTSP/Streaming/H264EncoderManager.cs`: SPS/PPS deduplication logic
-    - `RTSP/Streaming/StreamingController.cs`: Removed `IsSocketConnected` TOCTOU race; standalone send CTS
-    - `RTSP/Transport/TransportManager.cs`: Fixed `_sendLock` timeout to 3 seconds
+  - Added MjpegServerPort Configuration:
 
-  - **Impact**: H.264 streaming is now stable and no longer freezes after the first few frames. The thread safety fix resolves the root cause of MediaCodec JNI contention. Connection detection is more reliable without the TOCTOU race, and transport timeouts behave correctly during server lifecycle events.
+  - Fix: MJPEG server port is now configurable via `ServerConfiguration.MjpegServerPort` (default: 8089) or constructor parameter.
 
-- v1.5.16: H.264 Stream Freeze Fix — MediaTek Encoder Quirks, RTP Timestamps, and Client Lifecycle. This release resolves the remaining causes of H.264 stream freezing on MediaTek devices through a combination of encoder configuration fixes, RTP timestamp correction, and client lifecycle hardening.
+  **Usage Example (External Access)**:
+  ```html
+  <!-- From any device on the network -->
+  <img src="http://192.168.1.100:8089/Back/" alt="Live Stream" />
 
-  - **Encoder Stall from All-IDR Output (PRIMARY ROOT CAUSE)**:
+  <!-- With authentication -->
+  <img src="http://admin:password123@192.168.1.100:8089/Back/" alt="Live Stream" />
+  ```
 
-  - Problem: `SetFloat(KeyIFrameInterval, 0.25f)` was misinterpreted by the MediaTek MT6768 as `0`, causing every single frame to become an IDR keyframe. After ~1000 frames, the encoder's internal buffers were exhausted and it stalled permanently — no more output, but input still accepted.
+- v1.5.0: Stability and Performance Improvements. This release focuses on connection reliability, faster disconnection detection, smoother video playback, and reduced latency.
 
-  - Diagnostic: Encoder output logs showed `key=True` on every frame. After frame ~1000, `Frame dequeue timeout (2000ms)` appeared every 2 seconds with no further encoder output.
+  - Improved Socket Disconnection Detection:
 
-  - Fix: Changed to `SetInteger(KeyIFrameInterval, 1)`. Always use `SetInteger` (not `SetFloat`) for I-frame interval on Android MediaCodec. Sub-second float values are unreliable on many SoCs. Value of 1 = one IDR keyframe per second (~25 frames at 25fps).
+  - Problem: `Socket.Connected` property doesn't reliably detect abrupt TCP disconnections (client crash, network loss, etc.). The server would continue streaming to dead connections for extended periods.
 
-  - **RTP Timestamps 1000x Too Fast (CRITICAL)**:
+  - Fix: Added `IsSocketConnected()` method that uses `Socket.Poll()` to actively probe connection state. If poll returns readable but no data is available, the connection is confirmed closed. This detects dead connections within seconds instead of minutes.
 
-  - Problem: `EncoderTimestampToRtp` treated MediaCodec's `PresentationTimeUs` as microseconds, but the MT6768 reports values in units approximately 1000x larger than microseconds. This produced RTP timestamp deltas of ~3,000,000 per frame instead of the expected ~3,600 (at 25fps/90kHz clock). Players like VLC interpreted frames as being 33 seconds apart and buffered forever, appearing frozen.
+  - Reduced Reconnection Time (WatchDog Optimization):
 
-  - Diagnostic: Added NAL diagnostic logging that revealed encoder timestamp deltas of ~33,333,000 between 25fps frames (should be ~40,000 if microseconds).
+  - Problem: WatchDog ran every 60 seconds, causing long delays before the server detected all clients were gone and could reset state for new connections.
 
-  - Fix: Replaced encoder-timestamp-based RTP derivation with `Stopwatch` wall-clock time. `BaseEncoderTimestamp` is repurposed to store the `Stopwatch.GetTimestamp()` start tick. RTP offset is calculated as `elapsedSeconds * 90000.0`, which produces correct ~3,600 deltas regardless of encoder timestamp units. This approach is robust across all SoCs.
+  - Fix: WatchDog interval reduced to 5 seconds. Also improved logic to check `IsPlaying` status alongside socket connection, actively clean up dead clients, and clear SPS/PPS caches when resetting streaming state.
 
-  - **Client Lifecycle Killing Active Streams**:
+  - Fixed Frame Queue for Smoother Playback:
 
-  - Problem: Multiple lifecycle mechanisms (WatchDog, HandleClient, RTCP, TransportManager) were prematurely terminating streaming clients due to unreliable `Socket.Connected` checks, single-error disconnection, and disposal race conditions that caused `ObjectDisposedException` in streaming tasks.
+  - Problem: H.264 frames were stored in single variables (`_latestH264FrameBack/Front`) using `Interlocked.Exchange`. If the encoder produced frames faster than they could be sent, frames would be overwritten and lost, causing stuttering.
 
-  - Fixes:
-    - `GetDeadClients()` checks `IsPlaying` first — playing clients are never marked as dead, only non-playing clients are subject to socket checks and grace period timeouts
-    - `TransportManager` uses graduated error counting with a threshold of 10 consecutive failures (TCP) or 5 failures / unreachable host (UDP), instead of immediate disconnection on first error
-    - `CleanupClient` sets `IsPlaying = false` before calling `Dispose()` to prevent `ObjectDisposedException` in streaming tasks that may still be running on separate threads
-    - `HandleClient` uses `ReadLineAsync()` null detection instead of `Socket.Connected` to detect disconnection, avoiding false positives from the unreliable `Connected` property
-    - Frame dequeue uses a 2-second timeout to prevent blocking forever on encoder stalls
-    - `FramePacer.ShouldDropFrame` fixed: now correctly drops frames arriving too fast (less than half a frame interval), not frames arriving after a gap — the previous inverted logic caused recovery from stalls to be even slower
+  - Fix: Replaced single frame variables with `ConcurrentQueue<H264FrameEventArgs>` (max 5 frames buffer). Frames are now queued and sent in order, preventing loss during brief processing delays.
 
-  - **Encoding Loop Reorder**:
+  - Optimized Encoder Input/Output Handling:
 
-  - Problem: The encoding loop fed input first, then drained output. When the encoder's internal input queue was full (because output hadn't been drained), `FeedInputBuffer` would fail and the frame was lost.
+  - Problem: Encoder used 0ms timeout for buffer operations, causing missed buffers and aggressive frame dropping (max 1 frame in queue).
 
-  - Fix: Swapped the order in `EncodingLoop` to drain output before feeding input. This frees encoder resources before attempting to queue new input, reducing unnecessary frame loss on resource-constrained SoCs.
+  - Fix:
+    - Input buffer dequeue timeout increased to 10ms
+    - Output buffer dequeue timeout increased to 10ms
+    - Frame queue limit increased from 1 to 3 frames
+    - Re-enabled sleep in encoding loop to prevent CPU spinning
 
-  - **Files Changed**:
-    - `RTSP/H264Encoder.cs`: I-frame interval fix (`SetFloat` → `SetInteger`), encoding loop drain-before-feed reorder
-    - `RTSP/Transport/RtpPacketBuilder.cs`: Wall-clock `Stopwatch`-based RTP timestamp derivation
-    - `RTSP/Transport/TransportManager.cs`: Graduated error counting (10 threshold for TCP, 5 for UDP), SendLock timeout logging
-    - `RTSP/Streaming/StreamingController.cs`: 2-second frame dequeue timeout, `ObjectDisposedException` and `ChannelClosedException` handling
-    - `RTSP/Streaming/FramePacer.cs`: Inverted drop logic fix (drops fast frames, not slow ones)
-    - `RTSP/ClientManagement/ClientManager.cs`: Safe cleanup ordering (`IsPlaying = false` before `Dispose()`), `IsPlaying`-first dead client check
-    - `RTSP/Server.cs`: `HandleClient` socket lifecycle fix using `ReadLineAsync` null detection
+  - Reduced Streaming Latency:
 
-  - **Debugging Methodology**:
+  - Fix: Multiple latency optimizations applied:
+    - Socket buffers reduced from 256KB to 64KB (less buffering delay)
+    - TCP_NODELAY explicitly set on all connections
+    - I-frame interval reduced from 2s to 1s (faster stream recovery)
+    - Inactivity timeout reduced from 30s to 10s (faster dead connection cleanup)
 
-  - This fix was identified through a systematic "debug mode" approach:
-    1. Disabled all lifecycle management (WatchDog, RTCP cleanup, HandleClient socket closing) to isolate the actual streaming issue
-    2. Added frame counter logging to track frame flow through the entire pipeline (camera → encoder → channel → streaming controller → RTP → transport)
-    3. Discovered all-IDR output from encoder logs (`key=True` on every frame)
-    4. After I-frame fix, added detailed NAL diagnostic logging (NAL type, size, encoder timestamp, RTP timestamp, SPS/PPS info)
-    5. Discovered RTP timestamp delta of ~3,000,000 instead of expected ~3,600
-    6. Applied wall-clock timestamp fix — stream became fluid
+  - Enhanced Connection Health Checks:
 
-  - **Performance Metrics**:
+  - Fix: Streaming loop now checks three conditions before each frame:
+    - `IsSocketConnected()` for active connection state
+    - Inactivity timeout (10 seconds with no successful send)
+    - Consecutive send errors (disconnects after 3 failures)
 
-  | Metric | Before | After |
-  |--------|--------|-------|
-  | H.264 Stream Duration | ~30 seconds then freeze | Continuous, unlimited |
-  | Encoder Output | Stall after ~1000 frames | Continuous encoding |
-  | RTP Timestamp Delta | ~3,000,000 (833x too large) | ~3,600 (correct) |
-  | Client Reconnection | Frequent false disconnections | Stable with graduated error tolerance |
-  | Frame Recovery After Stall | Slow (drops first frames) | Immediate (drops only bursts) |
+  - Fixed Frame Stride Padding Handling:
 
-  - **Impact**: H.264 RTSP streaming now runs continuously without freezing on MediaTek MT6768 and likely other MediaTek SoCs that share these encoder quirks. The combination of correct I-frame interval configuration, robust RTP timestamp derivation, and hardened client lifecycle management eliminates the three root causes of the freeze. Transient network errors no longer kill the stream, and the encoder no longer stalls from all-IDR output.
+  - Problem: Android cameras may include row stride padding in YUV frames, causing buffer size mismatches (e.g., 640x480 camera sending 614,398 bytes instead of expected 460,800).
+
+  - Fix: Added frame size normalization via truncation to expected size. While this may cause minor artifacts on some devices, it prevents encoder crashes and ensures video delivery.
+
+- v1.4.1: Client Connection Management Overhaul and H.264 Reliability Fix. This release addresses critical issues with abrupt client disconnection handling and encoder buffer size mismatches that caused delayed reconnections and missing video.
+
+  - Fixed Critical Client Collection Bug (ConcurrentBag → ConcurrentDictionary):
+
+  - Problem: The server used `ConcurrentBag<Client>` with `TryTake()` for client cleanup. `TryTake()` removes a **random** element, not the specific client being cleaned up. This corrupted the client list over time, causing ghost clients and preventing proper cleanup.
+
+  - Fix: Replaced `ConcurrentBag<Client>` with `ConcurrentDictionary<string, Client>`. Client cleanup now uses `TryRemove(client.Id, out _)` to remove the exact client being disconnected.
+
+  - Added TCP Connection Timeout Detection:
+
+  - Problem: `Socket.Connected` does not detect abrupt disconnections (network failure, process kill). The server would continue trying to stream to dead clients, blocking resources and preventing new clients from receiving video.
+
+  - Fix: Added comprehensive connection health tracking:
+    - `LastActivityTime` tracks last successful send per client
+    - `ConsecutiveSendErrors` counts sequential failures
+    - 5-second send timeout using `CancellationTokenSource` detects stuck connections
+    - 30-second inactivity timeout in streaming loop catches zombie connections
+    - Client marked as disconnected after 3 consecutive errors or socket exception
+
+  - Fixed H.264 Encoder Buffer Size Mismatch:
+
+  - Problem: The encoder was initialized with camera-reported dimensions (e.g., 640x480), but some cameras send frames with different actual sizes (e.g., 640x640). This caused `Input buffer too small` errors and dropped frames.
+
+  - Fix: Added `CalculateDimensionsFromFrameSize()` method that:
+    - Checks common resolutions against actual YUV420 frame size
+    - Calculates dimensions using width/height hints when possible
+    - Falls back to square aspect ratio calculation
+    - Ensures encoder is always initialized with correct frame dimensions
+
+  - Improved UDP Error Handling:
+
+  - Problem: UDP send errors weren't properly tracked, allowing broken connections to persist.
+
+  - Fix: UDP sends now track activity time and consecutive errors. Clients are disconnected after 5 consecutive UDP errors or when network is unreachable.
+
+  - Enhanced Error Logging:
+
+  - Added detailed logging for connection timeouts, send failures, and dimension mismatches to aid debugging.
+
+- v1.4.0: Major H.264 Codec Overhaul and VLC Compatibility Fix. This release addresses critical issues in the H.264 implementation that caused stutter, timing problems, and complete playback failure on VLC and other strict players.
+
+  - Fixed Critical Timestamp Unit Mismatch:
+
+  - Problem: The encoder outputs timestamps in microseconds (PresentationTimeUs), but the server was treating them as nanoseconds. This resulted in RTP timestamps being 1000x smaller than expected, causing massive stutter, frame overlap, and timing desynchronization.
+
+  - Fix: The timestamp conversion in `EncoderTimestampToRtp` now correctly converts microseconds to RTP units using fixed-point arithmetic: `(deltaUs * 9 + 50) / 100` (equivalent to `deltaUs * 90000 / 1_000_000`).
+
+  - Added VLC Compatibility (sprop-parameter-sets in SDP):
+
+  - Problem: VLC and many strict players require `sprop-parameter-sets` in the SDP to initialize the H.264 decoder. Without this, VLC would fail to decode the stream entirely.
+
+  - Fix: The SDP now dynamically includes base64-encoded SPS and PPS in the `a=fmtp` line when available. The server caches these parameter sets as they're received from the encoder.
+
+  - Fixed NAL Unit Extraction (Multiple NALs per Frame):
+
+  - Problem: The encoder was treating each output buffer as a single NAL unit, even when it contained multiple NAL units (e.g., SEI + IDR, or SPS + PPS combined). This caused incomplete frames and decoder confusion.
+
+  - Fix: Added `ExtractNalUnitsFromFrame` method that properly parses start codes and extracts all NAL units from encoder output. The server now sends each NAL unit as a separate RTP packet (or FU-A fragmented if large).
+
+  - Fixed SPS/PPS Start Code Handling:
+
+  - Problem: When extracting SPS/PPS from MediaFormat's csd-0/csd-1 buffers, the code assumed specific start code formats. Some encoders provide raw NAL data without start codes, others use 3-byte or 4-byte start codes.
+
+  - Fix: Added robust `GetStartCodeLength`, `GetNalType`, and `EnsureStartCode` helper methods that handle all cases. Parameter sets are now normalized to 4-byte start codes for consistent handling.
+
+  - Fixed Multi-Client Frame Delivery:
+
+  - Problem: Using `Interlocked.Exchange` with null replacement caused frames to be consumed by one client, leaving other clients without frames.
+
+  - Fix: Changed to non-destructive frame reading where each client tracks its own last-sent timestamp. Multiple clients can now receive the same frame, and per-client timestamp tracking prevents duplicate sends.
+
+  - Improved Frame Dropping Strategy:
+
+  - Problem: The encoder was aggressively dropping frames (keeping only 2 max), which could break B-frame prediction chains and cause visible stutter.
+
+  - Fix: Frame queue limit increased to 3 with single-frame-at-a-time dropping. This provides better buffering while maintaining low latency.
+
+  - Added RTCP Sender Reports:
+
+  - Problem: VLC and other players use RTCP Sender Reports (SR) for clock synchronization and jitter buffer management. Without SR packets, players may exhibit poor sync and choppy playback.
+
+  - Fix: The server now sends RTCP Sender Reports every 5 seconds. Each SR includes NTP timestamp, RTP timestamp, packet count, and octet count as per RFC 3550.
+
+  - Enhanced Code Documentation:
+
+  - Added XML documentation comments to all major methods explaining their purpose, parameters, and behavior.
+  - Improved code readability with clear comments explaining RTP/RTCP protocol details.
+
+- v1.3.1: Major H.264 Stability and Stutter Fix This release targets and resolves a series of core issues in the H.264 streaming logic that caused stutter, frame overlapping, and "two-frame" freezes. The stream is now significantly smoother and more stable.
+
+  - Fixed Critical Timestamp Conversion:
+
+  - Problem: The server was incorrectly converting the camera encoder's timestamps. We discovered the encoder provides timestamps in nanoseconds, but the server was treating them as microseconds. This resulted in RTP timestamps being 1000x too large, causing players to think a single frame should last for 30+ seconds, leading to a "two-frame" freeze.
+
+  - Fix: The timestamp conversion logic in EncoderTimestampToRtp has been corrected to divide by 1,000,000,000.0 (nanoseconds) instead of 1,000,000.0 (microseconds).
+
+  - Corrected RTP Marker Bit Logic:
+
+  - Problem: The RTP "Marker Bit" (M-bit), which signals the end of a video frame, was being set incorrectly (e.g., on every small NAL unit). This confused decoders, causing them to render frames on top of each other or get stuck.
+
+  - Fix: The server now correctly tracks all NAL units and fragments belonging to a single frame. The M-bit is now set only on the absolute last RTP packet of the last NAL unit for that frame, as required by the H.264 spec.
+
+  - Removed Conflicting Stream Pacing:
+
+  - Problem: The streaming loop had two "pacemakers" fighting each other:
+
+  - A fixed Task.Delay trying to send at 45 FPS (22ms).
+
+  - The H.264 encoder, which was producing frames at 25 FPS (40ms).
+
+  - Fix: The fixed Task.Delay has been removed for H.264 streaming. The loop is now event-driven: it sends a frame as soon as the encoder provides one and loops immediately. If no new frame is ready, it waits a tiny 10ms (to prevent 100% CPU usage) and checks again. This lets the encoder, not the server loop, dictate the stream's framerate.
+
+  - Eliminated Network Send Latency (Nagle's Algorithm):
+
+  - Problem: For TCP streams, the OS was likely bundling small RTP packets together before sending them (Nagle's Algorithm). This is good for file transfers but terrible for real-time video, as it introduces small, random delays perceived as micro-stutter.
+
+  - Fix: Nagle's Algorithm is now explicitly disabled (NoDelay = true) on all accepted client sockets, ensuring every RTP packet is sent to the network immediately.
+
+  - Removed H.264 Frame Lock Contention:
+
+  - Problem: The encoder thread (writing a new frame) and the network thread (reading that frame) were using the same lock. This meant one thread often had to wait for the other, causing a "hiccup" in frame delivery.
+
+  - Fix: This lock has been completely replaced with a high-performance, lock-free Interlocked.Exchange operation. This allows the encoder and network threads to swap frame data atomically without ever blocking each other, resulting in a smoother handoff from camera to network.
+
+- v1.2.0: Adding new global encoder for compatiblity with multiple devices not only Mediatek and fixing some features from the server to handle clients.
+
+- v1.1.11: Fixing Server to allow Configuration Class, fixing MjpegServer disposal on Server class, fixing MjpegServer to set a fixed bitrate to 30 fps and fixing CPU leaks.
+
+- v1.1.10: Adding a custom class 'ServerConfiguration' to handle more easily all the server configurations.
+
+- v1.1.9: Adding user/password handling options.
+
+- v1.1.8: Fixing issues related with Camera Services, making that on camera or service closure do not allow to restart them.
+
+- v1.1.7: Fixing MJPEG Codec bugs avoiding crashes, fixing Watchdog that close prematurly some connections, fixing some issues with the preview.
+
+- v1.1.6: Adding ArrayPool to avoid ovearhead at GC with multiple byte[] creations like in RTP Packets.
+Adding .ConfigureAwait(false) on awaitable method to avoid context overhead, theorical from 100ms to 100 us, increase performance on fewer CPU resources devices.
+
+- v1.1.5: Fixing EventBuss command on Server class, if the server was started do not raise the flag into it, and sometimes make the app crash due to "Port already in use" or even using excesive CPU on multiple MJPEG servers.
+Adding to MJPEGServer preview of EventBuss to handle it by there, but needs sync with main server to avoid duplicate instances or commands.
+
+- v1.1.4: Adding auth option into CTOR of Server class, to enable or disable auth on stream rtsp, adding feature to determina video quality into mjpeg server
+
+- v1.1.3: Adding handling for auto-quality adjust based on rtcp control for MJPEG codec, allowing to increase or decrease the image quality to guarantee video stability over this codec.
+-- Adding a preview (WIP) for video profiles allowing to create custom paths for this new profiles, will allow to set a custom resolution, bitrate and more.
+
+- v1.1.2: Adding at Server CTOR two new variables to handle if the front or back camera should be enabled, this avoid the problem that only one camera start on devices that can not handle both cameras at same time.
 
 ---
 

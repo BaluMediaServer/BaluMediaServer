@@ -18,7 +18,11 @@ public class StreamingController : IStreamingController
     private readonly ITransportManager _transportManager;
     private readonly IClientManager _clientManager;
 
-    private bool _isStreaming;
+    // 0 = not streaming, 1 = streaming.
+    // Use Interlocked.CompareExchange (not volatile bool) so the 0→1 transition is atomic:
+    // a plain volatile read + separate write allows two simultaneous clients to both read 0
+    // before either writes 1, causing double CameraStartRequested / StreamingStateChanged(true).
+    private volatile int _isStreamingFlag;
 
     /// <summary>
     /// Fallback interval in milliseconds used when H.264 frame delivery needs a brief wait.
@@ -39,7 +43,7 @@ public class StreamingController : IStreamingController
     private const int InactivityTimeoutSeconds = 60;
 
     /// <inheritdoc/>
-    public bool IsStreaming => _isStreaming;
+    public bool IsStreaming => _isStreamingFlag == 1;
 
     /// <inheritdoc/>
     public event EventHandler<bool>? StreamingStateChanged;
@@ -61,6 +65,13 @@ public class StreamingController : IStreamingController
     public Func<int, FrameEventArgs?>? GetLatestFrame { get; set; }
 
     /// <summary>
+    /// Delegate to restart the camera and clear the cached latest frame for a given camera ID.
+    /// Called by the stall-recovery path so that <see cref="WaitForFrameAndStartEncoder"/>
+    /// blocks on a fresh frame rather than returning immediately from a stale cache.
+    /// </summary>
+    public Action<int>? RestartCamera { get; set; }
+
+    /// <summary>
     /// Creates a new StreamingController.
     /// </summary>
     public StreamingController(
@@ -78,22 +89,30 @@ public class StreamingController : IStreamingController
     }
 
     /// <summary>
-    /// Sets the streaming state.
+    /// Externally resets the streaming state (e.g. called by Server when all clients disconnect).
+    /// Uses <see cref="Interlocked.Exchange"/> so the write is immediately visible to all threads.
+    /// <para>
+    /// After this call returns 0, the next <see cref="StreamToClientAsync"/> invocation will be
+    /// able to win the <c>CompareExchange(0 → 1)</c> gate and restart the camera.
+    /// </para>
     /// </summary>
     public void SetStreamingState(bool streaming)
     {
-        _isStreaming = streaming;
+        Interlocked.Exchange(ref _isStreamingFlag, streaming ? 1 : 0);
         StreamingStateChanged?.Invoke(this, streaming);
     }
 
     /// <inheritdoc/>
     /// <remarks>
     /// This method manages the streaming loop for a connected client, including:
-    /// - Automatic camera start and encoder initialization for H.264
-    /// - Socket health monitoring
-    /// - Inactivity timeout tracking (60 seconds)
-    /// - Consecutive error detection (10 errors threshold)
-    /// - Activity tracking updates at each iteration to prevent false timeouts
+    /// <list type="bullet">
+    /// <item>Atomic camera start — <c>Interlocked.CompareExchange</c> on <c>_isStreamingFlag</c>
+    /// ensures <see cref="CameraStartRequested"/> and <see cref="StreamingStateChanged"/> are
+    /// each fired exactly once even when multiple clients connect simultaneously.</item>
+    /// <item>H.264 encoder initialization via <c>WaitForFrameAndStartEncoder</c>.</item>
+    /// <item>Consecutive error detection (10 errors threshold).</item>
+    /// <item>Stall detection and automatic camera+encoder restart (5 s after first frame, 3 s warmup).</item>
+    /// </list>
     /// </remarks>
     public async Task StreamToClientAsync(Models.Client client, CancellationToken cancellationToken)
     {
@@ -106,9 +125,18 @@ public class StreamingController : IStreamingController
             _encoderManager.RegisterClientChannel(client.CameraId, client.Id);
         }
 
-        if (!_isStreaming)
+        // Cache the channel reference once — avoids a per-frame dictionary lookup (25×/s per client).
+        // The channel is registered above and lives for the entire session, so this reference is stable.
+        Channel<H264FrameEventArgs>? h264Channel = client.Codec == CodecType.H264
+            ? _encoderManager.GetClientChannelRef(client.CameraId, client.Id)
+            : null;
+
+        // Atomic test-and-set: CAS returns the *old* value.
+        // The thread that transitions 0→1 wins and is the sole thread that starts the camera.
+        // Any thread that arrives while streaming is already active (old value == 1) skips to else-if.
+        if (Interlocked.CompareExchange(ref _isStreamingFlag, 1, 0) == 0)
         {
-            // Request camera start
+            // Request camera start — exactly once, even under simultaneous connects
             try
             {
                 CameraStartRequested?.Invoke(this, client.CameraId);
@@ -118,7 +146,6 @@ public class StreamingController : IStreamingController
                 Log.Error("[StreamingController]", $"CameraStartRequested subscriber error: {ex.Message}");
             }
 
-            _isStreaming = true;
             try
             {
                 StreamingStateChanged?.Invoke(this, true);
@@ -155,19 +182,16 @@ public class StreamingController : IStreamingController
         int consecutiveTimeouts = 0;
         bool gotFirstFrame = false;
         // Before any frame arrives: allow 15 × 200ms = 3s for MediaCodec hardware warmup.
-        // After the first frame flows: 2 × 200ms = 400ms triggers restart on stall.
+        // After the first frame flows: allow 25 × 200ms = 5s before declaring a stall.
+        // 5s gives slow/padded cameras (e.g. VGA on MediaTek delivering ~0.3fps) time to
+        // produce the next frame without triggering a premature encoder restart loop.
         const int warmupTimeoutCount = 15;
-        const int activeTimeoutCount = 2;
+        const int activeTimeoutCount = 25;
 
         // Pre-allocate per-session state to avoid per-frame allocations in the hot path.
         // nalSendBuffer is cleared and reused on every frame; the list header is allocated once.
         var nalSendBuffer = new List<byte[]>(8);
         var rtpBatchBuffer = new List<byte[]>(32);
-
-        // Reusable CTS for frame dequeue timeouts — avoids allocating a new
-        // CancellationTokenSource.CreateLinkedTokenSource on every frame attempt.
-        // Single-element array so the async method can update the reference.
-        var reusableTimeoutCts = new CancellationTokenSource?[1];
 
         try
         {
@@ -190,7 +214,7 @@ public class StreamingController : IStreamingController
 
                 if (client.Codec == CodecType.H264)
                 {
-                    frameSent = await StreamH264ToClientAsync(client, cancellationToken, nalSendBuffer, reusableTimeoutCts, rtpBatchBuffer).ConfigureAwait(false);
+                    frameSent = StreamH264ToClient(client, cancellationToken, nalSendBuffer, rtpBatchBuffer, h264Channel);
 
                     if (!frameSent)
                     {
@@ -203,19 +227,26 @@ public class StreamingController : IStreamingController
 
                         if (consecutiveTimeouts >= maxTimeouts)
                         {
-                            Log.Warn("[StreamingController]", $"No frames for {consecutiveTimeouts * FrameDequeueTimeoutMs}ms on camera {client.CameraId} (running={_encoderManager.IsEncoderRunning(client.CameraId)}, warmup={!gotFirstFrame}) — forcing restart");
+                            Log.Warn("[StreamingController]", $"No frames for {consecutiveTimeouts * FrameDequeueTimeoutMs}ms on camera {client.CameraId} (running={_encoderManager.IsEncoderRunning(client.CameraId)}, warmup={!gotFirstFrame}) — restarting camera+encoder");
                             try
                             {
                                 _encoderManager.StopEncoder(client.CameraId);
+
+                                // Restart the camera and clear the cached frame so
+                                // WaitForFrameAndStartEncoder blocks on a live frame instead
+                                // of returning instantly from a stale cache (which would restart
+                                // the encoder against a still-dead camera and loop indefinitely).
+                                RestartCamera?.Invoke(client.CameraId);
+
                                 await WaitForFrameAndStartEncoder(client, cancellationToken).ConfigureAwait(false);
                                 _encoderManager.RequestKeyFrame(client.CameraId);
                                 consecutiveTimeouts = 0;
                                 gotFirstFrame = false; // reset for the new encoder session
-                                Log.Info("[StreamingController]", $"Encoder restarted successfully for camera {client.CameraId}");
+                                Log.Info("[StreamingController]", $"Camera+encoder restarted successfully for camera {client.CameraId}");
                             }
                             catch (TimeoutException)
                             {
-                                Log.Error("[StreamingController]", $"Encoder restart failed (no frames from camera {client.CameraId}) — disconnecting client");
+                                Log.Error("[StreamingController]", $"Restart failed (no frames from camera {client.CameraId} after camera restart) — disconnecting client");
                                 break;
                             }
                         }
@@ -249,7 +280,6 @@ public class StreamingController : IStreamingController
         }
         finally
         {
-            reusableTimeoutCts[0]?.Dispose();
             // Unregister channel before cleanup so the fan-out stops writing to this client.
             if (client.Codec == CodecType.H264)
             {
@@ -344,43 +374,47 @@ public class StreamingController : IStreamingController
     /// <param name="client">The target client.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>True if a frame was successfully sent, false otherwise.</returns>
-    private async Task<bool> StreamH264ToClientAsync(Models.Client client, CancellationToken cancellationToken, List<byte[]> nalSendBuffer, CancellationTokenSource?[] reusableTimeoutCts, List<byte[]> rtpBatch)
+    // Synchronous hot-path: no async/await → no thread-pool continuation dispatch.
+    // Uses a pre-resolved channel reference (clientChannel) to avoid per-frame dictionary
+    // lock acquisitions. WaitOnChannel blocks the OS thread via kernel futex (~1 ms);
+    // Socket.Send() is a blocking syscall (~2 ms on LAN).
+    private bool StreamH264ToClient(Models.Client client, CancellationToken cancellationToken, List<byte[]> nalSendBuffer, List<byte[]> rtpBatch, Channel<H264FrameEventArgs>? clientChannel)
     {
         H264FrameEventArgs? h264Frame;
 
-        // Try non-blocking dequeue first (zero allocation in the hot path)
-        if (!_encoderManager.TryDequeueFrame(client.CameraId, client.Id, out h264Frame) || h264Frame == null)
+        // Use cached channel reference when available — bypasses the per-frame dictionary lock.
+        // Falls back to the manager methods if the reference was unavailable at session start.
+        if (clientChannel != null)
         {
-            // No frame ready — wait with a timeout to prevent blocking forever if encoder stalls.
-            // Reuse CTS to avoid per-frame allocation of CreateLinkedTokenSource.
-            try
+            if (!clientChannel.Reader.TryRead(out h264Frame))
             {
-                var cts = reusableTimeoutCts[0];
-                if (cts == null || !cts.TryReset())
+                if (cancellationToken.IsCancellationRequested) return false;
+                h264Frame = WaitOnChannel(clientChannel, FrameDequeueTimeoutMs, cancellationToken);
+                if (h264Frame == null)
                 {
-                    cts?.Dispose();
-                    cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                    reusableTimeoutCts[0] = cts;
+                    if (!cancellationToken.IsCancellationRequested)
+                        Log.Warn("[StreamingController]", $"Frame dequeue timeout ({FrameDequeueTimeoutMs}ms) - encoder may be stalled for camera {client.CameraId}");
+                    return false;
                 }
-                cts.CancelAfter(FrameDequeueTimeoutMs);
-                h264Frame = await _encoderManager.DequeueFrameAsync(client.CameraId, client.Id, cts.Token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-            {
-                // Timeout — encoder stalled, log and continue the loop
-                Log.Warn("[StreamingController]", $"Frame dequeue timeout ({FrameDequeueTimeoutMs}ms) - encoder may be stalled for camera {client.CameraId}");
-                return false;
-            }
-            catch (OperationCanceledException)
-            {
-                return false;
-            }
-            catch (ChannelClosedException)
-            {
-                Log.Warn("[StreamingController]", $"Frame channel closed for camera {client.CameraId} - encoder stopped");
-                return false;
             }
         }
+        else
+        {
+            // Fallback: look up channel each call (used when channel ref is unavailable)
+            if (!_encoderManager.TryDequeueFrame(client.CameraId, client.Id, out h264Frame) || h264Frame == null)
+            {
+                if (cancellationToken.IsCancellationRequested) return false;
+                h264Frame = _encoderManager.WaitDequeueFrame(client.CameraId, client.Id, FrameDequeueTimeoutMs, cancellationToken);
+                if (h264Frame == null)
+                {
+                    if (!cancellationToken.IsCancellationRequested)
+                        Log.Warn("[StreamingController]", $"Frame dequeue timeout ({FrameDequeueTimeoutMs}ms) - encoder may be stalled for camera {client.CameraId}");
+                    return false;
+                }
+            }
+        }
+
+        long dequeuedAt = System.Diagnostics.Stopwatch.GetTimestamp();
 
         if (h264Frame == null || h264Frame.NalUnits.Count == 0)
         {
@@ -395,14 +429,7 @@ public class StreamingController : IStreamingController
             return false;
         }
 
-        // Get or create pacer for this client.
-        // Target 30fps even though the encoder runs at 25fps: since 40ms > 33ms (one 30fps interval),
-        // GetDelayForNextFrame() always returns 0 for a 25fps stream, so frames are sent immediately
-        // on arrival without artificial delay. ShouldDropFrame still guards against burst duplicates
-        // (threshold: 16ms), keeping smoothness without adding latency.
-        var pacer = _clientManager.GetOrCreatePacer(client.Id, 30);
-
-        // Detect IDR frame
+        // Detect IDR frame (needed for SPS/PPS injection decision below)
         bool isIdrFrame = h264Frame.IsKeyFrame;
         if (!isIdrFrame && h264Frame.NalUnits.Count > 0)
         {
@@ -420,27 +447,16 @@ public class StreamingController : IStreamingController
             }
         }
 
-        // Check if we should drop this frame
-        if (pacer.ShouldDropFrame(isIdrFrame))
-        {
-            pacer.RecordDrop();
-            return false;
-        }
-
-        // Wait for proper timing
-        int delayMs = pacer.GetDelayForNextFrame();
-        if (delayMs > 0)
-        {
-            await Task.Delay(delayMs, cancellationToken).ConfigureAwait(false);
-        }
+        // No pacer delay: the encoder's 25fps output rate is the natural throttle, and the
+        // per-client channel (DropOldest, size=1) already discards stale frames on bursts.
+        // A software pacer would add 33ms of Thread.Sleep per frame on the now-synchronous path.
 
         uint frameRtpTimestamp = _rtpBuilder.EncoderTimestampToRtp((ulong)h264Frame.Timestamp, ref client);
 
-        lock (client)
-        {
-            client.LastH264FrameTimestamp = h264Frame.Timestamp;
-            client.FrameCount++;
-        }
+        // No lock needed — LastH264FrameTimestamp and FrameCount are written only by this
+        // streaming thread and read only within this same method.
+        client.LastH264FrameTimestamp = h264Frame.Timestamp;
+        client.FrameCount++;
 
         try
         {
@@ -490,10 +506,24 @@ public class StreamingController : IStreamingController
                 _rtpBuilder.BuildH264NalRtpPackets(client, nalSendBuffer[i], frameRtpTimestamp, isLastNalOfFrame, rtpBatch);
             }
 
-            // Send entire frame as one batch (single lock acquisition + single TCP send)
-            await _transportManager.SendBatchAsync(client, rtpBatch).ConfigureAwait(false);
+            // Synchronous send — blocking syscall on the dedicated OS thread, no thread-pool hop
+            long preSendAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            _transportManager.SendBatchSync(client, rtpBatch);
+            long postSendAt = System.Diagnostics.Stopwatch.GetTimestamp();
 
-            pacer.MarkFrameSent();
+            // Detailed latency breakdown every 25 frames:
+            //   queue  = frame wait in channel (scheduling latency target: <5ms)
+            //   build  = IDR detection + RTP packet construction
+            //   send   = socket.Send() syscall (target: <2ms on LAN)
+            if (h264Frame.EncodedAt > 0 && client.FrameCount % 25 == 1)
+            {
+                double freq = System.Diagnostics.Stopwatch.Frequency;
+                double queueMs = (dequeuedAt  - h264Frame.EncodedAt) * 1000.0 / freq;
+                double buildMs = (preSendAt   - dequeuedAt)          * 1000.0 / freq;
+                double sendMs  = (postSendAt  - preSendAt)            * 1000.0 / freq;
+                Log.Info("H264Latency", $"Stream path: queue={queueMs:F1}ms build={buildMs:F1}ms send={sendMs:F1}ms (client {client.Id[..8]}, frame {client.FrameCount})");
+            }
+
             return true;
         }
         catch (ObjectDisposedException)
@@ -507,6 +537,32 @@ public class StreamingController : IStreamingController
         {
             Log.Error("[StreamingController]", $"H264 streaming error: {ex.Message}");
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Synchronously blocks the calling OS thread until a frame is available on the channel,
+    /// the timeout elapses, or cancellation is requested. Mirrors WaitDequeueFrame but operates
+    /// on a pre-resolved channel reference to avoid the per-frame dictionary lock.
+    /// </summary>
+    private static H264FrameEventArgs? WaitOnChannel(Channel<H264FrameEventArgs> channel, int timeoutMs, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var vt = channel.Reader.WaitToReadAsync(cancellationToken);
+            if (vt.IsCompleted)
+            {
+                if (!vt.Result) return null; // channel completed (encoder stopped)
+                channel.Reader.TryRead(out var immediateFrame);
+                return immediateFrame;
+            }
+            if (!vt.AsTask().Wait(timeoutMs, cancellationToken)) return null; // timeout
+            channel.Reader.TryRead(out var frame);
+            return frame;
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
         }
     }
 

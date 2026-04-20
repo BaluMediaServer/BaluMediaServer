@@ -35,6 +35,8 @@ public class H264EncoderManager : IH264EncoderManager
 
     // Per-client buffer: 1 frame — always deliver the freshest encoded frame.
     // DropOldest ensures slow clients never stall the fan-out loop.
+    // The fan-out callbacks snapshot this list under lock then write outside the lock,
+    // so registering/unregistering clients does not block on pending TryWrite calls.
     private const int MaxH264QueueSize = 1;
 
     /// <inheritdoc/>
@@ -295,6 +297,38 @@ public class H264EncoderManager : IH264EncoderManager
     }
 
     /// <inheritdoc/>
+    public H264FrameEventArgs? WaitDequeueFrame(int cameraId, string clientId, int timeoutMs, CancellationToken cancellationToken)
+    {
+        Channel<H264FrameEventArgs>? channel = GetClientChannel(cameraId, clientId);
+        if (channel == null) return null;
+
+        try
+        {
+            var vt = channel.Reader.WaitToReadAsync(cancellationToken);
+
+            // Fast path: frame already in channel — no OS wait needed.
+            if (vt.IsCompleted)
+            {
+                if (!vt.Result) return null; // channel completed (encoder stopped)
+                channel.Reader.TryRead(out var immediateFrame);
+                return immediateFrame;
+            }
+
+            // Slow path: block the current OS thread (a LongRunning/Thread-class thread).
+            // Task.Wait() uses a kernel futex → the OS wakes this thread the moment the
+            // encoder writes a frame, with ~1ms scheduling latency vs 10–70ms for async
+            // continuation dispatch on Android's thread pool.
+            if (!vt.AsTask().Wait(timeoutMs, cancellationToken)) return null; // timeout
+            channel.Reader.TryRead(out var frame);
+            return frame;
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    /// <inheritdoc/>
     public (byte[]? sps, byte[]? pps) GetSpsPps()
     {
         lock (_spsPpsLock)
@@ -394,11 +428,26 @@ public class H264EncoderManager : IH264EncoderManager
     {
         UpdateSpsPpsCache(e);
 
-        // Fan-out: deliver this frame to every registered front-camera client
+        // Snapshot channel list under lock, then write without holding the lock.
+        // Clients registering/unregistering only wait for the fast snapshot copy, not all TryWrite calls.
+        Channel<H264FrameEventArgs>[]? snapshot = null;
+        int count = 0;
         lock (_frontClientChannelsLock)
         {
-            foreach (var ch in _frontClientChannels.Values)
-                ch.Writer.TryWrite(e);
+            count = _frontClientChannels.Count;
+            if (count > 0)
+            {
+                snapshot = System.Buffers.ArrayPool<Channel<H264FrameEventArgs>>.Shared.Rent(count);
+                int i = 0;
+                foreach (var ch in _frontClientChannels.Values)
+                    snapshot[i++] = ch;
+            }
+        }
+        if (snapshot != null)
+        {
+            for (int i = 0; i < count; i++)
+                snapshot[i].Writer.TryWrite(e);
+            System.Buffers.ArrayPool<Channel<H264FrameEventArgs>>.Shared.Return(snapshot, clearArray: true);
         }
 
         try { FrameEncoded?.Invoke(this, e); }
@@ -409,11 +458,25 @@ public class H264EncoderManager : IH264EncoderManager
     {
         UpdateSpsPpsCache(e);
 
-        // Fan-out: deliver this frame to every registered back-camera client
+        // Snapshot channel list under lock, then write without holding the lock.
+        Channel<H264FrameEventArgs>[]? snapshot = null;
+        int count = 0;
         lock (_backClientChannelsLock)
         {
-            foreach (var ch in _backClientChannels.Values)
-                ch.Writer.TryWrite(e);
+            count = _backClientChannels.Count;
+            if (count > 0)
+            {
+                snapshot = System.Buffers.ArrayPool<Channel<H264FrameEventArgs>>.Shared.Rent(count);
+                int i = 0;
+                foreach (var ch in _backClientChannels.Values)
+                    snapshot[i++] = ch;
+            }
+        }
+        if (snapshot != null)
+        {
+            for (int i = 0; i < count; i++)
+                snapshot[i].Writer.TryWrite(e);
+            System.Buffers.ArrayPool<Channel<H264FrameEventArgs>>.Shared.Return(snapshot, clearArray: true);
         }
 
         try { FrameEncoded?.Invoke(this, e); }
@@ -451,6 +514,10 @@ public class H264EncoderManager : IH264EncoderManager
             }
         }
     }
+
+    /// <inheritdoc/>
+    public Channel<H264FrameEventArgs>? GetClientChannelRef(int cameraId, string clientId)
+        => GetClientChannel(cameraId, clientId);
 
     private static void DrainClientChannels(Dictionary<string, Channel<H264FrameEventArgs>> channels, object lockObj)
     {

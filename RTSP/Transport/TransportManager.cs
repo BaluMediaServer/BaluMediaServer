@@ -106,6 +106,136 @@ public class TransportManager : ITransportManager
         }
     }
 
+    /// <inheritdoc/>
+    public bool SendBatchSync(Client client, List<byte[]> packets)
+    {
+        if (packets.Count == 0) return true;
+
+        // Acquire lock synchronously — avoids SemaphoreSlim.WaitAsync continuation dispatch
+        try
+        {
+            if (!client.SendLock.Wait(3000))
+            {
+                Log.Warn("[TransportManager]", $"SendLock timeout (3s) for client {client.Id} - skipping sync batch");
+                return false;
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+            return false; // client is being torn down
+        }
+
+        try
+        {
+            if (client.Transport == TransportMode.TCPInterleaved)
+            {
+                return SendInterleavedBatchSync(client, packets);
+            }
+            else if (client.Transport == TransportMode.UDP)
+            {
+                bool allOk = true;
+                foreach (var pkt in packets)
+                {
+                    try
+                    {
+                        var ep = client.RtpEndPoint;
+                        if (client.UdpSocket != null && ep != null)
+                            client.UdpSocket.SendTo(pkt, SocketFlags.None, ep);
+                        else
+                            allOk = false;
+                    }
+                    catch (SocketException ex)
+                    {
+                        Log.Error("[TransportManager]", $"UDP sync send error for client {client.Id}: {ex.SocketErrorCode}");
+                        allOk = false;
+                    }
+                }
+                if (allOk)
+                {
+                    lock (client)
+                    {
+                        client.LastActivityTick = Environment.TickCount64;
+                        client.ConsecutiveSendErrors = 0;
+                    }
+                }
+                return allOk;
+            }
+            return false;
+        }
+        finally
+        {
+            client.SendLock.Release();
+        }
+    }
+
+    private bool SendInterleavedBatchSync(Client client, List<byte[]> packets)
+    {
+        int totalSize = 0;
+        for (int i = 0; i < packets.Count; i++)
+            totalSize += 4 + packets[i].Length;
+
+        var frame = ArrayPool<byte>.Shared.Rent(totalSize);
+        try
+        {
+            int offset = 0;
+            for (int i = 0; i < packets.Count; i++)
+            {
+                var rtpPacket = packets[i];
+                frame[offset]     = 0x24; // $ magic byte
+                frame[offset + 1] = client.RtpChannel;
+                frame[offset + 2] = (byte)(rtpPacket.Length >> 8);
+                frame[offset + 3] = (byte)(rtpPacket.Length & 0xFF);
+                Buffer.BlockCopy(rtpPacket, 0, frame, offset + 4, rtpPacket.Length);
+                offset += 4 + rtpPacket.Length;
+            }
+
+            var socket = client.Socket;
+            if (socket?.Connected ?? false)
+            {
+                try
+                {
+                    // Blocking send — stays on the calling OS thread, no async scheduling overhead
+                    socket.Send(frame, 0, totalSize, SocketFlags.None);
+                    lock (client)
+                    {
+                        client.LastActivityTick = Environment.TickCount64;
+                        client.ConsecutiveSendErrors = 0;
+                    }
+                    return true;
+                }
+                catch (SocketException ex)
+                {
+                    lock (client)
+                    {
+                        client.ConsecutiveSendErrors++;
+                        if (client.ConsecutiveSendErrors >= 10)
+                        {
+                            client.IsPlaying = false;
+                            Log.Error("[TransportManager]", $"Client {client.Id} marked for cleanup after sync send error: {ex.SocketErrorCode}");
+                        }
+                    }
+                    return false;
+                }
+                catch (ObjectDisposedException)
+                {
+                    return false; // socket torn down concurrently
+                }
+            }
+
+            lock (client)
+            {
+                client.ConsecutiveSendErrors++;
+                if (client.ConsecutiveSendErrors >= 10)
+                    client.IsPlaying = false;
+            }
+            return false;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(frame);
+        }
+    }
+
     /// <summary>
     /// Concatenates multiple RTP packets into a single TCP interleaved buffer and sends with one syscall.
     /// </summary>
