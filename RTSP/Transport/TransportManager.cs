@@ -43,7 +43,7 @@ public class TransportManager : ITransportManager
         // if the CTS is cancelled during server lifecycle events.
         if (!await client.SendLock.WaitAsync(3000).ConfigureAwait(false))
         {
-            Log.Warn("[TransportManager]", $"SendLock timeout (3s) for client {client.Id} - skipping packet");
+            BaluLogger.Warn("[TransportManager]", $"SendLock timeout (3s) for client {client.Id} - skipping packet");
             return false;
         }
         try
@@ -79,7 +79,7 @@ public class TransportManager : ITransportManager
 
         if (!await client.SendLock.WaitAsync(3000).ConfigureAwait(false))
         {
-            Log.Warn("[TransportManager]", $"SendLock timeout (3s) for client {client.Id} - skipping batch");
+            BaluLogger.Warn("[TransportManager]", $"SendLock timeout (3s) for client {client.Id} - skipping batch");
             return false;
         }
         try
@@ -116,7 +116,7 @@ public class TransportManager : ITransportManager
         {
             if (!client.SendLock.Wait(3000))
             {
-                Log.Warn("[TransportManager]", $"SendLock timeout (3s) for client {client.Id} - skipping sync batch");
+                BaluLogger.Warn("[TransportManager]", $"SendLock timeout (3s) for client {client.Id} - skipping sync batch");
                 return false;
             }
         }
@@ -146,7 +146,7 @@ public class TransportManager : ITransportManager
                     }
                     catch (SocketException ex)
                     {
-                        Log.Error("[TransportManager]", $"UDP sync send error for client {client.Id}: {ex.SocketErrorCode}");
+                        BaluLogger.Error("[TransportManager]", $"UDP sync send error for client {client.Id}: {ex.SocketErrorCode}");
                         allOk = false;
                     }
                 }
@@ -211,7 +211,7 @@ public class TransportManager : ITransportManager
                         if (client.ConsecutiveSendErrors >= 10)
                         {
                             client.IsPlaying = false;
-                            Log.Error("[TransportManager]", $"Client {client.Id} marked for cleanup after sync send error: {ex.SocketErrorCode}");
+                            BaluLogger.Error("[TransportManager]", $"Client {client.Id} marked for cleanup after sync send error: {ex.SocketErrorCode}");
                         }
                     }
                     return false;
@@ -291,7 +291,7 @@ public class TransportManager : ITransportManager
                     if (client.ConsecutiveSendErrors >= 10)
                     {
                         client.IsPlaying = false;
-                        Log.Error("[TransportManager]", $"Client {client.Id} marked for cleanup after batch send error");
+                        BaluLogger.Error("[TransportManager]", $"Client {client.Id} marked for cleanup after batch send error");
                     }
                 }
                 return false;
@@ -359,17 +359,17 @@ public class TransportManager : ITransportManager
                     lock (client)
                     {
                         client.ConsecutiveSendErrors++;
-                        Log.Warn("[TransportManager]", $"TCP send timeout (3s) - client {client.Id} error count: {client.ConsecutiveSendErrors}");
+                        BaluLogger.Warn("[TransportManager]", $"TCP send timeout (3s) - client {client.Id} error count: {client.ConsecutiveSendErrors}");
                         if (client.ConsecutiveSendErrors >= 10)
                         {
                             client.IsPlaying = false;
-                            Log.Error("[TransportManager]", $"Client {client.Id} marked for cleanup - too many timeouts");
+                            BaluLogger.Error("[TransportManager]", $"Client {client.Id} marked for cleanup - too many timeouts");
                         }
                     }
                 }
                 else
                 {
-                    Log.Warn("[TransportManager]", "TCP send timeout - client may be disconnected");
+                    BaluLogger.Warn("[TransportManager]", "TCP send timeout - client may be disconnected");
                 }
                 return false;
             }
@@ -380,17 +380,17 @@ public class TransportManager : ITransportManager
                     lock (client)
                     {
                         client.ConsecutiveSendErrors++;
-                        Log.Error("[TransportManager]", $"TCP send socket error for client {client.Id} (error count: {client.ConsecutiveSendErrors}): {ex.SocketErrorCode} - {ex.Message}");
+                        BaluLogger.Error("[TransportManager]", $"TCP send socket error for client {client.Id} (error count: {client.ConsecutiveSendErrors}): {ex.SocketErrorCode} - {ex.Message}");
                         if (client.ConsecutiveSendErrors >= 10)
                         {
                             client.IsPlaying = false;
-                            Log.Error("[TransportManager]", $"Client {client.Id} marked for cleanup - too many socket errors");
+                            BaluLogger.Error("[TransportManager]", $"Client {client.Id} marked for cleanup - too many socket errors");
                         }
                     }
                 }
                 else
                 {
-                    Log.Error("[TransportManager]", $"TCP send socket error: {ex.SocketErrorCode} - {ex.Message}");
+                    BaluLogger.Error("[TransportManager]", $"TCP send socket error: {ex.SocketErrorCode} - {ex.Message}");
                 }
                 return false;
             }
@@ -401,17 +401,17 @@ public class TransportManager : ITransportManager
                     lock (client)
                     {
                         client.ConsecutiveSendErrors++;
-                        Log.Error("[TransportManager]", $"TCP send error for client {client.Id} (error count: {client.ConsecutiveSendErrors}): {ex.Message}");
+                        BaluLogger.Error("[TransportManager]", $"TCP send error for client {client.Id} (error count: {client.ConsecutiveSendErrors}): {ex.Message}");
                         if (client.ConsecutiveSendErrors >= 10)
                         {
                             client.IsPlaying = false;
-                            Log.Error("[TransportManager]", $"Client {client.Id} marked for cleanup after {client.ConsecutiveSendErrors} errors");
+                            BaluLogger.Error("[TransportManager]", $"Client {client.Id} marked for cleanup after {client.ConsecutiveSendErrors} errors");
                         }
                     }
                 }
                 else
                 {
-                    Log.Error("[TransportManager]", $"TCP send error: {ex.Message}");
+                    BaluLogger.Error("[TransportManager]", $"TCP send error: {ex.Message}");
                 }
                 return false;
             }
@@ -445,7 +445,7 @@ public class TransportManager : ITransportManager
             lock (client)
             {
                 client.ConsecutiveSendErrors++;
-                Log.Error("[TransportManager]", $"UDP send error for client {client.Id} (error count: {client.ConsecutiveSendErrors}): {ex.SocketErrorCode} - {ex.Message}");
+                BaluLogger.Error("[TransportManager]", $"UDP send error for client {client.Id} (error count: {client.ConsecutiveSendErrors}): {ex.SocketErrorCode} - {ex.Message}");
 
                 // Mark client for cleanup if persistent errors
                 if (ex.SocketErrorCode == SocketError.HostUnreachable ||
@@ -453,7 +453,7 @@ public class TransportManager : ITransportManager
                     client.ConsecutiveSendErrors >= 5)
                 {
                     client.IsPlaying = false;
-                    Log.Warn("[TransportManager]", $"Client {client.Id} marked for cleanup - unreachable or too many UDP errors");
+                    BaluLogger.Warn("[TransportManager]", $"Client {client.Id} marked for cleanup - unreachable or too many UDP errors");
                 }
             }
             return false;

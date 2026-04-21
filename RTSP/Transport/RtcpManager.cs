@@ -126,11 +126,11 @@ public class RtcpManager : IRtcpManager
                 client.LastSenderReportTime = DateTime.UtcNow;
             }
 
-            Log.Debug("[RtcpManager]", $"Sent RTCP SR to client {client.Id}");
+            BaluLogger.Debug("[RtcpManager]", $"Sent RTCP SR to client {client.Id}");
         }
         catch (Exception ex)
         {
-            Log.Error("[RtcpManager]", $"Error sending RTCP SR: {ex.Message}");
+            BaluLogger.Error("[RtcpManager]", $"Error sending RTCP SR: {ex.Message}");
         }
     }
 
@@ -165,13 +165,13 @@ public class RtcpManager : IRtcpManager
                 {
                     if (buffer[1] == 203) // BYE
                     {
-                        Log.Info("[RtcpManager]", $"Client {client.Id} sent RTCP BYE packet - graceful disconnect");
+                        BaluLogger.Info("[RtcpManager]", $"Client {client.Id} sent RTCP BYE packet - graceful disconnect");
                         ClientCleanupRequired?.Invoke(this, client);
                         break;
                     }
                     else if (buffer[1] == 201) // RR (Receiver Report)
                     {
-                        Log.Debug("[RtcpManager]", $"Received RTCP Receiver Report from client {client.Id}");
+                        BaluLogger.Debug("[RtcpManager]", $"Received RTCP Receiver Report from client {client.Id}");
                         HandleRtcpReport(client, buffer);
                     }
                 }
@@ -182,13 +182,13 @@ public class RtcpManager : IRtcpManager
                 if (_cancellationToken.IsCancellationRequested)
                 {
                     // Server shutdown - just exit quietly
-                    Log.Debug("[RtcpManager]", $"RTCP listener for client {client.Id} stopped - server shutdown");
+                    BaluLogger.Debug("[RtcpManager]", $"RTCP listener for client {client.Id} stopped - server shutdown");
                     break;
                 }
                 else
                 {
                     // Timeout - client inactive (no RTCP packets received)
-                    Log.Warn("[RtcpManager]", $"RTCP listener timeout (120s) for client {client.Id} - no RTCP packets received");
+                    BaluLogger.Warn("[RtcpManager]", $"RTCP listener timeout (120s) for client {client.Id} - no RTCP packets received");
                     ClientCleanupRequired?.Invoke(this, client);
                     break;
                 }
@@ -196,18 +196,18 @@ public class RtcpManager : IRtcpManager
             catch (ObjectDisposedException)
             {
                 // Socket was disposed - client disconnected
-                Log.Debug("[RtcpManager]", $"RTCP listener for client {client.Id} stopped - socket disposed");
+                BaluLogger.Debug("[RtcpManager]", $"RTCP listener for client {client.Id} stopped - socket disposed");
                 break;
             }
             catch (SocketException ex)
             {
                 // Socket error - client disconnected
-                Log.Warn("[RtcpManager]", $"RTCP listener for client {client.Id} stopped - socket error: {ex.SocketErrorCode}");
+                BaluLogger.Warn("[RtcpManager]", $"RTCP listener for client {client.Id} stopped - socket error: {ex.SocketErrorCode}");
                 break;
             }
             catch (Exception ex)
             {
-                Log.Warn("[RtcpManager]", $"RTCP listener for client {client.Id} stopped: {ex.Message}");
+                BaluLogger.Warn("[RtcpManager]", $"RTCP listener for client {client.Id} stopped: {ex.Message}");
                 break;
             }
         }

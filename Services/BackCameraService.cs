@@ -100,11 +100,11 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
             _cameraCapture.SetBackCameraCallback(this);
             _loggedFirstProcessedFrame = false;
             _cameraCapture?.StartBackCameraCapture(width, height);
-            global::Android.Util.Log.Info("[BackCameraService]", $"StartCapture({width}x{height}): camera started, channel capacity={_channelCapacity}, cts cancelled={_cts.IsCancellationRequested}");
+            BaluLogger.Info("[BackCameraService]", $"StartCapture({width}x{height}): camera started, channel capacity={_channelCapacity}, cts cancelled={_cts.IsCancellationRequested}");
         }
         catch (Exception ex)
         {
-            global::Android.Util.Log.Error("[BackCameraService]", $"StartCapture({width}x{height}) FAILED: {ex.Message}");
+            BaluLogger.Error("[BackCameraService]", $"StartCapture({width}x{height}) FAILED: {ex.Message}");
             SafeInvokeError($"Failed to start capture: {ex.Message}");
         }
     }
@@ -246,7 +246,7 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
         if (!_loggedFirstProcessedFrame)
         {
             _loggedFirstProcessedFrame = true;
-            global::Android.Util.Log.Info("[BackCameraService]", $"First processed frame: {args.Width}x{args.Height}, {args.Data?.Length ?? 0} bytes, subscribers={FrameReceived?.GetInvocationList().Length ?? 0}");
+            BaluLogger.Info("[BackCameraService]", $"First processed frame: {args.Width}x{args.Height}, {args.Data?.Length ?? 0} bytes, subscribers={FrameReceived?.GetInvocationList().Length ?? 0}");
         }
 
         try
@@ -346,7 +346,7 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
                 {
                     if (!_thread.Wait(TimeSpan.FromSeconds(5)))
                     {
-                        global::Android.Util.Log.Warn("[BackCameraService]", "Processing task did not stop within 5s timeout");
+                        BaluLogger.Warn("[BackCameraService]", "Processing task did not stop within 5s timeout");
                     }
                 }
                 catch { }

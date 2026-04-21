@@ -116,7 +116,7 @@ public class StreamingController : IStreamingController
     /// </remarks>
     public async Task StreamToClientAsync(Models.Client client, CancellationToken cancellationToken)
     {
-        Log.Debug("[StreamingController]", $"Starting stream to client {client.Id} using {client.Transport}");
+        BaluLogger.Debug("[StreamingController]", $"Starting stream to client {client.Id} using {client.Transport}");
 
         // Register per-client channel before starting the encoder so no frames are missed.
         // The fan-out in H264EncoderManager writes every encoded frame into this client's channel.
@@ -143,7 +143,7 @@ public class StreamingController : IStreamingController
             }
             catch (Exception ex)
             {
-                Log.Error("[StreamingController]", $"CameraStartRequested subscriber error: {ex.Message}");
+                BaluLogger.Error("[StreamingController]", $"CameraStartRequested subscriber error: {ex.Message}");
             }
 
             try
@@ -152,7 +152,7 @@ public class StreamingController : IStreamingController
             }
             catch (Exception ex)
             {
-                Log.Error("[StreamingController]", $"StreamingStateChanged subscriber error: {ex.Message}");
+                BaluLogger.Error("[StreamingController]", $"StreamingStateChanged subscriber error: {ex.Message}");
             }
 
             if (client.Codec == CodecType.H264)
@@ -164,7 +164,7 @@ public class StreamingController : IStreamingController
         else if (client.Codec == CodecType.H264 && !_encoderManager.IsEncoderRunning(client.CameraId))
         {
             // Encoder stalled since first client — restart it
-            Log.Info("[StreamingController]", $"Encoder stalled for camera {client.CameraId} — restarting");
+            BaluLogger.Info("[StreamingController]", $"Encoder stalled for camera {client.CameraId} — restarting");
             await WaitForFrameAndStartEncoder(client, cancellationToken).ConfigureAwait(false);
         }
 
@@ -187,6 +187,12 @@ public class StreamingController : IStreamingController
         // produce the next frame without triggering a premature encoder restart loop.
         const int warmupTimeoutCount = 15;
         const int activeTimeoutCount = 25;
+        // How many times to attempt camera+encoder restart before giving up and disconnecting
+        // the client (which signals the outer watchdog to do a full server restart).
+        // Each attempt includes a ~10s WaitForFrameAndStartEncoder timeout, so 3 attempts
+        // gives ~30s of transparent recovery before the client is killed.
+        const int MaxStallRecoveryAttempts = 3;
+        int stallRecoveryAttempts = 0;
 
         // Pre-allocate per-session state to avoid per-frame allocations in the hot path.
         // nalSendBuffer is cleared and reused on every frame; the list header is allocated once.
@@ -195,7 +201,7 @@ public class StreamingController : IStreamingController
 
         try
         {
-            Log.Info("[StreamingController]", $"Entering streaming loop for client {client.Id} (codec={client.Codec}, transport={client.Transport}, isPlaying={client.IsPlaying})");
+            BaluLogger.Info("[StreamingController]", $"Entering streaming loop for client {client.Id} (codec={client.Codec}, transport={client.Transport}, isPlaying={client.IsPlaying})");
 
             while (client.IsPlaying && !cancellationToken.IsCancellationRequested)
             {
@@ -206,7 +212,7 @@ public class StreamingController : IStreamingController
                 // falsely detects disconnection and breaks the streaming loop.
                 if (client.ConsecutiveSendErrors >= 10)
                 {
-                    Log.Warn("[StreamingController]", $"Client {client.Id} disconnecting - {client.ConsecutiveSendErrors} consecutive send errors (transport: {client.Transport})");
+                    BaluLogger.Warn("[StreamingController]", $"Client {client.Id} disconnecting - {client.ConsecutiveSendErrors} consecutive send errors (transport: {client.Transport})");
                     break;
                 }
 
@@ -227,7 +233,8 @@ public class StreamingController : IStreamingController
 
                         if (consecutiveTimeouts >= maxTimeouts)
                         {
-                            Log.Warn("[StreamingController]", $"No frames for {consecutiveTimeouts * FrameDequeueTimeoutMs}ms on camera {client.CameraId} (running={_encoderManager.IsEncoderRunning(client.CameraId)}, warmup={!gotFirstFrame}) — restarting camera+encoder");
+                            stallRecoveryAttempts++;
+                            BaluLogger.Warn("[StreamingController]", $"No frames for {consecutiveTimeouts * FrameDequeueTimeoutMs}ms on camera {client.CameraId} (running={_encoderManager.IsEncoderRunning(client.CameraId)}, warmup={!gotFirstFrame}) — recovery attempt {stallRecoveryAttempts}/{MaxStallRecoveryAttempts}");
                             try
                             {
                                 _encoderManager.StopEncoder(client.CameraId);
@@ -241,13 +248,24 @@ public class StreamingController : IStreamingController
                                 await WaitForFrameAndStartEncoder(client, cancellationToken).ConfigureAwait(false);
                                 _encoderManager.RequestKeyFrame(client.CameraId);
                                 consecutiveTimeouts = 0;
-                                gotFirstFrame = false; // reset for the new encoder session
-                                Log.Info("[StreamingController]", $"Camera+encoder restarted successfully for camera {client.CameraId}");
+                                gotFirstFrame = false;
+                                stallRecoveryAttempts = 0; // successful recovery — reset counter
+                                BaluLogger.Info("[StreamingController]", $"Camera+encoder restarted successfully for camera {client.CameraId}");
                             }
                             catch (TimeoutException)
                             {
-                                Log.Error("[StreamingController]", $"Restart failed (no frames from camera {client.CameraId} after camera restart) — disconnecting client");
-                                break;
+                                if (stallRecoveryAttempts >= MaxStallRecoveryAttempts)
+                                {
+                                    BaluLogger.Error("[StreamingController]", $"All {MaxStallRecoveryAttempts} recovery attempts exhausted for camera {client.CameraId} — disconnecting client to trigger full restart");
+                                    break;
+                                }
+
+                                // Camera did not recover yet — keep client connected and retry
+                                // after another stall window (~5s). The outer watchdog will do a
+                                // full server restart if we eventually exhaust all attempts.
+                                BaluLogger.Warn("[StreamingController]", $"Recovery attempt {stallRecoveryAttempts}/{MaxStallRecoveryAttempts} failed for camera {client.CameraId} — retrying in ~{activeTimeoutCount * FrameDequeueTimeoutMs}ms");
+                                consecutiveTimeouts = 0;
+                                gotFirstFrame = false;
                             }
                         }
                     }
@@ -272,11 +290,11 @@ public class StreamingController : IStreamingController
             }
 
             // Log why we exited
-            Log.Info("[StreamingController]", $"Streaming loop exited for client {client.Id}: IsPlaying={client.IsPlaying}, Cancelled={cancellationToken.IsCancellationRequested}, SendErrors={client.ConsecutiveSendErrors}");
+            BaluLogger.Info("[StreamingController]", $"Streaming loop exited for client {client.Id}: IsPlaying={client.IsPlaying}, Cancelled={cancellationToken.IsCancellationRequested}, SendErrors={client.ConsecutiveSendErrors}");
         }
         catch (Exception ex)
         {
-            Log.Error("[StreamingController]", $"Streaming error for client {client.Id}: {ex.GetType().Name}: {ex.Message}");
+            BaluLogger.Error("[StreamingController]", $"Streaming error for client {client.Id}: {ex.GetType().Name}: {ex.Message}");
         }
         finally
         {
@@ -325,22 +343,22 @@ public class StreamingController : IStreamingController
 
         if (frameSize != expectedSize)
         {
-            Log.Info("[StreamingController]", $"Frame has stride padding: {frameSize} bytes (image: {reportedWidth}x{reportedHeight} = {expectedSize} bytes)");
+            BaluLogger.Info("[StreamingController]", $"Frame has stride padding: {frameSize} bytes (image: {reportedWidth}x{reportedHeight} = {expectedSize} bytes)");
         }
 
-        Log.Info("[StreamingController]", $"Starting H264 encoder with {reportedWidth}x{reportedHeight}");
+        BaluLogger.Info("[StreamingController]", $"Starting H264 encoder with {reportedWidth}x{reportedHeight}");
         _encoderManager.StartEncoder(client.CameraId, reportedWidth, reportedHeight, frameSize);
 
         // Check if encoder fell back to a different resolution
         var (actualW, actualH) = _encoderManager.GetActualResolution(client.CameraId);
         if (actualW > 0 && actualH > 0 && (actualW != reportedWidth || actualH != reportedHeight))
         {
-            Log.Warn("[StreamingController]", $"Encoder fell back to {actualW}x{actualH} — requesting camera restart");
+            BaluLogger.Warn("[StreamingController]", $"Encoder fell back to {actualW}x{actualH} — requesting camera restart");
             // This stops the encoder and restarts the camera at the encoder's actual resolution
             EncoderResolutionFallback?.Invoke(this, (client.CameraId, actualW, actualH));
 
             // Wait for camera to produce frames at the new resolution, then restart encoder
-            Log.Info("[StreamingController]", $"Waiting for camera to produce {actualW}x{actualH} frames...");
+            BaluLogger.Info("[StreamingController]", $"Waiting for camera to produce {actualW}x{actualH} frames...");
             frame = null;
             retries = 0;
             const int maxFallbackRetries = 50; // More retries — camera restart takes longer
@@ -355,7 +373,7 @@ public class StreamingController : IStreamingController
                 await Task.Delay(delayMs, cancellationToken).ConfigureAwait(false);
             }
 
-            Log.Info("[StreamingController]", $"Got frame at {frame.Width}x{frame.Height} after camera restart, starting encoder");
+            BaluLogger.Info("[StreamingController]", $"Got frame at {frame.Width}x{frame.Height} after camera restart, starting encoder");
             _encoderManager.StartEncoder(client.CameraId, frame.Width, frame.Height, frame.Data.Length);
         }
     }
@@ -393,7 +411,7 @@ public class StreamingController : IStreamingController
                 if (h264Frame == null)
                 {
                     if (!cancellationToken.IsCancellationRequested)
-                        Log.Warn("[StreamingController]", $"Frame dequeue timeout ({FrameDequeueTimeoutMs}ms) - encoder may be stalled for camera {client.CameraId}");
+                        BaluLogger.Warn("[StreamingController]", $"Frame dequeue timeout ({FrameDequeueTimeoutMs}ms) - encoder may be stalled for camera {client.CameraId}");
                     return false;
                 }
             }
@@ -408,7 +426,7 @@ public class StreamingController : IStreamingController
                 if (h264Frame == null)
                 {
                     if (!cancellationToken.IsCancellationRequested)
-                        Log.Warn("[StreamingController]", $"Frame dequeue timeout ({FrameDequeueTimeoutMs}ms) - encoder may be stalled for camera {client.CameraId}");
+                        BaluLogger.Warn("[StreamingController]", $"Frame dequeue timeout ({FrameDequeueTimeoutMs}ms) - encoder may be stalled for camera {client.CameraId}");
                     return false;
                 }
             }
@@ -521,7 +539,7 @@ public class StreamingController : IStreamingController
                 double queueMs = (dequeuedAt  - h264Frame.EncodedAt) * 1000.0 / freq;
                 double buildMs = (preSendAt   - dequeuedAt)          * 1000.0 / freq;
                 double sendMs  = (postSendAt  - preSendAt)            * 1000.0 / freq;
-                Log.Info("H264Latency", $"Stream path: queue={queueMs:F1}ms build={buildMs:F1}ms send={sendMs:F1}ms (client {client.Id[..8]}, frame {client.FrameCount})");
+                BaluLogger.Info("H264Latency", $"Stream path: queue={queueMs:F1}ms build={buildMs:F1}ms send={sendMs:F1}ms (client {client.Id[..8]}, frame {client.FrameCount})");
             }
 
             return true;
@@ -529,13 +547,13 @@ public class StreamingController : IStreamingController
         catch (ObjectDisposedException)
         {
             // Client was disposed (CleanupClient called) — stop streaming immediately
-            Log.Info("[StreamingController]", $"Client disposed, stopping H264 stream");
+            BaluLogger.Info("[StreamingController]", $"Client disposed, stopping H264 stream");
             client.IsPlaying = false;
             return false;
         }
         catch (Exception ex)
         {
-            Log.Error("[StreamingController]", $"H264 streaming error: {ex.Message}");
+            BaluLogger.Error("[StreamingController]", $"H264 streaming error: {ex.Message}");
             return false;
         }
     }
@@ -600,7 +618,7 @@ public class StreamingController : IStreamingController
         }
         catch (Exception ex)
         {
-            Log.Error("[StreamingController]", $"MJPEG streaming error: {ex.Message}");
+            BaluLogger.Error("[StreamingController]", $"MJPEG streaming error: {ex.Message}");
         }
     }
 

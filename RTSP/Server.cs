@@ -36,6 +36,7 @@ public class Server : IDisposable
     private volatile bool _isCapturingFront;
     private volatile bool _isCapturingBack;
     private bool _mjpegServerEnabled;
+    private bool? _lastReportedStreamingState; // null = never reported; only fire OnStreaming on actual change
 
     // Camera configuration
     private int _backCameraWidth, _backCameraHeight, _frontCameraWidth, _frontCameraHeight;
@@ -168,12 +169,12 @@ public class Server : IDisposable
         _clientManager.OnClientsChange += clients =>
         {
             try { OnClientsChange?.Invoke(clients); }
-            catch (Exception ex) { Log.Error("[RTSP Server]", $"OnClientsChange subscriber error: {ex.Message}"); }
+            catch (Exception ex) { BaluLogger.Error("[RTSP Server]", $"OnClientsChange subscriber error: {ex.Message}"); }
         };
         _streamingController.StreamingStateChanged += (_, streaming) =>
         {
             try { OnStreaming?.Invoke(this, streaming); }
-            catch (Exception ex) { Log.Error("[RTSP Server]", $"OnStreaming subscriber error: {ex.Message}"); }
+            catch (Exception ex) { BaluLogger.Error("[RTSP Server]", $"OnStreaming subscriber error: {ex.Message}"); }
         };
         _streamingController.CameraStartRequested += OnCameraStartRequested;
         _streamingController.EncoderResolutionFallback += OnEncoderResolutionFallback;
@@ -306,14 +307,14 @@ public class Server : IDisposable
             var (backW, backH) = H264Encoder.ProbeSupportedResolution(_backCameraWidth, _backCameraHeight);
             if (backW != _backCameraWidth || backH != _backCameraHeight)
             {
-                Log.Info("[RTSP Server]", $"Adjusting back camera resolution to encoder-supported {backW}x{backH} (was {_backCameraWidth}x{_backCameraHeight})");
+                BaluLogger.Info("[RTSP Server]", $"Adjusting back camera resolution to encoder-supported {backW}x{backH} (was {_backCameraWidth}x{_backCameraHeight})");
                 _backCameraWidth = backW;
                 _backCameraHeight = backH;
             }
             var (frontW, frontH) = H264Encoder.ProbeSupportedResolution(_frontCameraWidth, _frontCameraHeight);
             if (frontW != _frontCameraWidth || frontH != _frontCameraHeight)
             {
-                Log.Info("[RTSP Server]", $"Adjusting front camera resolution to encoder-supported {frontW}x{frontH} (was {_frontCameraWidth}x{_frontCameraHeight})");
+                BaluLogger.Info("[RTSP Server]", $"Adjusting front camera resolution to encoder-supported {frontW}x{frontH} (was {_frontCameraWidth}x{_frontCameraHeight})");
                 _frontCameraWidth = frontW;
                 _frontCameraHeight = frontH;
             }
@@ -335,13 +336,43 @@ public class Server : IDisposable
     /// </summary>
     public void Stop()
     {
-        Log.Warn("[RTSP Server]", $"Stop() called - stack trace: {Environment.StackTrace}");
+        BaluLogger.Warn("[RTSP Server]", $"Stop() called - stack trace: {Environment.StackTrace}");
         IsRunning = false;
         EventBuss.Command -= OnCommandSend;
         _cts?.Cancel();
         _cts = new();
+
+        // Unsubscribe camera events before stopping cameras so no stale frames reach handlers
         _backService.FrameReceived -= OnBackFrameAvailable;
         _frontService.FrameReceived -= OnFrontFrameAvailable;
+
+        // Stop cameras so the AAR's camera2 session is fully torn down and recreated on Start().
+        // Without this, a hung camera2 session persists across Stop/Start and RestartCameraForStallRecovery
+        // cannot recover it because it calls the same already-stuck service.
+        if (_isCapturingBack)
+        {
+            try { _backService.StopCapture(); } catch (Exception ex) { BaluLogger.Warn("[RTSP Server]", $"Stop: back camera stop error: {ex.Message}"); }
+            _isCapturingBack = false;
+        }
+        if (_isCapturingFront)
+        {
+            try { _frontService.StopCapture(); } catch (Exception ex) { BaluLogger.Warn("[RTSP Server]", $"Stop: front camera stop error: {ex.Message}"); }
+            _isCapturingFront = false;
+        }
+
+        // Reset streaming flag so the first new client after Start() wins the CAS gate correctly
+        if (_isStreaming)
+        {
+            _isStreaming = false;
+            _streamingController.SetStreamingState(false);
+        }
+
+        // Clear client list so stale clients from the previous session don't appear in WatchDog
+        _clientManager.ClearAllClients();
+
+        // Reset last-reported state so WatchDog fires the correct initial state after Start()
+        _lastReportedStreamingState = null;
+
         _mjpegServer?.Stop();
         _socket.Close();
         _socket?.Dispose();
@@ -352,7 +383,7 @@ public class Server : IDisposable
     /// </summary>
     public void Dispose()
     {
-        Log.Warn("[RTSP Server]", $"Dispose() called - stack trace: {Environment.StackTrace}");
+        BaluLogger.Warn("[RTSP Server]", $"Dispose() called - stack trace: {Environment.StackTrace}");
         IsRunning = false;
         EventBuss.Command -= OnCommandSend;
         _mjpegServer?.Dispose();
@@ -375,9 +406,9 @@ public class Server : IDisposable
     private void LogError(object? sender, string error)
     {
         if (sender is FrontCameraService)
-            Log.Error("FRONT CAMERA SERVICE ERROR", error);
+            BaluLogger.Error("FRONT CAMERA SERVICE ERROR", error);
         else
-            Log.Error("BACK CAMERA SERVICE ERROR", error);
+            BaluLogger.Error("BACK CAMERA SERVICE ERROR", error);
     }
 
     private Socket CreateConfiguredSocket()
@@ -403,7 +434,7 @@ public class Server : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Warn("[RTSP Server]", $"Socket bind failed, retrying: {ex.Message}");
+            BaluLogger.Warn("[RTSP Server]", $"Socket bind failed, retrying: {ex.Message}");
             try
             {
                 _socket?.Close();
@@ -414,7 +445,7 @@ public class Server : IDisposable
             }
             catch (Exception retryEx)
             {
-                Log.Error("[RTSP Server]", $"Socket configuration failed: {retryEx.Message}");
+                BaluLogger.Error("[RTSP Server]", $"Socket configuration failed: {retryEx.Message}");
                 throw; // Re-throw to caller - socket cannot be configured
             }
         }
@@ -444,7 +475,7 @@ public class Server : IDisposable
                 case BussCommand.STOP_CAMERA_FRONT:
                     // NOTE: Camera stop disabled for continuous streaming to prevent interruptions
                     // To stop cameras, use the explicit Stop() method or stop the server
-                    Log.Debug("[RTSP Server]", "STOP_CAMERA_FRONT command ignored - continuous streaming mode enabled");
+                    BaluLogger.Debug("[RTSP Server]", "STOP_CAMERA_FRONT command ignored - continuous streaming mode enabled");
                     break;
                 case BussCommand.START_CAMERA_BACK:
                     lock (_backCameraLock)
@@ -464,7 +495,7 @@ public class Server : IDisposable
                 case BussCommand.STOP_CAMERA_BACK:
                     // NOTE: Camera stop disabled for continuous streaming to prevent interruptions
                     // To stop cameras, use the explicit Stop() method or stop the server
-                    Log.Debug("[RTSP Server]", "STOP_CAMERA_BACK command ignored - continuous streaming mode enabled");
+                    BaluLogger.Debug("[RTSP Server]", "STOP_CAMERA_BACK command ignored - continuous streaming mode enabled");
                     break;
                 case BussCommand.START_MJPEG_SERVER:
                     if (!_mjpegServerEnabled)
@@ -477,7 +508,7 @@ public class Server : IDisposable
                 case BussCommand.STOP_MJPEG_SERVER:
                     // NOTE: MJPEG server stop disabled for continuous streaming to prevent interruptions
                     // To stop the MJPEG server, use the explicit Stop() method or stop the RTSP server
-                    Log.Debug("[RTSP Server]", "STOP_MJPEG_SERVER command ignored - continuous streaming mode enabled");
+                    BaluLogger.Debug("[RTSP Server]", "STOP_MJPEG_SERVER command ignored - continuous streaming mode enabled");
                     break;
                 case BussCommand.SWITCH_CAMERA:
                     // Implementation unchanged
@@ -486,7 +517,7 @@ public class Server : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Error("BALU MEDIA SERVER SERVER", ex.Message);
+            BaluLogger.Error("BALU MEDIA SERVER SERVER", ex.Message);
         }
     }
 
@@ -499,7 +530,7 @@ public class Server : IDisposable
             if (!_loggedFirstBackFrame)
             {
                 _loggedFirstBackFrame = true;
-                Log.Info("[RTSP Server]", $"First back frame received: {arg.Width}x{arg.Height}, {arg.Data.Length} bytes");
+                BaluLogger.Info("[RTSP Server]", $"First back frame received: {arg.Width}x{arg.Height}, {arg.Data.Length} bytes");
             }
 #if ANDROID
             // Lazy-init overlay on first frame (dimensions only known at runtime).
@@ -515,6 +546,7 @@ public class Server : IDisposable
             // Stamp in-place before all consumers so H264, MJPEG, and event subscribers
             // all receive frames with the overlay already burned in.
             _backFrameOverlay?.StampInto(arg.Data, arg.Width, arg.Height);
+            SanitizeNv21BottomUv(arg.Data, arg.Width, arg.Height);
 #endif
             lock (_frameBackLock)
             {
@@ -522,7 +554,7 @@ public class Server : IDisposable
                 _latestBackFrame = arg;
                 if (wasNull && _getLatestFrameNullCount > 0)
                 {
-                    Log.Info("[RTSP Server]", $"Back frame restored after {_getLatestFrameNullCount} null reads: {arg.Width}x{arg.Height}, {arg.Data.Length} bytes");
+                    BaluLogger.Info("[RTSP Server]", $"Back frame restored after {_getLatestFrameNullCount} null reads: {arg.Width}x{arg.Height}, {arg.Data.Length} bytes");
                 }
             }
             // Feed encoder FIRST — lowest latency path. Event subscribers run after.
@@ -539,7 +571,7 @@ public class Server : IDisposable
             }
             catch (Exception ex)
             {
-                Log.Error("[RTSP Server]", $"OnNewBackFrame subscriber error: {ex.Message}");
+                BaluLogger.Error("[RTSP Server]", $"OnNewBackFrame subscriber error: {ex.Message}");
             }
         }
     }
@@ -557,6 +589,7 @@ public class Server : IDisposable
                     : null; // no overlay on front by default
             }
             _frontFrameOverlay?.StampInto(arg.Data, arg.Width, arg.Height);
+            SanitizeNv21BottomUv(arg.Data, arg.Width, arg.Height);
 #endif
             lock (_frameFrontLock)
             {
@@ -576,7 +609,7 @@ public class Server : IDisposable
             }
             catch (Exception ex)
             {
-                Log.Error("[RTSP Server]", $"OnNewFrontFrame subscriber error: {ex.Message}");
+                BaluLogger.Error("[RTSP Server]", $"OnNewFrontFrame subscriber error: {ex.Message}");
             }
         }
     }
@@ -600,7 +633,7 @@ public class Server : IDisposable
                     // Log only every 10th call to avoid flooding logcat
                     if (++_getLatestFrameNullCount % 10 == 1)
                     {
-                        Log.Info("[RTSP Server]", $"GetLatestFrame(back): null (x{_getLatestFrameNullCount}), isCapturing={_isCapturingBack}, isStreaming={_isStreaming}");
+                        BaluLogger.Info("[RTSP Server]", $"GetLatestFrame(back): null (x{_getLatestFrameNullCount}), isCapturing={_isCapturingBack}, isStreaming={_isStreaming}");
                     }
                 }
                 else
@@ -628,19 +661,23 @@ public class Server : IDisposable
             {
                 _backService.StartCapture(_backCameraWidth, _backCameraHeight);
                 _isCapturingBack = true;
-                Log.Info("[RTSP Server]", "Pre-started back camera at SETUP time");
+                BaluLogger.Info("[RTSP Server]", "Pre-started back camera at SETUP time");
             }
             else if (client.CameraId == 1 && !_isCapturingFront && _frontCameraEnabled)
             {
                 _frontService.StartCapture(_frontCameraWidth, _frontCameraHeight);
                 _isCapturingFront = true;
-                Log.Info("[RTSP Server]", "Pre-started front camera at SETUP time");
+                BaluLogger.Info("[RTSP Server]", "Pre-started front camera at SETUP time");
             }
         }
 
-        // Enable frame feeding to encoder
-        _isStreaming = true;
-        _streamingController.SetStreamingState(true);
+        // Enable frame feeding to encoder — guard so SetStreamingState fires only on the false→true
+        // transition, not on every subsequent SETUP from a second/third client.
+        if (!_isStreaming)
+        {
+            _isStreaming = true;
+            _streamingController.SetStreamingState(true);
+        }
 
         // Pre-warm H.264 encoder in background (needs first frame for dimensions)
         if (client.Codec == CodecType.H264 && !_encoderManager.IsEncoderRunning(client.CameraId))
@@ -663,7 +700,7 @@ public class Server : IDisposable
             var h = _backCameraHeight;
             lock (_backCameraLock)
             {
-                Log.Info("[RTSP Server]", $"Stall recovery: restarting back camera {w}x{h}");
+                BaluLogger.Info("[RTSP Server]", $"Stall recovery: restarting back camera {w}x{h}");
                 _backService.StopCapture();
                 lock (_frameBackLock) { _latestBackFrame = null; }
                 _isCapturingBack = false;
@@ -677,7 +714,7 @@ public class Server : IDisposable
             var h = _frontCameraHeight;
             lock (_frontCameraLock)
             {
-                Log.Info("[RTSP Server]", $"Stall recovery: restarting front camera {w}x{h}");
+                BaluLogger.Info("[RTSP Server]", $"Stall recovery: restarting front camera {w}x{h}");
                 _frontService.StopCapture();
                 lock (_frameFrontLock) { _latestFrontFrame = null; }
                 _isCapturingFront = false;
@@ -726,7 +763,7 @@ public class Server : IDisposable
             {
                 if (_backCameraWidth == actualW && _backCameraHeight == actualH)
                     return;
-                Log.Info("[RTSP Server]", $"Encoder fallback: restarting back camera {_backCameraWidth}x{_backCameraHeight} -> {actualW}x{actualH}");
+                BaluLogger.Info("[RTSP Server]", $"Encoder fallback: restarting back camera {_backCameraWidth}x{_backCameraHeight} -> {actualW}x{actualH}");
                 _backCameraWidth = actualW;
                 _backCameraHeight = actualH;
                 _encoderManager.StopEncoder(cameraId);
@@ -743,7 +780,7 @@ public class Server : IDisposable
             {
                 if (_frontCameraWidth == actualW && _frontCameraHeight == actualH)
                     return;
-                Log.Info("[RTSP Server]", $"Encoder fallback: restarting front camera {_frontCameraWidth}x{_frontCameraHeight} -> {actualW}x{actualH}");
+                BaluLogger.Info("[RTSP Server]", $"Encoder fallback: restarting front camera {_frontCameraWidth}x{_frontCameraHeight} -> {actualW}x{actualH}");
                 _frontCameraWidth = actualW;
                 _frontCameraHeight = actualH;
                 _encoderManager.StopEncoder(cameraId);
@@ -786,7 +823,7 @@ public class Server : IDisposable
             if (oldWidth == newWidth && oldHeight == newHeight)
                 return;
 
-            Log.Info("[RTSP Server]", $"Resolution change for {(cameraId == 0 ? "back" : "front")} camera: {oldWidth}x{oldHeight} -> {newWidth}x{newHeight}");
+            BaluLogger.Info("[RTSP Server]", $"Resolution change for {(cameraId == 0 ? "back" : "front")} camera: {oldWidth}x{oldHeight} -> {newWidth}x{newHeight}");
 
             // Update resolution fields
             if (cameraId == 0)
@@ -804,13 +841,13 @@ public class Server : IDisposable
             bool isCameraRunning = cameraId == 0 ? _isCapturingBack : _isCapturingFront;
             if (!isCameraRunning)
             {
-                Log.Info("[RTSP Server]", $"Camera {cameraId} not running, resolution will apply on next start");
+                BaluLogger.Info("[RTSP Server]", $"Camera {cameraId} not running, resolution will apply on next start");
                 return;
             }
 
             // Stop H.264 encoder
             _encoderManager.StopEncoder(cameraId);
-            Log.Info("[RTSP Server]", $"Stopped H264 encoder for camera {cameraId}");
+            BaluLogger.Info("[RTSP Server]", $"Stopped H264 encoder for camera {cameraId}");
 
             // Clear SPS/PPS caches (old resolution params are invalid)
             _encoderManager.ClearSpsPps();
@@ -852,7 +889,7 @@ public class Server : IDisposable
                 _frontService.StartCapture(newWidth, newHeight);
                 _isCapturingFront = true;
             }
-            Log.Info("[RTSP Server]", $"Restarted {(cameraId == 0 ? "back" : "front")} camera at {newWidth}x{newHeight}");
+            BaluLogger.Info("[RTSP Server]", $"Restarted {(cameraId == 0 ? "back" : "front")} camera at {newWidth}x{newHeight}");
 
             // Pre-warm encoder in background
             PreWarmEncoderAsync(cameraId);
@@ -878,7 +915,7 @@ public class Server : IDisposable
         }
 
         if (disconnected > 0)
-            Log.Info("[RTSP Server]", $"Disconnected {disconnected} RTSP client(s) for camera {cameraId}");
+            BaluLogger.Info("[RTSP Server]", $"Disconnected {disconnected} RTSP client(s) for camera {cameraId}");
     }
 
     /// <summary>
@@ -900,7 +937,7 @@ public class Server : IDisposable
                 {
                     if (retries++ > maxRetries)
                     {
-                        Log.Warn("[RTSP Server]", $"Pre-warm timeout waiting for frame from camera {cameraId} after resolution change");
+                        BaluLogger.Warn("[RTSP Server]", $"Pre-warm timeout waiting for frame from camera {cameraId} after resolution change");
                         return;
                     }
                     int delayMs = Math.Min(10 * (1 << Math.Min(retries, 4)), 100);
@@ -913,14 +950,14 @@ public class Server : IDisposable
                 var (actualW, actualH) = _encoderManager.GetActualResolution(cameraId);
                 if (actualW > 0 && actualH > 0 && (actualW != frame.Width || actualH != frame.Height))
                 {
-                    Log.Warn("[RTSP Server]", $"Pre-warm: encoder fell back to {actualW}x{actualH} (camera: {frame.Width}x{frame.Height}) — restarting camera");
+                    BaluLogger.Warn("[RTSP Server]", $"Pre-warm: encoder fell back to {actualW}x{actualH} (camera: {frame.Width}x{frame.Height}) — restarting camera");
                     // Reuse the same fallback handler
                     OnEncoderResolutionFallback(this, (cameraId, actualW, actualH));
-                    Log.Info("[RTSP Server]", $"Camera {cameraId} restarted at {actualW}x{actualH} — encoder will be started by StreamingController");
+                    BaluLogger.Info("[RTSP Server]", $"Camera {cameraId} restarted at {actualW}x{actualH} — encoder will be started by StreamingController");
                 }
                 else
                 {
-                    Log.Info("[RTSP Server]", $"Pre-warmed H264 encoder for camera {cameraId}: {frame.Width}x{frame.Height}");
+                    BaluLogger.Info("[RTSP Server]", $"Pre-warmed H264 encoder for camera {cameraId}: {frame.Width}x{frame.Height}");
                 }
             }
             catch (OperationCanceledException)
@@ -929,7 +966,7 @@ public class Server : IDisposable
             }
             catch (Exception ex)
             {
-                Log.Error("[RTSP Server]", $"Pre-warm encoder error after resolution change: {ex.Message}");
+                BaluLogger.Error("[RTSP Server]", $"Pre-warm encoder error after resolution change: {ex.Message}");
             }
         }, _cts.Token);
     }
@@ -961,7 +998,7 @@ public class Server : IDisposable
 
                 if (deadClients.Count > 0)
                 {
-                    Log.Info("[RTSP Server]", $"WatchDog cleaning up {deadClients.Count} dead client(s)");
+                    BaluLogger.Info("[RTSP Server]", $"WatchDog cleaning up {deadClients.Count} dead client(s)");
                 }
 
                 foreach (var client in deadClients)
@@ -977,12 +1014,12 @@ public class Server : IDisposable
                 {
                     if (_encoderManager.IsEncoderRunning(0))
                     {
-                        Log.Info("[RTSP Server]", "WatchDog: no clients — stopping back H264 encoder (idle stall prevention)");
+                        BaluLogger.Info("[RTSP Server]", "WatchDog: no clients — stopping back H264 encoder (idle stall prevention)");
                         _encoderManager.StopEncoder(0);
                     }
                     if (_encoderManager.IsEncoderRunning(1))
                     {
-                        Log.Info("[RTSP Server]", "WatchDog: no clients — stopping front H264 encoder (idle stall prevention)");
+                        BaluLogger.Info("[RTSP Server]", "WatchDog: no clients — stopping front H264 encoder (idle stall prevention)");
                         _encoderManager.StopEncoder(1);
                     }
                     if (_isStreaming)
@@ -993,24 +1030,31 @@ public class Server : IDisposable
                 }
 
                 var mjpegClientCount = _mjpegServer?.ClientCount ?? 0;
-                Log.Debug("[RTSP Server]", $"WatchDog: Active clients: RTSP={playingClients}, MJPEG={mjpegClientCount}, Cameras: Back={_isCapturingBack}, Front={_isCapturingFront}, Streaming={_isStreaming}");
+                BaluLogger.Debug("[RTSP Server]", $"WatchDog: Active clients: RTSP={playingClients}, MJPEG={mjpegClientCount}, Cameras: Back={_isCapturingBack}, Front={_isCapturingFront}, Streaming={_isStreaming}");
             }
             catch (Exception ex)
             {
-                Log.Error("[RTSP Server]", $"WatchDog error: {ex.Message}");
+                BaluLogger.Error("[RTSP Server]", $"WatchDog error: {ex.Message}");
             }
 
-            // Report streaming state considering BOTH RTSP and MJPEG clients
-            // This prevents the "IDLE" state when only MJPEG clients are connected
+            // Report streaming state considering BOTH RTSP and MJPEG clients.
+            // Only fire OnStreaming when the state actually changes — firing every tick caused
+            // repeated "[STREAMING] ACTIVE" log entries in callers (e.g. every 5s while cameras
+            // run with no RTSP clients) and disrupted ServerService's stall-watchdog arm logic.
             var hasAnyClients = _isStreaming || (_mjpegServer?.ClientCount ?? 0) > 0;
             var camerasRunning = _isCapturingBack || _isCapturingFront;
-            try
+            bool newStreamingState = hasAnyClients || camerasRunning;
+            if (newStreamingState != _lastReportedStreamingState)
             {
-                OnStreaming?.Invoke(this, hasAnyClients || camerasRunning);
-            }
-            catch (Exception ex)
-            {
-                Log.Error("[RTSP Server]", $"OnStreaming subscriber error: {ex.Message}");
+                _lastReportedStreamingState = newStreamingState;
+                try
+                {
+                    OnStreaming?.Invoke(this, newStreamingState);
+                }
+                catch (Exception ex)
+                {
+                    BaluLogger.Error("[RTSP Server]", $"OnStreaming subscriber error: {ex.Message}");
+                }
             }
             await Task.Delay(5000, _cts.Token).ConfigureAwait(false);
         }
@@ -1033,7 +1077,7 @@ public class Server : IDisposable
                     }
                     catch (Exception ex)
                     {
-                        Log.Error("[RTSP Server]", $"HandleClient unhandled error: {ex.Message}");
+                        BaluLogger.Error("[RTSP Server]", $"HandleClient unhandled error: {ex.Message}");
                     }
                 }, _cts.Token);
             }
@@ -1094,7 +1138,7 @@ public class Server : IDisposable
                 // ReadLineAsync returns null when the stream is closed (client disconnected)
                 if (requestLine == null)
                 {
-                    Log.Info("[RTSP Server]", $"Client {client.Id} disconnected (end of stream)");
+                    BaluLogger.Info("[RTSP Server]", $"Client {client.Id} disconnected (end of stream)");
                     // Signal streaming task to stop immediately rather than waiting for 10 send errors
                     if (client != null) lock (client) { client.IsPlaying = false; }
                     break;
@@ -1102,7 +1146,7 @@ public class Server : IDisposable
 
                 if (string.IsNullOrEmpty(requestLine)) continue;
 
-                Log.Debug("[RTSP Server]", requestLine);
+                BaluLogger.Debug("[RTSP Server]", requestLine);
                 var request = await protocolHandler.ParseRequestAsync(reader, requestLine).ConfigureAwait(false);
                 if (request == null) continue;
 
@@ -1169,7 +1213,7 @@ public class Server : IDisposable
                         }
                         catch (Exception ex)
                         {
-                            Log.Error("[RTSP Server]", $"StreamToClient unhandled error: {ex.Message}");
+                            BaluLogger.Error("[RTSP Server]", $"StreamToClient unhandled error: {ex.Message}");
                         }
                     }, _cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
                 }
@@ -1225,7 +1269,7 @@ public class Server : IDisposable
                 }
                 else
                 {
-                    Log.Error("[RTSP]", "Failed to decode image data");
+                    BaluLogger.Error("[RTSP]", "Failed to decode image data");
                     return Array.Empty<byte>();
                 }
             }
@@ -1237,7 +1281,7 @@ public class Server : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Error("[RTSP]", $"JPEG encoding error: {ex.Message}");
+            BaluLogger.Error("[RTSP]", $"JPEG encoding error: {ex.Message}");
             return Array.Empty<byte>();
         }
         finally
@@ -1247,6 +1291,64 @@ public class Server : IDisposable
             try { rect?.Dispose(); } catch { }
             try { yuvImage?.Dispose(); } catch { }
             try { bitmap?.Dispose(); } catch { }
+        }
+    }
+
+    // Maximum number of bottom UV rows to scan when searching for a valid (non-zero) row.
+    private const int UvScanLimit = 16;
+
+    private static int _uvDiagFrame = 0;
+    private const int UvDiagInterval = 300; // Log every ~10s at 30fps
+
+    /// <summary>
+    /// Repairs zeroed NV21 UV rows at the bottom of the frame in-place.
+    /// Scans backwards from the last row to find the deepest non-zero UV row,
+    /// then copies it over every zeroed row below it. Handles any number of
+    /// corrupted rows up to UvScanLimit, regardless of the exact MediaTek quirk depth.
+    /// </summary>
+    private static void SanitizeNv21BottomUv(byte[] data, int width, int height)
+    {
+        int uvStart = width * height;
+        int uvRowCount = height / 2;
+        if (uvRowCount < 2) return;
+
+        // Periodic diagnostic: dump last 8 UV rows BEFORE the fix.
+        int frameIdx = System.Threading.Interlocked.Increment(ref _uvDiagFrame);
+        if (frameIdx % UvDiagInterval == 1)
+        {
+            var sb = new System.Text.StringBuilder();
+            int diagRows = Math.Min(8, uvRowCount);
+            for (int r = uvRowCount - diagRows; r < uvRowCount; r++)
+            {
+                int off = uvStart + r * width;
+                if (off + 8 > data.Length) break;
+                sb.Append($"row{r}:[{data[off]:X2}{data[off+1]:X2} {data[off+2]:X2}{data[off+3]:X2} {data[off+4]:X2}{data[off+5]:X2} {data[off+6]:X2}{data[off+7]:X2}] ");
+            }
+            BaluLogger.Info("[UV-DIAG]", $"f{frameIdx} {sb}");
+        }
+
+        // Scan backwards from last row to find the deepest row with non-zero UV data.
+        int scanEnd = Math.Max(0, uvRowCount - UvScanLimit);
+        int lastGoodRow = -1;
+        for (int r = uvRowCount - 1; r >= scanEnd; r--)
+        {
+            int off = uvStart + r * width;
+            if (off + width > data.Length) continue;
+            // Sample 4 VU pairs: row is "good" if any pair is non-zero
+            bool good = data[off] != 0 || data[off + 1] != 0
+                     || data[off + 2] != 0 || data[off + 3] != 0
+                     || data[off + width / 2] != 0 || data[off + width / 2 + 1] != 0;
+            if (good) { lastGoodRow = r; break; }
+        }
+
+        if (lastGoodRow < 0 || lastGoodRow >= uvRowCount - 1) return; // nothing to repair
+
+        int srcOff = uvStart + lastGoodRow * width;
+        for (int r = lastGoodRow + 1; r < uvRowCount; r++)
+        {
+            int dstOff = uvStart + r * width;
+            if (dstOff + width > data.Length) break;
+            System.Buffer.BlockCopy(data, srcOff, data, dstOff, width);
         }
     }
 }

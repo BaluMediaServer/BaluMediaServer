@@ -168,7 +168,7 @@ public class MjpegServer : IDisposable
     /// </summary>
     public void Dispose()
     {
-        Log.Warn("MJPEG SERVER", $"Dispose() called");
+        BaluLogger.Warn("MJPEG SERVER", $"Dispose() called");
 
         // Set disposed flag FIRST to stop encoder loops from accessing Java objects
         _disposed = true;
@@ -199,37 +199,37 @@ public class MjpegServer : IDisposable
             var encoderTasks = new[] { _backEncoderTask, _frontEncoderTask };
             if (!Task.WaitAll(encoderTasks.Where(t => t != null).ToArray()!, TimeSpan.FromSeconds(5)))
             {
-                Log.Warn("MJPEG SERVER", "Encoder tasks did not complete within 5s timeout");
+                BaluLogger.Warn("MJPEG SERVER", "Encoder tasks did not complete within 5s timeout");
             }
         }
         catch (System.Exception ex)
         {
-            Log.Debug("MJPEG SERVER", $"Encoder tasks wait error: {ex.Message}");
+            BaluLogger.Debug("MJPEG SERVER", $"Encoder tasks wait error: {ex.Message}");
         }
 
         //EventBuss.Command -= OnCommandSend;
         _listener?.Close();
 
         try { _thread?.Dispose(); }
-        catch (System.Exception ex) { Log.Debug("MJPEG SERVER", $"Dispose _thread error: {ex.Message}"); }
+        catch (System.Exception ex) { BaluLogger.Debug("MJPEG SERVER", $"Dispose _thread error: {ex.Message}"); }
 
         try { _watchdog?.Dispose(); }
-        catch (System.Exception ex) { Log.Debug("MJPEG SERVER", $"Dispose _watchdog error: {ex.Message}"); }
+        catch (System.Exception ex) { BaluLogger.Debug("MJPEG SERVER", $"Dispose _watchdog error: {ex.Message}"); }
 
         try { _backEncoderTask?.Dispose(); }
-        catch (System.Exception ex) { Log.Debug("MJPEG SERVER", $"Dispose _backEncoderTask error: {ex.Message}"); }
+        catch (System.Exception ex) { BaluLogger.Debug("MJPEG SERVER", $"Dispose _backEncoderTask error: {ex.Message}"); }
 
         try { _frontEncoderTask?.Dispose(); }
-        catch (System.Exception ex) { Log.Debug("MJPEG SERVER", $"Dispose _frontEncoderTask error: {ex.Message}"); }
+        catch (System.Exception ex) { BaluLogger.Debug("MJPEG SERVER", $"Dispose _frontEncoderTask error: {ex.Message}"); }
 
         try { _backFrameSemaphore?.Dispose(); }
-        catch (System.Exception ex) { Log.Debug("MJPEG SERVER", $"Dispose _backFrameSemaphore error: {ex.Message}"); }
+        catch (System.Exception ex) { BaluLogger.Debug("MJPEG SERVER", $"Dispose _backFrameSemaphore error: {ex.Message}"); }
 
         try { _frontFrameSemaphore?.Dispose(); }
-        catch (System.Exception ex) { Log.Debug("MJPEG SERVER", $"Dispose _frontFrameSemaphore error: {ex.Message}"); }
+        catch (System.Exception ex) { BaluLogger.Debug("MJPEG SERVER", $"Dispose _frontFrameSemaphore error: {ex.Message}"); }
 
         _cts?.Dispose();
-        Log.Info("MJPEG SERVER", "Disposed successfully");
+        BaluLogger.Info("MJPEG SERVER", "Disposed successfully");
     }
     private void OnCommandSend(BussCommand command)
     {
@@ -247,7 +247,7 @@ public class MjpegServer : IDisposable
         }
         catch (System.Exception ex)
         {
-            Log.Error("MJPEG SERVER", $"OnCommandSend error: {ex.Message}");
+            BaluLogger.Error("MJPEG SERVER", $"OnCommandSend error: {ex.Message}");
         }
     }
     private async Task Watchdog()
@@ -262,7 +262,7 @@ public class MjpegServer : IDisposable
                 if (statusCounter >= 5)
                 {
                     statusCounter = 0;
-                    Log.Info("MJPEG SERVER", $"Watchdog: Listening={_listener.IsListening}, Clients={ClientCount} (Back={BackClientCount}, Front={FrontClientCount}), FPS: Back={_backCurrentFps:F1}, Front={_frontCurrentFps:F1}, Total: Back={_totalBackFrames}, Front={_totalFrontFrames}");
+                    BaluLogger.Info("MJPEG SERVER", $"Watchdog: Listening={_listener.IsListening}, Clients={ClientCount} (Back={BackClientCount}, Front={FrontClientCount}), FPS: Back={_backCurrentFps:F1}, Front={_frontCurrentFps:F1}, Total: Back={_totalBackFrames}, Front={_totalFrontFrames}");
 
                     // Periodic stale client cleanup
                     CleanupStaleClients();
@@ -277,18 +277,18 @@ public class MjpegServer : IDisposable
                     var timeSinceLastFrame = (DateTime.UtcNow - _lastFrame).TotalSeconds;
                     if (timeSinceLastFrame > WatchdogTimeoutSeconds)
                     {
-                        Log.Info("MJPEG SERVER", $"Watchdog: No frames for {timeSinceLastFrame:F0}s (continuous mode - no restart)");
+                        BaluLogger.Info("MJPEG SERVER", $"Watchdog: No frames for {timeSinceLastFrame:F0}s (continuous mode - no restart)");
                     }
                 }
                 await Task.Delay(1000, _cts.Token);
             }
             catch (OperationCanceledException)
             {
-                Log.Warn("MJPEG SERVER", "Watchdog cancelled");
+                BaluLogger.Warn("MJPEG SERVER", "Watchdog cancelled");
                 break;
             }
         }
-        Log.Warn("MJPEG SERVER", "Watchdog exited");
+        BaluLogger.Warn("MJPEG SERVER", "Watchdog exited");
     }
 
     /// <summary>
@@ -336,7 +336,7 @@ public class MjpegServer : IDisposable
         // Remove stale clients
         foreach (var (response, info, isBack) in staleClients)
         {
-            Log.Warn("MJPEG SERVER", $"Watchdog removing stale client {info.ClientId} - FramesSent={info.FramesSent}, Age={(now - info.ConnectedAt).TotalSeconds:F0}s");
+            BaluLogger.Warn("MJPEG SERVER", $"Watchdog removing stale client {info.ClientId} - FramesSent={info.FramesSent}, Age={(now - info.ConnectedAt).TotalSeconds:F0}s");
 
             // Cancel client's streaming task
             try { info.Cts.Cancel(); } catch { }
@@ -360,7 +360,7 @@ public class MjpegServer : IDisposable
 
         if (staleClients.Count > 0)
         {
-            Log.Info("MJPEG SERVER", $"Watchdog cleaned up {staleClients.Count} stale client(s)");
+            BaluLogger.Info("MJPEG SERVER", $"Watchdog cleaned up {staleClients.Count} stale client(s)");
         }
     }
     private void OnBackFrameAvailable(object? sender, FrameEventArgs arg)
@@ -397,7 +397,7 @@ public class MjpegServer : IDisposable
             // Check disposed flag BEFORE any JNI calls to prevent SIGSEGV
             if (_disposed)
             {
-                Log.Debug("MJPEG SERVER", "Back encoder loop exiting - server disposed");
+                BaluLogger.Debug("MJPEG SERVER", "Back encoder loop exiting - server disposed");
                 break;
             }
 
@@ -446,7 +446,7 @@ public class MjpegServer : IDisposable
             }
             catch (System.Exception ex)
             {
-                if (!_disposed) Log.Debug("MJPEG SERVER", $"Back encoder error: {ex.Message}");
+                if (!_disposed) BaluLogger.Debug("MJPEG SERVER", $"Back encoder error: {ex.Message}");
             }
         }
     }
@@ -465,7 +465,7 @@ public class MjpegServer : IDisposable
             // Check disposed flag BEFORE any JNI calls to prevent SIGSEGV
             if (_disposed)
             {
-                Log.Debug("MJPEG SERVER", "Front encoder loop exiting - server disposed");
+                BaluLogger.Debug("MJPEG SERVER", "Front encoder loop exiting - server disposed");
                 break;
             }
 
@@ -514,7 +514,7 @@ public class MjpegServer : IDisposable
             }
             catch (System.Exception ex)
             {
-                if (!_disposed) Log.Debug("MJPEG SERVER", $"Front encoder error: {ex.Message}");
+                if (!_disposed) BaluLogger.Debug("MJPEG SERVER", $"Front encoder error: {ex.Message}");
             }
         }
     }
@@ -528,7 +528,7 @@ public class MjpegServer : IDisposable
         try
         {
             _listener.Start();
-            Log.Info("MJPEG SERVER", $"STARTING SERVER - StartWithoutStream={StartWithoutStream}");
+            BaluLogger.Info("MJPEG SERVER", $"STARTING SERVER - StartWithoutStream={StartWithoutStream}");
             if (!StartWithoutStream)
             {
                 EventBuss.SendCommand(BussCommand.START_CAMERA_FRONT);
@@ -540,11 +540,11 @@ public class MjpegServer : IDisposable
                 _streamStarted = false;
             }
             _thread = Task.Run(ListenLoop, _cts.Token);
-            Log.Info("MJPEG SERVER", $"STARTED SERVER - IsListening={_listener.IsListening}");
+            BaluLogger.Info("MJPEG SERVER", $"STARTED SERVER - IsListening={_listener.IsListening}");
         }
         catch (System.Exception ex)
         {
-            Log.Warn("MJPEG SERVER", $"Start() exception: {ex.Message}");
+            BaluLogger.Warn("MJPEG SERVER", $"Start() exception: {ex.Message}");
         }
 
     }
@@ -554,7 +554,7 @@ public class MjpegServer : IDisposable
     /// </summary>
     public void Stop()
     {
-        Log.Warn("MJPEG SERVER", $"Stop() called - stack trace: {Environment.StackTrace}");
+        BaluLogger.Warn("MJPEG SERVER", $"Stop() called - stack trace: {Environment.StackTrace}");
         _clientsBack.Clear();
         _clientsFront.Clear();
         EventBuss.SendCommand(BussCommand.STOP_CAMERA_BACK);
@@ -565,12 +565,12 @@ public class MjpegServer : IDisposable
 
     private async Task ListenLoop()
     {
-        Log.Info("MJPEG SERVER", "ListenLoop started");
+        BaluLogger.Info("MJPEG SERVER", "ListenLoop started");
         while (_listener.IsListening && !_cts.IsCancellationRequested)
         {
             try
             {
-                Log.Debug("MJPEG SERVER", "WAITING CLIENT");
+                BaluLogger.Debug("MJPEG SERVER", "WAITING CLIENT");
                 var ctx = await _listener.GetContextAsync();
                 _ = Task.Run(async () =>
                 {
@@ -580,18 +580,18 @@ public class MjpegServer : IDisposable
                     }
                     catch (System.Exception ex)
                     {
-                        Log.Error("MJPEG SERVER", $"HandleClient unhandled error: {ex.Message}");
+                        BaluLogger.Error("MJPEG SERVER", $"HandleClient unhandled error: {ex.Message}");
                     }
                 }, _cts.Token);
             }
             catch (System.Exception ex)
             {
                 // Listener was stopped or failed - log it in release mode
-                Log.Warn("MJPEG SERVER", $"ListenLoop exception: {ex.GetType().Name}: {ex.Message}");
+                BaluLogger.Warn("MJPEG SERVER", $"ListenLoop exception: {ex.GetType().Name}: {ex.Message}");
             }
         }
         // Log why we exited the loop
-        Log.Warn("MJPEG SERVER", $"ListenLoop EXITED - IsListening={_listener.IsListening}, IsCancelled={_cts.IsCancellationRequested}");
+        BaluLogger.Warn("MJPEG SERVER", $"ListenLoop EXITED - IsListening={_listener.IsListening}, IsCancelled={_cts.IsCancellationRequested}");
     }
 
     private async Task HandleClient(HttpListenerContext context)
@@ -603,7 +603,7 @@ public class MjpegServer : IDisposable
             {
                 if (!_streamStarted)  // Double-check after acquiring lock
                 {
-                    Log.Debug("MJPEG SERVER", "First client connected, starting cameras on-demand");
+                    BaluLogger.Debug("MJPEG SERVER", "First client connected, starting cameras on-demand");
                     EventBuss.SendCommand(BussCommand.START_CAMERA_FRONT);
                     EventBuss.SendCommand(BussCommand.START_CAMERA_BACK);
                     _streamStarted = true;
@@ -611,7 +611,7 @@ public class MjpegServer : IDisposable
             }
         }
         var remoteEndpoint = context.Request.RemoteEndPoint?.ToString() ?? "unknown";
-        Log.Debug("MJPEG SERVER", $"Client connected from {remoteEndpoint}");
+        BaluLogger.Debug("MJPEG SERVER", $"Client connected from {remoteEndpoint}");
 
         var response = context.Response;
         var uri = context.Request.Url?.ToString() ?? string.Empty;
@@ -621,7 +621,7 @@ public class MjpegServer : IDisposable
         {
             if (!ValidateAuthentication(context))
             {
-                Log.Debug("MJPEG SERVER", $"Authentication failed for {remoteEndpoint}");
+                BaluLogger.Debug("MJPEG SERVER", $"Authentication failed for {remoteEndpoint}");
                 response.StatusCode = 401;
                 response.Headers.Add("WWW-Authenticate", "Basic realm=\"MJPEG Stream\"");
                 response.Close();
@@ -658,7 +658,7 @@ public class MjpegServer : IDisposable
             _clientsFront.TryAdd(response, clientInfo);
         }
 
-        Log.Info("MJPEG SERVER", $"Client {clientInfo.ClientId} connected from {remoteEndpoint} for {(isBackCamera ? "Back" : "Front")} camera (max {_maxFrameRate} FPS)");
+        BaluLogger.Info("MJPEG SERVER", $"Client {clientInfo.ClientId} connected from {remoteEndpoint} for {(isBackCamera ? "Back" : "Front")} camera (max {_maxFrameRate} FPS)");
 
         try
         {
@@ -670,7 +670,7 @@ public class MjpegServer : IDisposable
                 // Check if stream is still writable (basic check)
                 if (!response.OutputStream.CanWrite)
                 {
-                    Log.Debug("MJPEG SERVER", $"Client {clientInfo.ClientId} stream no longer writable");
+                    BaluLogger.Debug("MJPEG SERVER", $"Client {clientInfo.ClientId} stream no longer writable");
                     break;
                 }
 
@@ -688,14 +688,14 @@ public class MjpegServer : IDisposable
                     // Timeout case 1: Client received frames but stopped receiving
                     if (clientInfo.FramesSent > 0 && timeSinceLastFrame > ClientTimeoutSeconds)
                     {
-                        Log.Debug("MJPEG SERVER", $"Client {clientInfo.ClientId} timed out - no frames for {timeSinceLastFrame:F0}s");
+                        BaluLogger.Debug("MJPEG SERVER", $"Client {clientInfo.ClientId} timed out - no frames for {timeSinceLastFrame:F0}s");
                         break;
                     }
 
                     // Timeout case 2: Client never received any frames (camera not started, etc.)
                     if (clientInfo.FramesSent == 0 && connectionAge > ClientMaxIdleSeconds)
                     {
-                        Log.Debug("MJPEG SERVER", $"Client {clientInfo.ClientId} idle timeout - no frames received in {connectionAge:F0}s");
+                        BaluLogger.Debug("MJPEG SERVER", $"Client {clientInfo.ClientId} idle timeout - no frames received in {connectionAge:F0}s");
                         break;
                     }
 
@@ -720,7 +720,7 @@ public class MjpegServer : IDisposable
                 var writeSuccess = await WriteFrameToClientAsync(response, jpegData, clientInfo, linkedCts.Token).ConfigureAwait(false);
                 if (!writeSuccess)
                 {
-                    Log.Debug("MJPEG SERVER", $"Client {clientInfo.ClientId} write failed - disconnecting");
+                    BaluLogger.Debug("MJPEG SERVER", $"Client {clientInfo.ClientId} write failed - disconnecting");
                     break;
                 }
 
@@ -735,7 +735,7 @@ public class MjpegServer : IDisposable
         }
         catch (System.Exception ex)
         {
-            Log.Debug("MJPEG SERVER", $"Client {clientInfo.ClientId} error: {ex.Message}");
+            BaluLogger.Debug("MJPEG SERVER", $"Client {clientInfo.ClientId} error: {ex.Message}");
         }
         finally
         {
@@ -757,7 +757,7 @@ public class MjpegServer : IDisposable
                     if (_clientsBack.Count == 0 && _clientsFront.Count == 0)
                     {
                         _streamStarted = false;
-                        Log.Info("MJPEG SERVER", "Last client disconnected, reset stream state for on-demand restart");
+                        BaluLogger.Info("MJPEG SERVER", "Last client disconnected, reset stream state for on-demand restart");
                     }
                 }
             }
@@ -771,7 +771,7 @@ public class MjpegServer : IDisposable
             }
             catch { }
 
-            Log.Info("MJPEG SERVER", $"Client {clientInfo.ClientId} disconnected from {remoteEndpoint}. Frames sent: {clientInfo.FramesSent}, Bytes: {clientInfo.BytesSent / 1024}KB");
+            BaluLogger.Info("MJPEG SERVER", $"Client {clientInfo.ClientId} disconnected from {remoteEndpoint}. Frames sent: {clientInfo.FramesSent}, Bytes: {clientInfo.BytesSent / 1024}KB");
         }
     }
 
@@ -826,7 +826,7 @@ public class MjpegServer : IDisposable
         }
         catch (OperationCanceledException)
         {
-            Log.Debug("MJPEG SERVER", $"Client {clientInfo.ClientId} write timeout ({WriteTimeoutMs}ms)");
+            BaluLogger.Debug("MJPEG SERVER", $"Client {clientInfo.ClientId} write timeout ({WriteTimeoutMs}ms)");
             return false;
         }
         catch

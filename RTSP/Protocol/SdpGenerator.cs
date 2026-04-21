@@ -113,7 +113,7 @@ public class SdpGenerator : ISdpGenerator
         }
         catch (Exception ex)
         {
-            Log.Error("[SdpGenerator]", $"Error generating sprop-parameter-sets: {ex.Message}");
+            BaluLogger.Error("[SdpGenerator]", $"Error generating sprop-parameter-sets: {ex.Message}");
             return string.Empty;
         }
     }

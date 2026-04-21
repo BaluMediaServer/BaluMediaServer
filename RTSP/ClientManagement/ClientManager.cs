@@ -43,7 +43,7 @@ public class ClientManager : IClientManager
         }
         catch (Exception ex)
         {
-            Log.Error("[ClientManager]", $"ClientCountChanged subscriber error: {ex.Message}");
+            BaluLogger.Error("[ClientManager]", $"ClientCountChanged subscriber error: {ex.Message}");
         }
         try
         {
@@ -51,7 +51,7 @@ public class ClientManager : IClientManager
         }
         catch (Exception ex)
         {
-            Log.Error("[ClientManager]", $"OnClientsChange subscriber error: {ex.Message}");
+            BaluLogger.Error("[ClientManager]", $"OnClientsChange subscriber error: {ex.Message}");
         }
     }
 
@@ -109,11 +109,11 @@ public class ClientManager : IClientManager
                 client.Dispose();
             }
             SafeInvokeClientChange();
-            Log.Info("[ClientManager]", $"Client {client.Id} cleaned up");
+            BaluLogger.Info("[ClientManager]", $"Client {client.Id} cleaned up");
         }
         catch (Exception ex)
         {
-            Log.Error("[ClientManager]", $"Error cleaning up client: {ex.Message}");
+            BaluLogger.Error("[ClientManager]", $"Error cleaning up client: {ex.Message}");
         }
     }
 
@@ -144,7 +144,7 @@ public class ClientManager : IClientManager
             // Socket disconnected = definitely dead
             if (!(client.Socket?.Connected ?? false))
             {
-                Log.Debug("[ClientManager]", $"Client {client.Id} marked as dead - socket disconnected");
+                BaluLogger.Debug("[ClientManager]", $"Client {client.Id} marked as dead - socket disconnected");
                 deadClients.Add(client);
                 continue;
             }
@@ -153,7 +153,7 @@ public class ClientManager : IClientManager
             var connectionAge = now - client.ConnectedAt;
             if (connectionAge > gracePeriod)
             {
-                Log.Debug("[ClientManager]", $"Client {client.Id} marked as dead - exceeded grace period ({connectionAge.TotalSeconds:F0}s > {gracePeriod.TotalSeconds}s, not playing)");
+                BaluLogger.Debug("[ClientManager]", $"Client {client.Id} marked as dead - exceeded grace period ({connectionAge.TotalSeconds:F0}s > {gracePeriod.TotalSeconds}s, not playing)");
                 deadClients.Add(client);
             }
         }
@@ -181,7 +181,7 @@ public class ClientManager : IClientManager
             }
             catch (Exception ex)
             {
-                Log.Error("[ClientManager]", $"Error cleaning up client {client?.Id}: {ex.Message}");
+                BaluLogger.Error("[ClientManager]", $"Error cleaning up client {client?.Id}: {ex.Message}");
             }
         }
         _clients.Clear();
@@ -229,7 +229,7 @@ public class ClientManager : IClientManager
         }
         catch (Exception ex)
         {
-            Log.Error("[ClientManager]", $"NotifyClientsChanged subscriber error: {ex.Message}");
+            BaluLogger.Error("[ClientManager]", $"NotifyClientsChanged subscriber error: {ex.Message}");
         }
     }
 }

@@ -124,14 +124,14 @@ public class MediaTekH264Encoder : IDisposable
                         encoder = MediaCodec.CreateByCodecName(encoderName);
                         encoder.Configure(format, null, null, MediaCodecConfigFlags.Encode);
                         selectedEncoder = encoderName;
-                        Log.Debug("H264MTK", $"Successfully configured encoder: {encoderName}");
+                        BaluLogger.Debug("H264MTK", $"Successfully configured encoder: {encoderName}");
                         break;
                     }
                     catch (Exception ex)
                     {
                         encoder?.Release();
                         encoder = null;
-                        Log.Debug("H264MTK", $"Failed to configure {encoderName}: {ex.Message}");
+                        BaluLogger.Debug("H264MTK", $"Failed to configure {encoderName}: {ex.Message}");
                     }
                 }
                 
@@ -155,12 +155,12 @@ public class MediaTekH264Encoder : IDisposable
                 };
                 _encoderThread.Start();
                 
-                Log.Debug("H264MTK", $"Encoder started: {_width}x{_height} @ {_bitrate}bps");
+                BaluLogger.Debug("H264MTK", $"Encoder started: {_width}x{_height} @ {_bitrate}bps");
                 return true;
             }
             catch (Exception ex)
             {
-                Log.Error("H264MTK", $"Failed to start encoder: {ex.Message}");
+                BaluLogger.Error("H264MTK", $"Failed to start encoder: {ex.Message}");
                 _encoder?.Release();
                 _encoder = null;
                 return false;
@@ -189,11 +189,11 @@ public class MediaTekH264Encoder : IDisposable
                 // Store the new bitrate
                 _bitrate = newBitrate;
                 
-                Log.Debug("H264MTK", $"Bitrate updated to: {newBitrate}bps");
+                BaluLogger.Debug("H264MTK", $"Bitrate updated to: {newBitrate}bps");
             }
             catch (Exception ex)
             {
-                Log.Error("H264MTK", $"Failed to update bitrate: {ex.Message}");
+                BaluLogger.Error("H264MTK", $"Failed to update bitrate: {ex.Message}");
             }
         }
     }
@@ -219,7 +219,7 @@ public class MediaTekH264Encoder : IDisposable
         {
             if (_frameQueue.TryDequeue(out _))
             {
-                Log.Debug("H264MTK", "Dropped old frame to prevent latency");
+                BaluLogger.Debug("H264MTK", "Dropped old frame to prevent latency");
             }
         }
         
@@ -233,7 +233,7 @@ public class MediaTekH264Encoder : IDisposable
         byte[]? pps = null;
         bool gotFirstOutput = false;
         
-        Log.Debug("H264MTK", "Encoding loop started");
+        BaluLogger.Debug("H264MTK", "Encoding loop started");
         
         while (_isRunning)
         {
@@ -260,11 +260,11 @@ public class MediaTekH264Encoder : IDisposable
             }
             catch (Exception ex)
             {
-                Log.Error("H264MTK", $"Encoding loop error: {ex.Message}");
+                BaluLogger.Error("H264MTK", $"Encoding loop error: {ex.Message}");
             }
         }
         
-        Log.Debug("H264MTK", "Encoding loop ended");
+        BaluLogger.Debug("H264MTK", "Encoding loop ended");
     }
     
     /// <summary>
@@ -313,7 +313,7 @@ public class MediaTekH264Encoder : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Error("H264MTK", $"Feed input error: {ex.Message}");
+            BaluLogger.Error("H264MTK", $"Feed input error: {ex.Message}");
         }
     }
     private byte[] ConvertNV21ToNV12Pooled(byte[] nv21)
@@ -388,7 +388,7 @@ public class MediaTekH264Encoder : IDisposable
                     if ((bufferInfo.Flags & MediaCodecBufferFlags.CodecConfig) != 0)
                     {
                         ParseConfigFrame(data, ref sps, ref pps);
-                        Log.Debug("H264MTK", "Got config frame");
+                        BaluLogger.Debug("H264MTK", "Got config frame");
                     }
                     else
                     {
@@ -431,7 +431,7 @@ public class MediaTekH264Encoder : IDisposable
             else if (outputIndex == (int)MediaCodecInfoState.OutputFormatChanged)
             {
                 var format = _encoder.OutputFormat;
-                Log.Debug("H264MTK", $"Output format changed: {format}");
+                BaluLogger.Debug("H264MTK", $"Output format changed: {format}");
                 
                 // Extract SPS/PPS from format
                 ExtractParameterSets(format, ref sps, ref pps);
@@ -439,7 +439,7 @@ public class MediaTekH264Encoder : IDisposable
             }
             else if (outputIndex == (int)MediaCodecInfoState.OutputBuffersChanged)
             {
-                Log.Debug("H264MTK", "Output buffers changed");
+                BaluLogger.Debug("H264MTK", "Output buffers changed");
                 return true;
             }
             
@@ -447,7 +447,7 @@ public class MediaTekH264Encoder : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Error("H264MTK", $"Drain output error: {ex.Message}");
+            BaluLogger.Error("H264MTK", $"Drain output error: {ex.Message}");
             return false;
         }
     }
@@ -558,7 +558,7 @@ public class MediaTekH264Encoder : IDisposable
                             else if (nalType == 8) pps = nal;
                         }
                     }
-                    Log.Debug("H264MTK", $"Got SPS/PPS from csd-0: {csd0.Length} bytes, {nalUnits.Count} NAL(s)");
+                    BaluLogger.Debug("H264MTK", $"Got SPS/PPS from csd-0: {csd0.Length} bytes, {nalUnits.Count} NAL(s)");
                 }
             }
 
@@ -571,13 +571,13 @@ public class MediaTekH264Encoder : IDisposable
                     pps = new byte[ppsBuffer.Remaining()];
                     ppsBuffer.Get(pps);
                     ppsBuffer.Rewind();
-                    Log.Debug("H264MTK", $"Got PPS from csd-1: {pps.Length} bytes");
+                    BaluLogger.Debug("H264MTK", $"Got PPS from csd-1: {pps.Length} bytes");
                 }
             }
         }
         catch (Exception ex)
         {
-            Log.Error("H264MTK", $"Error extracting parameter sets: {ex.Message}");
+            BaluLogger.Error("H264MTK", $"Error extracting parameter sets: {ex.Message}");
         }
     }
     
@@ -591,7 +591,7 @@ public class MediaTekH264Encoder : IDisposable
         
         if (nv21.Length < ySize + uvSize)
         {
-            Log.Error("H264MTK", $"Invalid frame size: {nv21.Length}, expected: {ySize + uvSize}");
+            BaluLogger.Error("H264MTK", $"Invalid frame size: {nv21.Length}, expected: {ySize + uvSize}");
             return nv21; // Return as-is to avoid crash
         }
         
@@ -629,7 +629,7 @@ public class MediaTekH264Encoder : IDisposable
             }
             catch (Exception ex)
             {
-                Log.Error("H264MTK", $"Error stopping encoder: {ex.Message}");
+                BaluLogger.Error("H264MTK", $"Error stopping encoder: {ex.Message}");
             }
             
             _encoder = null;

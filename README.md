@@ -66,6 +66,7 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 - Advanced watchdog system with 60-second inactivity timeout, idle encoder shutdown, and comprehensive health monitoring
 - Automatic resource cleanup and memory management
 - **FrameOverlay**: text overlay stamped into YUV frames — up to 4 slots, 6 content types, 7 anchor positions, full RGB color, configurable size
+- **BaluLogger**: subscribe to `BaluLogger.OnLog` to receive all internal library logs in-process — no ADB required; every `Log.Info/Warn/Error/Debug` call inside the library fires the event with level, tag, message, and timestamp
 
 ### 🔹 Modular RTSP Architecture (v1.5.8+)
 
@@ -96,6 +97,8 @@ Services/
 ├── FrontCameraService.cs        # Front camera capture (JNI-free processing thread)
 ├── MjpegServer.cs               # HTTP MJPEG streaming server
 └── FrameOverlay.cs              # YUV-level text overlay burn-in (up to 4 slots)
+
+BaluLogger.cs                    # Static logger: writes to logcat + fires OnLog event
 ```
 
 **Benefits:**
@@ -339,6 +342,7 @@ All classes in this library include comprehensive XML documentation comments for
 | **Models** | `Client`, `FrameEventArgs`, `H264FrameEventArgs`, `VideoProfile`, `VideoResolution`, `ServerConfiguration`, `RtspRequest`, `RtspAuth`, `EncoderInfo` |
 | **Enums** | `AuthType`, `CodecType`, `BussCommand`, `TransportMode`, `VideoResolution`, `OverlayContent`, `AnchorPoint` |
 | **Services** | `Server`, `MjpegServer`, `FrontCameraService`, `BackCameraService`, `FrameOverlay` |
+| **Logging** | `BaluLogger`, `BaluLogEventArgs`, `BaluLogLevel` |
 | **Overlay Types** | `OverlaySlot`, `OverlayColor` |
 | **Encoders** | `H264Encoder`, `MediaTekH264Encoder` |
 | **Utilities** | `EventBuss`, `FrameConverterHelper`, `FrameCallback` |
@@ -667,7 +671,7 @@ new OverlayColor(r: 128, g: 0, b: 255)
 
 #### Events
 ```csharp
-// Fired when streaming state changes
+// Fired when streaming state changes (fires only on actual false→true / true→false transitions)
 public static event EventHandler<bool>? OnStreaming;
 
 // Fired when client list changes
@@ -679,6 +683,74 @@ public static event EventHandler<FrameEventArgs>? OnNewBackFrame;
 // Fired when new frame is available from front camera (for general purpose use: snapshots, processing, etc.)
 public static event EventHandler<FrameEventArgs>? OnNewFrontFrame;
 ```
+
+### BaluLogger — In-Process Log Subscription
+
+`BaluLogger` is a static wrapper around `Android.Util.Log` that simultaneously writes to Android logcat **and** fires a `static event` so consuming apps can receive every internal library diagnostic message in-process — no ADB or log-parsing required.
+
+> Subscribe **before** creating a `Server` instance to capture startup and encoder-selection messages.
+
+#### API
+
+```csharp
+// Log levels
+public enum BaluLogLevel { Debug, Info, Warn, Error }
+
+// Event args — all fields are set at construction time (immutable after firing)
+public sealed class BaluLogEventArgs : EventArgs
+{
+    public BaluLogLevel Level    { get; }
+    public string       Tag      { get; }
+    public string       Message  { get; }
+    public DateTime     Timestamp { get; }
+}
+
+// Static event — raised synchronously on the thread that produced the entry
+public static event EventHandler<BaluLogEventArgs>? BaluLogger.OnLog;
+```
+
+#### Quick Start
+
+```csharp
+// Subscribe once at app startup, before creating Server
+BaluLogger.OnLog += (_, e) =>
+{
+    // Forward to your own logging infrastructure
+    _logger.LogInformation("[Balu/{Level}] {Tag}: {Message}",
+        e.Level, e.Tag, e.Message);
+};
+
+var server = new Server(config);
+server.Start();
+```
+
+#### Buffered / async handler (recommended for high-frequency use)
+
+The event fires **synchronously** on the calling thread (encoder thread, camera callback, etc.). Keep handlers short — offload heavy work to a `Channel`:
+
+```csharp
+private readonly Channel<BaluLogEventArgs> _logChannel =
+    Channel.CreateBounded<BaluLogEventArgs>(
+        new BoundedChannelOptions(512) { FullMode = BoundedChannelFullMode.DropOldest });
+
+// Subscribe
+BaluLogger.OnLog += (_, e) => _logChannel.Writer.TryWrite(e);
+
+// Drain in background
+_ = Task.Run(async () =>
+{
+    await foreach (var e in _logChannel.Reader.ReadAllAsync())
+    {
+        await _remoteLogger.SendAsync($"[{e.Level}] {e.Tag}: {e.Message}");
+    }
+});
+```
+
+#### Notes
+
+- The event handler is wrapped in a `try/catch` inside `BaluLogger` — a subscriber crash never propagates to the calling thread.
+- `BaluLogger.Debug` calls still appear in logcat but `Debug` entries are invisible in release builds on Android (`Log.Debug` is stripped by the build system). Subscribe to `OnLog` to capture them in both configurations.
+- All 264+ `Log.X()` calls across the library route through `BaluLogger`, so every module (encoder, transport, streaming controller, camera services, RTSP protocol) is covered.
 
 ### MjpegServer Class
 
@@ -1171,6 +1243,9 @@ Server.OnClientsChange += (clients) => {
 - Per-client `SemaphoreSlim` (SendLock) serializes all sends to prevent TCP interleaved framing corruption. Batch RTP sends acquire the lock once per frame instead of per packet.
 - The WatchDog stops the H.264 encoder when no clients are connected, preventing an idle stall loop from consuming resources. The camera stays running for fast reconnects.
 - Simultaneous client connects are race-free: `_isStreamingFlag` uses `Interlocked.CompareExchange` (v1.5.25) so `CameraStartRequested` and `StreamingStateChanged(true)` are each fired exactly once, even when two clients arrive at the same millisecond.
+- `OnStreaming` fires only on real state transitions (v1.5.25): the WatchDog previously fired `OnStreaming(true)` unconditionally every 5 seconds while cameras were running, flooding consumer apps with spurious events. A `_lastReportedStreamingState` guard now suppresses duplicate fires.
+- `Stop()` fully tears down cameras and resets state (v1.5.25): `StopCapture()` is now called on both camera services so the AAR's camera2 session is fully torn down and recreated on the next `Start()`. Without this, a hung camera2 session persisted across watchdog restarts and `RestartCameraForStallRecovery` could not recover it. Client list is also cleared on `Stop()` to prevent stale entries appearing in the next session's WatchDog.
+- `SetStreamingState` fires only on first SETUP per session (v1.5.25): `PreStartCameraAndEncoder` now guards the `SetStreamingState(true)` call with `if (!_isStreaming)`, preventing a duplicate `[STREAMING] ACTIVE` event for every subsequent SETUP request.
 
 **Latency Optimization Notes (v1.5.23–v1.5.25):**
 - All frame channels use capacity=1 with `DropOldest` — the encoder always processes the freshest frame, eliminating queue-induced latency.
@@ -1306,6 +1381,8 @@ Unit tests cover pure C# components. Android-dependent classes (camera services,
 - ✅ **Thread-safety hardening — volatile flags, volatile backing fields for IsPlaying/ConsecutiveSendErrors, missing lock fix** (v1.5.24)
 - ✅ **Idle encoder stall loop fix — WatchDog stops encoder when no clients connected; wider stall timeout for slow cameras** (v1.5.24)
 - ✅ **Hot-path CPU & memory optimisation + simultaneous-connect race fix — SpinWait escalation, cached channel refs, selective buffer zeroing, fan-out lock reduction, atomic CAS start gate** (v1.5.25)
+- ✅ **Server restart hardening — Stop() tears down cameras + clears clients, OnStreaming fires only on state change, SetStreamingState guarded on SETUP** (v1.5.25)
+- ✅ **In-process log subscription — BaluLogger.OnLog exposes all 264+ internal log calls as a subscribable event (tag, level, message, timestamp)** (v1.5.25)
 
 ### Planned (v1.6+)
 - ⬜ Fix image rotation on some devices
@@ -1358,14 +1435,28 @@ There are few (if any) options to integrate RTSP servers with Android using C# a
 
 ## Patch Notes
 
-- v1.5.25: **Hot-Path CPU & Memory Optimisation + Simultaneous-Connect Race Fix**
-  - **SpinWait escalation fix** (`H264Encoder.EncodingLoop`): the `SpinWait` is now declared once outside the encoding loop. Its spin count accumulates across idle iterations so it correctly escalates from spinning → yielding → sleeping. Previously a fresh `new SpinWait()` was created each idle iteration — it never advanced past level-0 spinning, burning 100% CPU during the 40 ms gaps between frames on the highest-priority encoder thread.
-  - **Per-client channel caching** (`StreamingController`): the `Channel<H264FrameEventArgs>` reference is retrieved once after `RegisterClientChannel` and reused for the entire session. Previously `TryDequeueFrame` and `WaitDequeueFrame` both acquired a dictionary lock on every call (50 lock acquisitions/second/client) just to look up the same stable reference.
-  - **Selective encoder buffer zeroing** (`H264Encoder.WriteFrameToEncoderBuffer`): replaced `Array.Clear(buf, 0, 1.4 MB)` with targeted clearing of only the stride-gap padding bytes at the end of each row and any sliceHeight padding rows. The hot path (camera resolution == encoder resolution, no stride padding) now performs zero `Array.Clear` calls, eliminating 35 MB/s of unnecessary RAM writes at 1280×720 / 25 fps.
-  - **Fan-out lock reduction** (`H264EncoderManager`): `OnH264BackFrameEncoded` / `OnH264FrontFrameEncoded` snapshot the client channel list into a pooled `ArrayPool<Channel>` array under the lock, then release the lock before calling `TryWrite`. Unregistering clients no longer wait for all fan-out writes to complete.
-  - **Removed dead code**: deleted `ConvertNV21ToNV12Pooled` — it rented a pooled buffer then immediately allocated a new heap array and copied into it, giving the pool no benefit. The NV21 → NV12 conversion is handled inline by `WriteFrameToEncoderBuffer`.
-  - **`ProbeSupportedResolution` startup fix**: now calls `GetCachedBestEncoder()` instead of performing a full O(N) codec re-scan. Saves 200–700 ms at every server `Start()` call.
-  - **Atomic streaming start gate** (`StreamingController`): replaced `volatile bool _isStreaming` + plain `if (!_isStreaming) { _isStreaming = true; }` with `volatile int _isStreamingFlag` guarded by `Interlocked.CompareExchange(ref _isStreamingFlag, 1, 0) == 0`. The CAS instruction is atomic at the CPU level, so exactly one thread can transition the flag from 0→1. With the previous code, two clients connecting within the same scheduler timeslice could both read `_isStreaming == false` before either wrote `true`, causing `CameraStartRequested` and `StreamingStateChanged(true)` to fire twice — observed in device logs as double `[STREAMING] State changed: ACTIVE`. `SetStreamingState` updated to use `Interlocked.Exchange` for consistency.
+- v1.5.25: **Hot-Path Optimisation, Server Restart Hardening, Simultaneous-Connect Race Fix, In-Process Logging**
+
+  **Hot-path CPU & memory optimisations:**
+  - **SpinWait escalation fix** (`H264Encoder.EncodingLoop`): the `SpinWait` is now declared once outside the encoding loop so its spin count accumulates across idle iterations and correctly escalates from spinning → yielding → sleeping. Previously a fresh `new SpinWait()` was created each iteration — it never advanced past level-0 spinning, burning 100% CPU during the 40 ms gaps between frames.
+  - **Per-client channel caching** (`StreamingController`): the `Channel<H264FrameEventArgs>` reference is retrieved once after `RegisterClientChannel` and reused for the session, eliminating 50 dictionary lock acquisitions/second/client.
+  - **Selective encoder buffer zeroing** (`H264Encoder.WriteFrameToEncoderBuffer`): replaced `Array.Clear(buf, 0, 1.4 MB)` with targeted clearing of only stride-gap padding bytes. The hot path (camera res == encoder res) now performs zero `Array.Clear` calls — eliminates 35 MB/s of unnecessary RAM writes at 1280×720 / 25 fps.
+  - **Fan-out lock reduction** (`H264EncoderManager`): client channel list is snapshotted under the lock into a pooled array, then the lock is released before `TryWrite` calls. Unregistering a client no longer blocks all fan-out writes.
+  - **Removed dead code**: deleted `ConvertNV21ToNV12Pooled` — it rented a pool buffer then immediately heap-allocated a copy, negating the pool entirely.
+  - **`ProbeSupportedResolution` startup fix**: now calls `GetCachedBestEncoder()` instead of re-scanning all codecs, saving 200–700 ms per `Start()`.
+
+  **Simultaneous-connect race fix:**
+  - **Atomic streaming start gate** (`StreamingController`): replaced `volatile bool _isStreaming` + plain read/write with `volatile int _isStreamingFlag` guarded by `Interlocked.CompareExchange(ref _isStreamingFlag, 1, 0) == 0`. With the previous code, two clients arriving in the same scheduler timeslice could both read `_isStreaming == false` before either wrote `true`, causing `CameraStartRequested` and `StreamingStateChanged(true)` to fire twice — observed as double `[STREAMING] State changed: ACTIVE` in device logs. `SetStreamingState` updated to use `Interlocked.Exchange`.
+
+  **Server restart hardening:**
+  - **`Stop()` now tears down cameras** (`Server`): `StopCapture()` called on both camera services and `_isCapturingBack/_isCapturingFront` reset to `false`. Previously a hung Android camera2 session (the root cause of 1-hour stalls) persisted across watchdog Stop/Start cycles, making `RestartCameraForStallRecovery` ineffective — it was calling the same already-stuck service.
+  - **`Stop()` clears client list**: `_clientManager.ClearAllClients()` called on stop so stale client entries from the previous session are not visible to the new session's WatchDog.
+  - **`Stop()` resets streaming flag**: `SetStreamingState(false)` called on stop so the first new client after `Start()` correctly wins the CAS gate and triggers camera startup.
+  - **`OnStreaming` fires only on state change** (`Server.WatchDog`): added `_lastReportedStreamingState` guard — the WatchDog previously fired `OnStreaming(true)` unconditionally every 5 seconds while cameras were running (even with no RTSP clients), flooding consumer apps with spurious `[STREAMING] ACTIVE` events. Now fires only on actual false→true / true→false transitions.
+  - **`SetStreamingState` guarded on SETUP** (`PreStartCameraAndEncoder`): wrapped with `if (!_isStreaming)` so the `StreamingStateChanged` event fires once per session instead of once per SETUP request.
+
+  **In-process log subscription:**
+  - **`BaluLogger`** (new `BaluLogger.cs`): static wrapper around `Android.Util.Log` that simultaneously writes to logcat and fires `BaluLogger.OnLog` (`EventHandler<BaluLogEventArgs>`). All 264+ `Log.X()` calls across the library have been migrated to `BaluLogger.X()`. Subscribe before creating `Server` to receive startup, encoder-selection, stall, and transport diagnostics in-process without ADB. Handler is wrapped in `try/catch` — subscriber exceptions never propagate to the calling thread.
 
 - v1.5.24: **Text Overlay, Synchronous Streaming, Thread-Safety & Stall Loop Fixes**
   - **Text overlay burn-in** (`Services/FrameOverlay.cs`): up to 4 configurable text slots stamped into NV21/NV12 YUV frames before MediaCodec encodes them. Content types: `DeviceName`, `IpAddress`, `DateTime`, `Date`, `Time`, `Custom`. Anchor positions: all four corners, three top/bottom edge centers, and `Absolute` pixel coordinates. Full RGB color via `OverlayColor` (7 presets + custom). Static slots rendered once; `Time`/`DateTime` refresh each second; `IpAddress` refreshes each minute. Per-frame hot path ≈ 2 µs at 1280×720 (byte-level Y+UV stamp, zero allocation).

@@ -61,7 +61,7 @@ public class H264EncoderManager : IH264EncoderManager
         {
             lock (_backClientChannelsLock) { _backClientChannels[clientId] = channel; }
         }
-        Log.Debug("[EncoderManager]", $"Registered frame channel for client {clientId} camera {cameraId}");
+        BaluLogger.Debug("[EncoderManager]", $"Registered frame channel for client {clientId} camera {cameraId}");
     }
 
     /// <inheritdoc/>
@@ -88,7 +88,7 @@ public class H264EncoderManager : IH264EncoderManager
 
         // Complete the writer so any awaiting ReadAsync gets ChannelClosedException
         channel?.Writer.TryComplete();
-        Log.Debug("[EncoderManager]", $"Unregistered frame channel for client {clientId} camera {cameraId}");
+        BaluLogger.Debug("[EncoderManager]", $"Unregistered frame channel for client {clientId} camera {cameraId}");
     }
 
     /// <inheritdoc/>
@@ -121,7 +121,7 @@ public class H264EncoderManager : IH264EncoderManager
             // Restart encoder if it exists but stopped running (stalled/crashed)
             if (_h264BackEncoder != null && !_h264BackEncoder.IsRunning)
             {
-                Log.Info("[EncoderManager]", "Back encoder stalled — restarting");
+                BaluLogger.Info("[EncoderManager]", "Back encoder stalled — restarting");
                 _h264BackEncoder.FrameEncoded -= OnH264BackFrameEncoded;
                 var staleBackEncoder = _h264BackEncoder;
                 _h264BackEncoder = null;
@@ -135,13 +135,13 @@ public class H264EncoderManager : IH264EncoderManager
             {
                 try
                 {
-                    Log.Debug("[EncoderManager]", $"Starting H264 encoder: {width}x{height}");
+                    BaluLogger.Debug("[EncoderManager]", $"Starting H264 encoder: {width}x{height}");
                     _h264BackEncoder = new H264Encoder(width, height, bitrate: 2000000, frameRate: 25);
 
                     // Check if encoder fell back to different resolution
                     if (_h264BackEncoder.ActualWidth != width || _h264BackEncoder.ActualHeight != height)
                     {
-                        Log.Warn("[EncoderManager]", $"Encoder using {_h264BackEncoder.ActualWidth}x{_h264BackEncoder.ActualHeight} instead of {width}x{height}");
+                        BaluLogger.Warn("[EncoderManager]", $"Encoder using {_h264BackEncoder.ActualWidth}x{_h264BackEncoder.ActualHeight} instead of {width}x{height}");
                     }
 
                     int expectedSize = (_h264BackEncoder.ActualWidth * _h264BackEncoder.ActualHeight * 3) / 2;
@@ -150,16 +150,16 @@ public class H264EncoderManager : IH264EncoderManager
                     _h264BackEncoder.FrameEncoded += OnH264BackFrameEncoded;
                     if (!_h264BackEncoder.Start())
                     {
-                        Log.Error("[EncoderManager]", "Encoder failed to start");
+                        BaluLogger.Error("[EncoderManager]", "Encoder failed to start");
                         _h264BackEncoder.Dispose();
                         _h264BackEncoder = null;
                         return;
                     }
-                    Log.Debug("[EncoderManager]", $"H264 back encoder started: {_h264BackEncoder.ActualWidth}x{_h264BackEncoder.ActualHeight}");
+                    BaluLogger.Debug("[EncoderManager]", $"H264 back encoder started: {_h264BackEncoder.ActualWidth}x{_h264BackEncoder.ActualHeight}");
                 }
                 catch (Exception ex)
                 {
-                    Log.Error("[EncoderManager]", $"Failed to start H264 encoder: {ex.Message}");
+                    BaluLogger.Error("[EncoderManager]", $"Failed to start H264 encoder: {ex.Message}");
                     _h264BackEncoder?.Dispose();
                     _h264BackEncoder = null;
                 }
@@ -174,7 +174,7 @@ public class H264EncoderManager : IH264EncoderManager
             // Restart encoder if it exists but stopped running (stalled/crashed)
             if (_h264FrontEncoder != null && !_h264FrontEncoder.IsRunning)
             {
-                Log.Info("[EncoderManager]", "Front encoder stalled — restarting");
+                BaluLogger.Info("[EncoderManager]", "Front encoder stalled — restarting");
                 _h264FrontEncoder.FrameEncoded -= OnH264FrontFrameEncoded;
                 var staleFrontEncoder = _h264FrontEncoder;
                 _h264FrontEncoder = null;
@@ -188,13 +188,13 @@ public class H264EncoderManager : IH264EncoderManager
             {
                 try
                 {
-                    Log.Debug("[EncoderManager]", $"Starting H264 front encoder: {width}x{height}");
+                    BaluLogger.Debug("[EncoderManager]", $"Starting H264 front encoder: {width}x{height}");
                     _h264FrontEncoder = new H264Encoder(width, height, bitrate: 2000000, frameRate: 25);
 
                     // Check if encoder fell back to different resolution
                     if (_h264FrontEncoder.ActualWidth != width || _h264FrontEncoder.ActualHeight != height)
                     {
-                        Log.Warn("[EncoderManager]", $"Front encoder using {_h264FrontEncoder.ActualWidth}x{_h264FrontEncoder.ActualHeight} instead of {width}x{height}");
+                        BaluLogger.Warn("[EncoderManager]", $"Front encoder using {_h264FrontEncoder.ActualWidth}x{_h264FrontEncoder.ActualHeight} instead of {width}x{height}");
                     }
 
                     int expectedSize = (_h264FrontEncoder.ActualWidth * _h264FrontEncoder.ActualHeight * 3) / 2;
@@ -203,16 +203,16 @@ public class H264EncoderManager : IH264EncoderManager
                     _h264FrontEncoder.FrameEncoded += OnH264FrontFrameEncoded;
                     if (!_h264FrontEncoder.Start())
                     {
-                        Log.Error("[EncoderManager]", "Front encoder failed to start");
+                        BaluLogger.Error("[EncoderManager]", "Front encoder failed to start");
                         _h264FrontEncoder.Dispose();
                         _h264FrontEncoder = null;
                         return;
                     }
-                    Log.Debug("[EncoderManager]", $"H264 front encoder started: {_h264FrontEncoder.ActualWidth}x{_h264FrontEncoder.ActualHeight}");
+                    BaluLogger.Debug("[EncoderManager]", $"H264 front encoder started: {_h264FrontEncoder.ActualWidth}x{_h264FrontEncoder.ActualHeight}");
                 }
                 catch (Exception ex)
                 {
-                    Log.Error("[EncoderManager]", $"Failed to start H264 front encoder: {ex.Message}");
+                    BaluLogger.Error("[EncoderManager]", $"Failed to start H264 front encoder: {ex.Message}");
                     _h264FrontEncoder?.Dispose();
                     _h264FrontEncoder = null;
                 }
@@ -244,7 +244,7 @@ public class H264EncoderManager : IH264EncoderManager
                 _h264BackEncoder.Dispose();
                 _h264BackEncoder = null;
                 _h264BackEncoderExpectedFrameSize = 0;
-                Log.Info("[EncoderManager]", "H264 back encoder stopped");
+                BaluLogger.Info("[EncoderManager]", "H264 back encoder stopped");
             }
         }
     }
@@ -260,7 +260,7 @@ public class H264EncoderManager : IH264EncoderManager
                 _h264FrontEncoder.Dispose();
                 _h264FrontEncoder = null;
                 _h264FrontEncoderExpectedFrameSize = 0;
-                Log.Info("[EncoderManager]", "H264 front encoder stopped");
+                BaluLogger.Info("[EncoderManager]", "H264 front encoder stopped");
             }
         }
     }
@@ -269,7 +269,7 @@ public class H264EncoderManager : IH264EncoderManager
     public void RestartEncoderWithNewSize(int cameraId, int frameSize, int hintWidth, int hintHeight)
     {
         var (width, height) = CalculateDimensionsFromFrameSize(frameSize, hintWidth, hintHeight);
-        Log.Info("[EncoderManager]", $"Restarting encoder with new dimensions: {width}x{height}");
+        BaluLogger.Info("[EncoderManager]", $"Restarting encoder with new dimensions: {width}x{height}");
 
         StopEncoder(cameraId);
         StartEncoder(cameraId, width, height);
@@ -451,7 +451,7 @@ public class H264EncoderManager : IH264EncoderManager
         }
 
         try { FrameEncoded?.Invoke(this, e); }
-        catch (Exception ex) { Android.Util.Log.Error("H264EncoderManager", $"FrameEncoded subscriber error: {ex.Message}"); }
+        catch (Exception ex) { BaluLogger.Error("H264EncoderManager", $"FrameEncoded subscriber error: {ex.Message}"); }
     }
 
     private void OnH264BackFrameEncoded(object? sender, H264FrameEventArgs e)
@@ -480,7 +480,7 @@ public class H264EncoderManager : IH264EncoderManager
         }
 
         try { FrameEncoded?.Invoke(this, e); }
-        catch (Exception ex) { Android.Util.Log.Error("H264EncoderManager", $"FrameEncoded subscriber error: {ex.Message}"); }
+        catch (Exception ex) { BaluLogger.Error("H264EncoderManager", $"FrameEncoded subscriber error: {ex.Message}"); }
     }
 
     private void UpdateSpsPpsCache(H264FrameEventArgs e)

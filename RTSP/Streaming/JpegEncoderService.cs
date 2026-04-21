@@ -76,7 +76,7 @@ public class JpegEncoderService : IDisposable
         _backEncoderTask = Task.Run(() => EncoderLoopAsync(_backInputChannel.Reader, _backOutputChannel.Writer, 0), _cts.Token);
         _frontEncoderTask = Task.Run(() => EncoderLoopAsync(_frontInputChannel.Reader, _frontOutputChannel.Writer, 1), _cts.Token);
 
-        Log.Info("[JpegEncoderService]", $"Started with quality={quality}, inputBuffer={inputBufferSize}, outputBuffer={outputBufferSize}");
+        BaluLogger.Info("[JpegEncoderService]", $"Started with quality={quality}, inputBuffer={inputBufferSize}, outputBuffer={outputBufferSize}");
     }
 
     /// <summary>
@@ -100,7 +100,7 @@ public class JpegEncoderService : IDisposable
     public void SetQuality(int quality)
     {
         _quality = Math.Clamp(quality, 1, 100);
-        Log.Debug("[JpegEncoderService]", $"Quality updated to {_quality}");
+        BaluLogger.Debug("[JpegEncoderService]", $"Quality updated to {_quality}");
     }
 
     /// <summary>
@@ -110,7 +110,7 @@ public class JpegEncoderService : IDisposable
     private async Task EncoderLoopAsync(ChannelReader<FrameEventArgs> input, ChannelWriter<EncodedJpegFrame> output, int cameraId)
     {
         var cameraName = cameraId == 1 ? "Front" : "Back";
-        Log.Debug("[JpegEncoderService]", $"{cameraName} camera encoder loop started");
+        BaluLogger.Debug("[JpegEncoderService]", $"{cameraName} camera encoder loop started");
 
         try
         {
@@ -119,7 +119,7 @@ public class JpegEncoderService : IDisposable
                 // Check disposed flag BEFORE any JNI calls to prevent SIGSEGV
                 if (_disposed)
                 {
-                    Log.Debug("[JpegEncoderService]", $"{cameraName} encoder loop exiting - service disposed");
+                    BaluLogger.Debug("[JpegEncoderService]", $"{cameraName} encoder loop exiting - service disposed");
                     break;
                 }
 
@@ -152,26 +152,26 @@ public class JpegEncoderService : IDisposable
                 {
                     if (!_disposed) // Only log if not disposing
                     {
-                        Log.Error("[JpegEncoderService]", $"{cameraName} encoding error: {ex.Message}");
+                        BaluLogger.Error("[JpegEncoderService]", $"{cameraName} encoding error: {ex.Message}");
                     }
                 }
             }
         }
         catch (OperationCanceledException)
         {
-            Log.Debug("[JpegEncoderService]", $"{cameraName} camera encoder loop cancelled");
+            BaluLogger.Debug("[JpegEncoderService]", $"{cameraName} camera encoder loop cancelled");
         }
         catch (Exception ex)
         {
             if (!_disposed)
             {
-                Log.Error("[JpegEncoderService]", $"{cameraName} camera encoder loop error: {ex.Message}");
+                BaluLogger.Error("[JpegEncoderService]", $"{cameraName} camera encoder loop error: {ex.Message}");
             }
         }
         finally
         {
             output.Complete();
-            Log.Debug("[JpegEncoderService]", $"{cameraName} camera encoder loop stopped");
+            BaluLogger.Debug("[JpegEncoderService]", $"{cameraName} camera encoder loop stopped");
         }
     }
 
@@ -221,7 +221,7 @@ public class JpegEncoderService : IDisposable
                 }
                 else
                 {
-                    Log.Error("[JpegEncoderService]", "Failed to decode image data");
+                    BaluLogger.Error("[JpegEncoderService]", "Failed to decode image data");
                     return Array.Empty<byte>();
                 }
             }
@@ -234,7 +234,7 @@ public class JpegEncoderService : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Error("[JpegEncoderService]", $"JPEG encoding error: {ex.Message}");
+            BaluLogger.Error("[JpegEncoderService]", $"JPEG encoding error: {ex.Message}");
             return Array.Empty<byte>();
         }
         finally
@@ -266,20 +266,20 @@ public class JpegEncoderService : IDisposable
             var tasks = new[] { _backEncoderTask, _frontEncoderTask };
             if (!Task.WaitAll(tasks, TimeSpan.FromSeconds(5)))
             {
-                Log.Warn("[JpegEncoderService]", "Encoder tasks did not complete within 5s timeout");
+                BaluLogger.Warn("[JpegEncoderService]", "Encoder tasks did not complete within 5s timeout");
             }
         }
         catch (AggregateException ex)
         {
-            Log.Warn("[JpegEncoderService]", $"Encoder task errors during dispose: {ex.InnerException?.Message ?? ex.Message}");
+            BaluLogger.Warn("[JpegEncoderService]", $"Encoder task errors during dispose: {ex.InnerException?.Message ?? ex.Message}");
         }
         catch (Exception ex)
         {
-            Log.Warn("[JpegEncoderService]", $"Dispose error: {ex.Message}");
+            BaluLogger.Warn("[JpegEncoderService]", $"Dispose error: {ex.Message}");
         }
 
         _cts?.Dispose();
-        Log.Info("[JpegEncoderService]", "Disposed");
+        BaluLogger.Info("[JpegEncoderService]", "Disposed");
     }
 }
 

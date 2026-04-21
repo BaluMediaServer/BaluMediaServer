@@ -20,6 +20,7 @@ public class H264Encoder : IDisposable
     private MediaCodec? _encoder;
     private int _width;
     private int _height;
+    private int _encodeHeight;  // Encoding height = _height + one extra macroblock row (MediaTek crop workaround)
     private int _bitrate;
     private readonly int _frameRate;
     private volatile bool _isRunning;
@@ -84,6 +85,12 @@ public class H264Encoder : IDisposable
     /// Gets the actual height being used by the encoder after any resolution fallback.
     /// </summary>
     public int ActualHeight => _height;
+
+    /// <summary>
+    /// Gets the number of luma rows to crop from the bottom in the SPS crop rect.
+    /// Non-zero when <see cref="_encodeHeight"/> > <see cref="_height"/> (MediaTek crop workaround).
+    /// </summary>
+    public int CropBottomOffset => _encodeHeight > _height ? (_encodeHeight - _height) / 2 : 0;
 
     /// <summary>
     /// Represents frame data waiting to be encoded.
@@ -158,7 +165,7 @@ public class H264Encoder : IDisposable
                 var codecList = new MediaCodecList(new());
                 var codecInfos = codecList.GetCodecInfos();
                 _cachedBestEncoder = SelectBestEncoder(codecInfos!);
-                Log.Info("H264MTK", $"Encoder selection cached: {_cachedBestEncoder?.Name ?? "none"}");
+                BaluLogger.Info("H264MTK", $"Encoder selection cached: {_cachedBestEncoder?.Name ?? "none"}");
             }
             return _cachedBestEncoder!;
         }
@@ -210,7 +217,7 @@ public class H264Encoder : IDisposable
                 if (encoderInfo != null)
                 {
                     encoders.Add(encoderInfo);
-                    Log.Debug("EncoderSelector", $"Evaluated {encoderInfo.Name}: Score={encoderInfo.Score}");
+                    BaluLogger.Debug("EncoderSelector", $"Evaluated {encoderInfo.Name}: Score={encoderInfo.Score}");
                 }
             }
         }
@@ -219,11 +226,11 @@ public class H264Encoder : IDisposable
         encoders.Sort((a, b) => b.Score.CompareTo(a.Score));
 
         // Log the ranking
-        Log.Debug("EncoderSelector", "Encoder ranking:");
+        BaluLogger.Debug("EncoderSelector", "Encoder ranking:");
         
         foreach (var encoder in encoders)
         {
-            Log.Debug("EncoderSelector", $"  {encoder.Name}: {encoder.Score} points");
+            BaluLogger.Debug("EncoderSelector", $"  {encoder.Name}: {encoder.Score} points");
         }
 
         return encoders.FirstOrDefault()!;
@@ -367,7 +374,7 @@ public class H264Encoder : IDisposable
         }
         catch (Exception e)
         {
-            Log.Error("EncoderSelector", $"Error evaluating encoder {codecInfo.Name}: {e.Message}");
+            BaluLogger.Error("EncoderSelector", $"Error evaluating encoder {codecInfo.Name}: {e.Message}");
             return null!;
         }
     }
@@ -446,7 +453,7 @@ public class H264Encoder : IDisposable
             {
                 if (w <= requestedWidth && h <= requestedHeight && videoCaps.IsSizeSupported(w, h))
                 {
-                    Log.Info("H264", $"ProbeSupportedResolution: {requestedWidth}x{requestedHeight} not supported, using {w}x{h}");
+                    BaluLogger.Info("H264", $"ProbeSupportedResolution: {requestedWidth}x{requestedHeight} not supported, using {w}x{h}");
                     return (w, h);
                 }
             }
@@ -455,7 +462,7 @@ public class H264Encoder : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Error("H264", $"ProbeSupportedResolution error: {ex.Message}");
+            BaluLogger.Error("H264", $"ProbeSupportedResolution error: {ex.Message}");
             return (requestedWidth, requestedHeight);
         }
     }
@@ -476,13 +483,20 @@ public class H264Encoder : IDisposable
                 if (!IsResolutionSupported(_width, _height))
                 {
                     var (newW, newH) = GetNearestSupportedResolution(_width, _height);
-                    Log.Warn("H264", $"Resolution {_width}x{_height} not supported, falling back to {newW}x{newH}");
+                    BaluLogger.Warn("H264", $"Resolution {_width}x{_height} not supported, falling back to {newW}x{newH}");
                     _width = newW;
                     _height = newH;
                 }
 
+                // Encode at one extra 16-pixel macroblock row above the display height.
+                // MediaTek C2MtkVenc corrupts the chroma of the last macroblock row in the
+                // encoded bitstream regardless of input data. By pushing that row into padding
+                // and setting SPS frame_crop_bottom_offset, the decoder hides it — all real
+                // content (rows 0.._height-1) is preserved and displayed correctly.
+                _encodeHeight = ((_height / 16) + 2) * 16; // e.g. 480 → 512 (2 extra macroblock rows)
+
                 // Create format with encoder's supported color format
-                var format = MediaFormat.CreateVideoFormat(MediaFormat.MimetypeVideoAvc, _width, _height);
+                var format = MediaFormat.CreateVideoFormat(MediaFormat.MimetypeVideoAvc, _width, _encodeHeight);
 
                 // Prefer NV12 (SemiPlanar) — it has a well-defined buffer layout for raw
                 // ByteBuffer writes. COLOR_FormatYUV420Flexible has undefined layout for
@@ -490,17 +504,17 @@ public class H264Encoder : IDisposable
                 if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420SemiPlanar))
                 {
                     _selectedColorFormat = COLOR_FormatYUV420SemiPlanar; // NV12
-                    Log.Debug("H264", "Using COLOR_FormatYUV420SemiPlanar (NV12)");
+                    BaluLogger.Debug("H264", "Using COLOR_FormatYUV420SemiPlanar (NV12)");
                 }
                 else if (_bestEncoder.ColorFormats.Contains(COLOR_FormatYUV420Flexible))
                 {
                     _selectedColorFormat = COLOR_FormatYUV420Flexible;
-                    Log.Warn("H264", "Using COLOR_FormatYUV420Flexible (NV12 unavailable)");
+                    BaluLogger.Warn("H264", "Using COLOR_FormatYUV420Flexible (NV12 unavailable)");
                 }
                 else
                 {
                     _selectedColorFormat = COLOR_FormatYUV420SemiPlanar; // Default fallback
-                    Log.Debug("H264", "Using default COLOR_FormatYUV420SemiPlanar");
+                    BaluLogger.Debug("H264", "Using default COLOR_FormatYUV420SemiPlanar");
                 }
 
                 format.SetInteger(MediaFormat.KeyColorFormat, _selectedColorFormat);
@@ -586,7 +600,7 @@ public class H264Encoder : IDisposable
                 // Query actual input format to get stride and sliceHeight
                 // MediaCodec may use larger stride/sliceHeight for alignment
                 _encoderStride = _width;
-                _encoderSliceHeight = _height;
+                _encoderSliceHeight = _encodeHeight; // Default to configured encode height if query fails
                 try
                 {
                     var inputFormat = encoder.InputFormat;
@@ -595,18 +609,18 @@ public class H264Encoder : IDisposable
                         if (OperatingSystem.IsAndroidVersionAtLeast(29))
                         {
                             _encoderStride = inputFormat.GetInteger(MediaFormat.KeyStride, _width);
-                            _encoderSliceHeight = inputFormat.GetInteger(MediaFormat.KeySliceHeight, _height);
-                            Log.Info("H264", $"Encoder input: stride={_encoderStride}, sliceHeight={_encoderSliceHeight} (video={_width}x{_height})");
+                            _encoderSliceHeight = inputFormat.GetInteger(MediaFormat.KeySliceHeight, _encodeHeight);
+                            BaluLogger.Info("H264", $"Encoder input: stride={_encoderStride}, sliceHeight={_encoderSliceHeight} (video={_width}x{_height}, encode={_encodeHeight})");
                         }
 
                         // Some encoders return 0 meaning "same as configured"
                         if (_encoderStride <= 0) _encoderStride = _width;
-                        if (_encoderSliceHeight <= 0) _encoderSliceHeight = _height;
+                        if (_encoderSliceHeight <= 0) _encoderSliceHeight = _encodeHeight;
                     }
                 }
                 catch (Exception ex)
                 {
-                    Log.Warn("H264", $"Could not query input format: {ex.Message}");
+                    BaluLogger.Warn("H264", $"Could not query input format: {ex.Message}");
                 }
 
                 // Start encoding thread
@@ -618,16 +632,16 @@ public class H264Encoder : IDisposable
                 };
                 _encoderThread.Start();
 
-                Log.Info("H264", $"Encoder started successfully: {_bestEncoder.Name}");
-                Log.Info("H264", $"Format: {_width}x{_height} @ {_frameRate}fps, {_bitrate}bps");
-                Log.Info("H264", $"Color format: {_selectedColorFormat}");
+                BaluLogger.Info("H264", $"Encoder started successfully: {_bestEncoder.Name}");
+                BaluLogger.Info("H264", $"Format: {_width}x{_height} (encode:{_encodeHeight}) @ {_frameRate}fps, {_bitrate}bps, cropBottom={CropBottomOffset}");
+                BaluLogger.Info("H264", $"Color format: {_selectedColorFormat}");
                 
                 return true;
             }
             catch (Exception ex)
             {
-                Log.Error("H264", $"Failed to start encoder: {ex.Message}");
-                Log.Error("H264", $"Stack trace: {ex.StackTrace}");
+                BaluLogger.Error("H264", $"Failed to start encoder: {ex.Message}");
+                BaluLogger.Error("H264", $"Stack trace: {ex.StackTrace}");
                 
                 try
                 {
@@ -636,7 +650,7 @@ public class H264Encoder : IDisposable
                 }
                 catch (Exception releaseEx)
                 {
-                    Log.Error("H264", $"Error releasing encoder: {releaseEx.Message}");
+                    BaluLogger.Error("H264", $"Error releasing encoder: {releaseEx.Message}");
                 }
                 
                 _encoder = null;
@@ -661,11 +675,11 @@ public class H264Encoder : IDisposable
                 var bundle = new Bundle();
                 bundle.PutInt(MediaCodec.ParameterKeyRequestSyncFrame, 0);
                 _encoder.SetParameters(bundle);
-                Log.Debug("H264MTK", "IDR keyframe requested for new client");
+                BaluLogger.Debug("H264MTK", "IDR keyframe requested for new client");
             }
             catch (Exception ex)
             {
-                Log.Warn("H264MTK", $"RequestKeyFrame failed: {ex.Message}");
+                BaluLogger.Warn("H264MTK", $"RequestKeyFrame failed: {ex.Message}");
             }
         }
     }
@@ -692,11 +706,11 @@ public class H264Encoder : IDisposable
                 // Store the new bitrate
                 _bitrate = newBitrate;
                 
-                Log.Debug("H264MTK", $"Bitrate updated to: {newBitrate}bps");
+                BaluLogger.Debug("H264MTK", $"Bitrate updated to: {newBitrate}bps");
             }
             catch (Exception ex)
             {
-                Log.Error("H264MTK", $"Failed to update bitrate: {ex.Message}");
+                BaluLogger.Error("H264MTK", $"Failed to update bitrate: {ex.Message}");
             }
         }
     }
@@ -727,7 +741,7 @@ public class H264Encoder : IDisposable
 
         if (frameData.Length != expectedSize)
         {
-            Log.Error("H264", $"Invalid frame size: {frameData.Length}, expected: {expectedSize} (encoder: {_width}x{_height})");
+            BaluLogger.Error("H264", $"Invalid frame size: {frameData.Length}, expected: {expectedSize} (encoder: {_width}x{_height})");
             return;
         }
 
@@ -777,7 +791,7 @@ public class H264Encoder : IDisposable
         int _outputFrameCount = 0;
         long _prevOutputTicks = 0;
 
-        Log.Debug("H264MTK", "Encoding loop started");
+        BaluLogger.Debug("H264MTK", "Encoding loop started");
 
         try
         {
@@ -814,7 +828,7 @@ public class H264Encoder : IDisposable
                             double inputToOutputMs = (_lastInputTicks > 0)
                                 ? (outputNow - _lastInputTicks) * 1000.0 / Stopwatch.Frequency
                                 : 0;
-                            Log.Info("H264Latency", $"Encoder: avg output interval={intervalMs:F1}ms, last input→output={inputToOutputMs:F1}ms, frames={_outputFrameCount}");
+                            BaluLogger.Info("H264Latency", $"Encoder: avg output interval={intervalMs:F1}ms, last input→output={inputToOutputMs:F1}ms, frames={_outputFrameCount}");
                         }
                         _prevOutputTicks = outputNow;
                         _lastOutputTicks = outputNow;
@@ -841,7 +855,7 @@ public class H264Encoder : IDisposable
 
                         if (sinceLastOutput > StallThresholdTicks && sinceLastInput < StallThresholdTicks && gotFirstOutput)
                         {
-                            Log.Error("H264MTK", $"Output stall detected: no output for {sinceLastOutput / Stopwatch.Frequency}s while input is active (gotFirstOutput={gotFirstOutput}) — stopping encoder");
+                            BaluLogger.Error("H264MTK", $"Output stall detected: no output for {sinceLastOutput / Stopwatch.Frequency}s while input is active (gotFirstOutput={gotFirstOutput}) — stopping encoder");
                             _isRunning = false;
                             break;
                         }
@@ -869,12 +883,12 @@ public class H264Encoder : IDisposable
                     if (_disposed) break;
 
                     consecutiveErrors++;
-                    Log.Error("H264MTK", $"Encoding loop error ({consecutiveErrors}/{maxConsecutiveErrors}): {ex.Message}");
+                    BaluLogger.Error("H264MTK", $"Encoding loop error ({consecutiveErrors}/{maxConsecutiveErrors}): {ex.Message}");
 
                     // Break out of loop if too many consecutive errors - encoder likely in bad state
                     if (consecutiveErrors >= maxConsecutiveErrors)
                     {
-                        Log.Error("H264MTK", "Too many consecutive errors - stopping encoder loop");
+                        BaluLogger.Error("H264MTK", "Too many consecutive errors - stopping encoder loop");
                         _isRunning = false;
                         break;
                     }
@@ -891,7 +905,7 @@ public class H264Encoder : IDisposable
             catch { }
         }
 
-        Log.Debug("H264MTK", "Encoding loop ended");
+        BaluLogger.Debug("H264MTK", "Encoding loop ended");
     }
     
     /// <summary>
@@ -899,7 +913,7 @@ public class H264Encoder : IDisposable
     /// Handles color format conversion and stride padding as needed.
     /// </summary>
     private bool _loggedFirstFeed = false;
-    private bool _loggedFirstWriteFrame = false;
+    private int _writeFrameLogCounter = 0;
 
     public void FeedInputBuffer(FrameData frame)
     {
@@ -946,7 +960,7 @@ public class H264Encoder : IDisposable
                     if (!_loggedFirstFeed)
                     {
                         _loggedFirstFeed = true;
-                        Log.Info("H264", $"DIAG feed: frameLen={frameData.Length}, expected={expectedSize}, encoder={_width}x{_height}, src={frame.SourceWidth}x{frame.SourceHeight}, bufCap={inputBuffer.Capacity()}, stride={_encoderStride}, slice={_encoderSliceHeight}, colorFmt={_selectedColorFormat}");
+                        BaluLogger.Info("H264", $"DIAG feed: frameLen={frameData.Length}, expected={expectedSize}, encoder={_width}x{_height}, src={frame.SourceWidth}x{frame.SourceHeight}, bufCap={inputBuffer.Capacity()}, stride={_encoderStride}, slice={_encoderSliceHeight}, colorFmt={_selectedColorFormat}");
                     }
 
                     // Write frame directly to encoder buffer with correct stride/sliceHeight layout
@@ -961,7 +975,7 @@ public class H264Encoder : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Error("H264MTK", $"Feed input error: {ex.Message}");
+            BaluLogger.Error("H264MTK", $"Feed input error: {ex.Message}");
         }
     }
     /// <summary>
@@ -999,8 +1013,8 @@ public class H264Encoder : IDisposable
         int dstUvPlaneSize = stride * (sliceHeight / 2);
         int totalDstSize = dstYPlaneSize + dstUvPlaneSize;
 
-        // Deduce sliceHeight from buffer capacity if query failed (defaults matched height)
-        if (sliceHeight == _height && inputBuffer.Capacity() > totalDstSize + stride)
+        // Deduce sliceHeight from buffer capacity if query failed (defaults matched encode height)
+        if (sliceHeight == _encodeHeight && inputBuffer.Capacity() > totalDstSize + stride)
         {
             // Buffer is larger than expected — encoder likely has bigger sliceHeight
             // sliceHeight = bufferCapacity * 2 / (stride * 3)
@@ -1012,14 +1026,13 @@ public class H264Encoder : IDisposable
                 dstYPlaneSize = stride * sliceHeight;
                 dstUvPlaneSize = stride * (sliceHeight / 2);
                 totalDstSize = dstYPlaneSize + dstUvPlaneSize;
-                Log.Info("H264", $"Deduced encoder sliceHeight={sliceHeight} from bufCap={inputBuffer.Capacity()} (stride={stride})");
+                BaluLogger.Info("H264", $"Deduced encoder sliceHeight={sliceHeight} from bufCap={inputBuffer.Capacity()} (stride={stride})");
             }
         }
 
-        if (!_loggedFirstWriteFrame)
+        if (_writeFrameLogCounter++ % 300 == 0)
         {
-            _loggedFirstWriteFrame = true;
-            Log.Info("H264", $"WriteFrame: src={srcWidth}x{srcHeight}, encoder={_width}x{_height}, stride={stride}, slice={sliceHeight}, bufCap={inputBuffer.Capacity()}, srcUvStart={srcUvStart}, dstYPlane={dstYPlaneSize}, frameLen={frameData.Length}");
+            BaluLogger.Info("H264", $"WriteFrame: src={srcWidth}x{srcHeight}, enc={_width}x{_height}, stride={stride}, slice={sliceHeight}, bufCap={inputBuffer.Capacity()}, srcUvStart={srcUvStart}, dstYPlane={dstYPlaneSize}, frameLen={frameData.Length}");
         }
 
         int copyWidth = Math.Min(srcWidth, _width);
@@ -1043,11 +1056,24 @@ public class H264Encoder : IDisposable
             if (stride > copyWidth)
                 Array.Clear(encoderData, dstOff + copyWidth, stride - copyWidth);
         }
-        // Zero bottom Y padding rows only when sliceHeight > copyHeight
+        // Fill bottom Y padding rows: duplicate last real row into the extra-macroblock region
+        // so the MediaTek encoder has valid input for the rows that will be hidden by the SPS crop.
+        // Zero any additional rows beyond _encodeHeight (encoder alignment padding).
         if (copyHeight < sliceHeight)
         {
-            int yPadStart = copyHeight * stride;
-            Array.Clear(encoderData, yPadStart, dstYPlaneSize - yPadStart);
+            int encRows = Math.Min(_encodeHeight, sliceHeight);
+            if (copyHeight > 0 && encRows > copyHeight)
+            {
+                int lastRowOff = (copyHeight - 1) * stride;
+                for (int r = copyHeight; r < encRows; r++)
+                {
+                    int dstOff = r * stride;
+                    System.Buffer.BlockCopy(encoderData, lastRowOff, encoderData, dstOff, copyWidth);
+                    if (stride > copyWidth) Array.Clear(encoderData, dstOff + copyWidth, stride - copyWidth);
+                }
+            }
+            if (encRows < sliceHeight)
+                Array.Clear(encoderData, encRows * stride, dstYPlaneSize - encRows * stride);
         }
 
         // Copy UV plane: NV21 (VU interleaved) → NV12 (UV interleaved) with U/V swap
@@ -1065,15 +1091,57 @@ public class H264Encoder : IDisposable
                 encoderData[dstOff + i] = frameData[srcOff + i + 1];     // U
                 encoderData[dstOff + i + 1] = frameData[srcOff + i];     // V
             }
-            // Zero UV column padding only when stride > copyUvWidth
+            // Fill UV column padding with neutral chroma (0x80) — U=128, V=128 is gray.
+            // Cleared-to-zero UV (U=0, V=0) decodes to green (R:0 G:135 B:0 in BT.601).
             if (stride > copyUvWidth)
-                Array.Clear(encoderData, dstOff + copyUvWidth, stride - copyUvWidth);
+                new Span<byte>(encoderData, dstOff + copyUvWidth, stride - copyUvWidth).Fill(0x80);
         }
-        // Zero bottom UV padding rows only when sliceHeight/2 > copyUvHeight
+        // Scan the last 16 NV12 UV rows for the deepest non-zero row and copy it
+        // over any zeroed rows below it. Defense-in-depth: SanitizeNv21BottomUv already
+        // patched the NV21 source, but the NV21→NV12 swap may expose new zeros.
+        const int uvScanLimit = 16;
+        int scanEnd = Math.Max(0, copyUvHeight - uvScanLimit);
+        int lastGoodUvRow = -1;
+        for (int r = copyUvHeight - 1; r >= scanEnd; r--)
+        {
+            int off = dstYPlaneSize + r * stride;
+            if (off + 4 > encoderDataSize) continue;
+            if (encoderData[off] != 0 || encoderData[off + 1] != 0
+             || encoderData[off + 2] != 0 || encoderData[off + 3] != 0)
+            { lastGoodUvRow = r; break; }
+        }
+        if (lastGoodUvRow >= 0 && lastGoodUvRow < copyUvHeight - 1)
+        {
+            int srcOff = dstYPlaneSize + lastGoodUvRow * stride;
+            for (int r = lastGoodUvRow + 1; r < copyUvHeight; r++)
+            {
+                int dstOff = dstYPlaneSize + r * stride;
+                if (dstOff + copyUvWidth > encoderDataSize) break;
+                System.Buffer.BlockCopy(encoderData, srcOff, encoderData, dstOff, copyUvWidth);
+            }
+        }
+
+        // Fill bottom UV padding rows: duplicate last real UV row into the extra-macroblock region.
+        // Fill any additional rows beyond _encodeHeight/2 with neutral chroma (0x80 = gray).
         if (copyUvHeight < sliceHeight / 2)
         {
-            int uvPadStart = dstYPlaneSize + copyUvHeight * stride;
-            Array.Clear(encoderData, uvPadStart, dstUvPlaneSize - uvPadStart);
+            int encUvRows = Math.Min(_encodeHeight / 2, sliceHeight / 2);
+            if (copyUvHeight > 0 && encUvRows > copyUvHeight)
+            {
+                int lastUvOff = dstYPlaneSize + (copyUvHeight - 1) * stride;
+                for (int r = copyUvHeight; r < encUvRows; r++)
+                {
+                    int dstOff = dstYPlaneSize + r * stride;
+                    System.Buffer.BlockCopy(encoderData, lastUvOff, encoderData, dstOff, copyUvWidth);
+                    if (stride > copyUvWidth)
+                        new Span<byte>(encoderData, dstOff + copyUvWidth, stride - copyUvWidth).Fill(0x80);
+                }
+            }
+            if (encUvRows < sliceHeight / 2)
+            {
+                int uvRemStart = dstYPlaneSize + encUvRows * stride;
+                new Span<byte>(encoderData, uvRemStart, dstUvPlaneSize - encUvRows * stride).Fill(0x80);
+            }
         }
 
         int writeSize = Math.Min(encoderDataSize, inputBuffer.Capacity());
@@ -1136,7 +1204,7 @@ public class H264Encoder : IDisposable
         // Log crop parameters once for debugging
         if (_lastLoggedSize != frameData.Length)
         {
-            Log.Info("H264", $"CropAndDestride: src={srcWidth}x{srcHeight} actual={srcStride}x{actualSrcHeight}, dst={dstWidth}x{dstHeight}, data={frameData.Length}");
+            BaluLogger.Info("H264", $"CropAndDestride: src={srcWidth}x{srcHeight} actual={srcStride}x{actualSrcHeight}, dst={dstWidth}x{dstHeight}, data={frameData.Length}");
         }
 
         // If source and dest are same resolution and no stride padding, return as-is
@@ -1236,7 +1304,7 @@ public class H264Encoder : IDisposable
                     if ((bufferInfo.Flags & MediaCodecBufferFlags.CodecConfig) != 0)
                     {
                         ParseConfigFrame(data, ref sps, ref pps);
-                        Log.Debug("H264MTK", "Got config frame");
+                        BaluLogger.Debug("H264MTK", "Got config frame");
                     }
                     else
                     {
@@ -1280,7 +1348,7 @@ public class H264Encoder : IDisposable
             else if (outputIndex == (int)MediaCodecInfoState.OutputFormatChanged)
             {
                 var format = _encoder.OutputFormat;
-                Log.Debug("H264MTK", $"Output format changed: {format}");
+                BaluLogger.Debug("H264MTK", $"Output format changed: {format}");
                 
                 // Extract SPS/PPS from format
                 ExtractParameterSets(format, ref sps, ref pps);
@@ -1288,7 +1356,7 @@ public class H264Encoder : IDisposable
             }
             else if (outputIndex == (int)MediaCodecInfoState.OutputBuffersChanged)
             {
-                Log.Debug("H264MTK", "Output buffers changed");
+                BaluLogger.Debug("H264MTK", "Output buffers changed");
                 return true;
             }
             
@@ -1296,7 +1364,7 @@ public class H264Encoder : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Error("H264MTK", $"Drain output error: {ex.Message}");
+            BaluLogger.Error("H264MTK", $"Drain output error: {ex.Message}");
             return false;
         }
     }
@@ -1324,7 +1392,7 @@ public class H264Encoder : IDisposable
             if (offset > 0 && nal.Length > offset)
             {
                 var nalType = nal[offset] & 0x1F;
-                if (nalType == 7) sps = nal;
+                if (nalType == 7) sps = PatchSpsForCrop(nal);
                 else if (nalType == 8) pps = nal;
             }
         }
@@ -1420,11 +1488,11 @@ public class H264Encoder : IDisposable
                         if (offset > 0 && nal.Length > offset)
                         {
                             int nalType = nal[offset] & 0x1F;
-                            if (nalType == 7) sps = nal;
+                            if (nalType == 7) sps = PatchSpsForCrop(nal);
                             else if (nalType == 8) pps = nal;
                         }
                     }
-                    Log.Debug("H264Encoder", $"Got SPS/PPS from csd-0: {csd0.Length} bytes, {nalUnits.Count} NAL(s)");
+                    BaluLogger.Debug("H264Encoder", $"Got SPS/PPS from csd-0: {csd0.Length} bytes, {nalUnits.Count} NAL(s)");
                 }
             }
 
@@ -1437,13 +1505,13 @@ public class H264Encoder : IDisposable
                     pps = new byte[ppsBuffer.Remaining()];
                     ppsBuffer.Get(pps);
                     ppsBuffer.Rewind();
-                    Log.Debug("H264Encoder", $"Got PPS from csd-1: {pps.Length} bytes");
+                    BaluLogger.Debug("H264Encoder", $"Got PPS from csd-1: {pps.Length} bytes");
                 }
             }
         }
         catch (Exception ex)
         {
-            Log.Error("H264Encoder", $"Error extracting parameter sets: {ex.Message}");
+            BaluLogger.Error("H264Encoder", $"Error extracting parameter sets: {ex.Message}");
         }
     }
     
@@ -1457,7 +1525,7 @@ public class H264Encoder : IDisposable
         
         if (nv21.Length < ySize + uvSize)
         {
-            Log.Error("H264MTK", $"Invalid frame size: {nv21.Length}, expected: {ySize + uvSize}");
+            BaluLogger.Error("H264MTK", $"Invalid frame size: {nv21.Length}, expected: {ySize + uvSize}");
             return nv21; // Return as-is to avoid crash
         }
         
@@ -1476,6 +1544,123 @@ public class H264Encoder : IDisposable
         return nv12;
     }
     
+    // ── SPS crop patch helpers ─────────────────────────────────────────────────────
+    // Patches a raw SPS NAL unit (with 3- or 4-byte start code) to add
+    // frame_cropping_flag=1 and frame_crop_bottom_offset=CropBottomOffset.
+    // This hides the extra macroblock row from decoders while preserving all
+    // real content. Called once per SPS, not per frame.
+
+    private byte[] PatchSpsForCrop(byte[] spsNal)
+    {
+        int cropOffset = CropBottomOffset;
+        if (cropOffset <= 0) return spsNal;
+
+        int scLen = 0;
+        if (spsNal.Length >= 4 && spsNal[0] == 0 && spsNal[1] == 0 && spsNal[2] == 0 && spsNal[3] == 1)
+            scLen = 4;
+        else if (spsNal.Length >= 3 && spsNal[0] == 0 && spsNal[1] == 0 && spsNal[2] == 1)
+            scLen = 3;
+        if (scLen == 0 || scLen + 1 >= spsNal.Length) return spsNal;
+        if ((spsNal[scLen] & 0x1F) != 7) return spsNal; // not SPS
+
+        // Build bit list from RBSP body (after NAL header byte)
+        var bits = new List<bool>((spsNal.Length - scLen - 1) * 8);
+        for (int i = scLen + 1; i < spsNal.Length; i++)
+        {
+            byte b = spsNal[i];
+            for (int k = 7; k >= 0; k--) bits.Add(((b >> k) & 1) == 1);
+        }
+
+        int pos = 0;
+        try
+        {
+            int profileIdc = SpsReadBits(bits, ref pos, 8);
+            SpsReadBits(bits, ref pos, 8);  // constraint_flags
+            SpsReadBits(bits, ref pos, 8);  // level_idc
+            SpsReadUe(bits, ref pos);       // seq_parameter_set_id
+
+            // Bail on high profiles — their extensions require full parsing
+            if (profileIdc == 100 || profileIdc == 110 || profileIdc == 122 || profileIdc == 244 ||
+                profileIdc ==  44 || profileIdc ==  83 || profileIdc ==  86 || profileIdc == 118 ||
+                profileIdc == 128 || profileIdc == 138 || profileIdc == 134 || profileIdc == 135)
+                return spsNal;
+
+            SpsReadUe(bits, ref pos);       // log2_max_frame_num_minus4
+            int pocType = SpsReadUe(bits, ref pos);
+            if (pocType == 0)
+                SpsReadUe(bits, ref pos);   // log2_max_pic_order_cnt_lsb_minus4
+            else if (pocType == 1)
+            {
+                pos++;                      // delta_pic_order_always_zero_flag
+                SpsReadSe(bits, ref pos); SpsReadSe(bits, ref pos);
+                int n = SpsReadUe(bits, ref pos);
+                for (int i = 0; i < n; i++) SpsReadSe(bits, ref pos);
+            }
+
+            SpsReadUe(bits, ref pos);       // num_ref_frames
+            pos++;                          // gaps_in_frame_num_value_allowed_flag
+            SpsReadUe(bits, ref pos);       // pic_width_in_mbs_minus1
+            SpsReadUe(bits, ref pos);       // pic_height_in_map_units_minus1
+
+            bool frameMbsOnly = bits[pos++];
+            if (!frameMbsOnly) pos++;       // mb_adaptive_frame_field_flag
+            pos++;                          // direct_8x8_inference_flag
+
+            if (bits[pos]) return spsNal;   // frame_cropping_flag already set — skip
+            bits[pos] = true;               // set frame_cropping_flag = 1
+            pos++;
+
+            var ins = new List<bool>();
+            SpsAppendUe(ins, 0);            // crop_left
+            SpsAppendUe(ins, 0);            // crop_right
+            SpsAppendUe(ins, 0);            // crop_top
+            SpsAppendUe(ins, cropOffset);   // crop_bottom
+            bits.InsertRange(pos, ins);
+        }
+        catch { return spsNal; }
+
+        // Rebuild: start code + NAL header + patched RBSP
+        int rbspBytes = (bits.Count + 7) / 8;
+        var result = new byte[scLen + 1 + rbspBytes];
+        for (int i = 0; i < scLen; i++) result[i] = spsNal[i];
+        result[scLen] = spsNal[scLen]; // NAL header
+        for (int i = 0; i < bits.Count; i++)
+            if (bits[i]) result[scLen + 1 + i / 8] |= (byte)(1 << (7 - (i % 8)));
+
+        BaluLogger.Info("H264", $"SPS patched: added crop_bottom={cropOffset} ({spsNal.Length} → {result.Length} bytes)");
+        return result;
+    }
+
+    private static int SpsReadBits(List<bool> bits, ref int pos, int count)
+    {
+        int v = 0;
+        for (int i = 0; i < count; i++) v = (v << 1) | (bits[pos++] ? 1 : 0);
+        return v;
+    }
+
+    private static int SpsReadUe(List<bool> bits, ref int pos)
+    {
+        int m = 0;
+        while (pos < bits.Count && !bits[pos++]) m++;
+        int info = 0;
+        for (int i = 0; i < m; i++) info = (info << 1) | (bits[pos++] ? 1 : 0);
+        return (1 << m) - 1 + info;
+    }
+
+    private static void SpsReadSe(List<bool> bits, ref int pos) => SpsReadUe(bits, ref pos);
+
+    private static void SpsAppendUe(List<bool> bits, int value)
+    {
+        int x = value + 1;
+        int m = 0;
+        while ((x >> (m + 1)) > 0) m++;
+        for (int i = 0; i < m; i++) bits.Add(false);
+        bits.Add(true);
+        for (int i = m - 1; i >= 0; i--) bits.Add(((x >> i) & 1) == 1);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+
     /// <summary>
     /// Stops the encoder and releases all resources.
     /// Sets _disposed flag FIRST to stop encoder loop before any JNI cleanup.
@@ -1497,7 +1682,7 @@ public class H264Encoder : IDisposable
             {
                 if (!_encoderThread.Join(500))
                 {
-                    Log.Warn("H264MTK", "Encoder thread did not stop within 500ms timeout");
+                    BaluLogger.Warn("H264MTK", "Encoder thread did not stop within 500ms timeout");
                 }
             }
 
@@ -1515,16 +1700,16 @@ public class H264Encoder : IDisposable
 
                 if (!releaseTask.Wait(TimeSpan.FromSeconds(0.5)))
                 {
-                    Log.Warn("H264MTK", "Encoder.Release() timed out (500ms) - may cause resource leak");
+                    BaluLogger.Warn("H264MTK", "Encoder.Release() timed out (500ms) - may cause resource leak");
                 }
             }
             catch (System.Exception ex)
             {
-                Log.Error("H264MTK", $"Error stopping encoder: {ex.Message}");
+                BaluLogger.Error("H264MTK", $"Error stopping encoder: {ex.Message}");
             }
 
             _encoder = null;
-            Log.Info("H264MTK", "Encoder stopped and disposed");
+            BaluLogger.Info("H264MTK", "Encoder stopped and disposed");
         }
     }
     

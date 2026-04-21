@@ -126,7 +126,7 @@ public class AuthenticationManager : IAuthenticationManager
             }
             catch (Exception ex)
             {
-                Log.Error("[AuthManager]", $"Failed to decode Basic auth: {ex.Message}");
+                BaluLogger.Error("[AuthManager]", $"Failed to decode Basic auth: {ex.Message}");
                 return null;
             }
         }
@@ -173,14 +173,14 @@ public class AuthenticationManager : IAuthenticationManager
             // Check if this is a nonce we generated
             if (!_nonceCache.ContainsKey(auth.Nonce))
             {
-                Log.Debug("[AuthManager]", $"Unknown nonce: {auth.Nonce}");
+                BaluLogger.Debug("[AuthManager]", $"Unknown nonce: {auth.Nonce}");
                 return false;
             }
 
             // Check if nonce is expired
             if (!IsNonceValid(auth.Nonce))
             {
-                Log.Debug("[AuthManager]", "Nonce expired");
+                BaluLogger.Debug("[AuthManager]", "Nonce expired");
                 _nonceCache.TryRemove(auth.Nonce, out _);
                 return false;
             }
@@ -190,7 +190,7 @@ public class AuthenticationManager : IAuthenticationManager
 
             if (string.IsNullOrEmpty(providedResponse))
             {
-                Log.Debug("[AuthManager]", "No response in digest auth");
+                BaluLogger.Debug("[AuthManager]", "No response in digest auth");
                 return false;
             }
 
@@ -233,18 +233,18 @@ public class AuthenticationManager : IAuthenticationManager
 
             if (isValid)
             {
-                Log.Debug("[AuthManager]", $"User {auth.Username} authenticated successfully");
+                BaluLogger.Debug("[AuthManager]", $"User {auth.Username} authenticated successfully");
             }
             else
             {
-                Log.Debug("[AuthManager]", $"Authentication failed for user {auth.Username}");
+                BaluLogger.Debug("[AuthManager]", $"Authentication failed for user {auth.Username}");
             }
 
             return isValid;
         }
         catch (Exception ex)
         {
-            Log.Error("[AuthManager]", $"Error validating digest auth: {ex.Message}");
+            BaluLogger.Error("[AuthManager]", $"Error validating digest auth: {ex.Message}");
             return false;
         }
     }

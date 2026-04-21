@@ -20,7 +20,7 @@
 		<RepositoryUrl>https://github.com/BaluMediaServer/BaluMediaServer</RepositoryUrl>
 		<RepositoryType>git</RepositoryType>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
-		<PackageReleaseNotes>v1.5.25: Performance, Stability &amp; FrameOverlay — Added YUV-level text burn-in (FrameOverlay) via ServerConfiguration.BackCameraOverlaySlots / FrontCameraOverlaySlots; BT.601 limited-range color conversion, drop-shadow, configurable anchor, font size, color, and alpha; H.264 only, per-frame hot path ~2µs. Fixed simultaneous-connect race: replaced volatile bool _isStreaming with Interlocked.CompareExchange on int flag so CameraStartRequested and StreamingStateChanged(true) each fire exactly once regardless of concurrent SETUP requests. Replaced Thread.Sleep in FramePacer with SpinWait for sub-millisecond precision. Added per-CameraId Channel caching in EncoderManager to avoid repeated allocation on reconnect. Selective buffer zeroing: only pad bytes written to encoder input buffer rather than zeroing the full stride-aligned region. Narrowed fan-out lock in RtpPacketBuilder to cover only the client list snapshot, not the entire send loop. Removed unreachable dead-code paths in StreamingController. Build: replaced all CA1416 Build.VERSION guards with OperatingSystem.IsAndroidVersionAtLeast(); removed stale XML doc param tags (CS1572); fixed CS8603 null-forgiving on cached encoder field; removed unused dropped-frame counters (CS0169); pinned Xamarin.AndroidX.Collection.Ktx 1.5.0.1 to silence NU1608; rewrote Transforms/Metadata.xml removing ~30 stale rules that produced BG8A00 noise.</PackageReleaseNotes>
+		<PackageReleaseNotes>v1.5.25: Performance, Stability, Server Restart Hardening &amp; In-Process Logging — Hot-path: persistent SpinWait escalation fix (was resetting each iteration, burning CPU); per-client Channel ref caching eliminates 50 dict-lock acquisitions/s/client; selective encoder buffer zeroing (zero Array.Clear on common path); fan-out lock narrowed to snapshot only; dead ConvertNV21ToNV12Pooled removed; ProbeSupportedResolution uses cached encoder. Simultaneous-connect race fix: volatile bool replaced with Interlocked.CompareExchange int flag so CameraStartRequested and StreamingStateChanged(true) each fire exactly once. Server restart hardening: Stop() now calls StopCapture() on both cameras (fixes hung camera2 session surviving watchdog restarts), ClearAllClients(), SetStreamingState(false), and resets _isCapturingBack/Front flags; OnStreaming fires only on real state transitions (was firing every 5s unconditionally); PreStartCameraAndEncoder guards SetStreamingState with if(!_isStreaming). In-process logging: BaluLogger static class wraps all 264+ Log.X() calls — writes to logcat AND fires BaluLogger.OnLog (BaluLogEventArgs with Level/Tag/Message/Timestamp) so apps receive full internal diagnostics without ADB. FrameOverlay: YUV-level text burn-in via ServerConfiguration.BackCameraOverlaySlots/FrontCameraOverlaySlots; BT.601, drop-shadow, configurable anchor/size/color; H.264 only; ~2µs/frame. Build: CA1416 guards replaced with OperatingSystem.IsAndroidVersionAtLeast(); CS8603/CS1572/CS0169 fixed; Xamarin.AndroidX.Collection.Ktx 1.5.0.1 pinned; Metadata.xml rewritten removing 30 stale BG8A00 rules.</PackageReleaseNotes>
 		
 		<!-- Include symbols for debugging -->
 		<IncludeSymbols>true</IncludeSymbols>
@@ -49,5 +49,10 @@
 
 	<ItemGroup>
 		<TransformFile Include="Transforms\Metadata.xml" />
+	</ItemGroup>
+
+	<!-- Make BaluLogger available in every file without an explicit using statement -->
+	<ItemGroup>
+		<Using Include="BaluMediaServer" />
 	</ItemGroup>
 </Project>

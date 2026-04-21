@@ -164,7 +164,7 @@ public class RtspProtocolHandler : IRtspProtocolHandler
             return;
         }
 
-        Log.Debug("[RtspProtocol]", $"Transport: {transport}");
+        BaluLogger.Debug("[RtspProtocol]", $"Transport: {transport}");
         var transportParams = _transportManager.ParseTransport(transport);
         var responseHeaders = new Dictionary<string, string>
         {

@@ -340,7 +340,7 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
                 {
                     if (!_thread.Wait(TimeSpan.FromSeconds(5)))
                     {
-                        global::Android.Util.Log.Warn("[FrontCameraService]", "Processing task did not stop within 5s timeout");
+                        BaluLogger.Warn("[FrontCameraService]", "Processing task did not stop within 5s timeout");
                     }
                 }
                 catch { }
