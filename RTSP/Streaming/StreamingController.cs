@@ -432,8 +432,6 @@ public class StreamingController : IStreamingController
             }
         }
 
-        long dequeuedAt = System.Diagnostics.Stopwatch.GetTimestamp();
-
         if (h264Frame == null || h264Frame.NalUnits.Count == 0)
         {
             return false;
@@ -525,22 +523,7 @@ public class StreamingController : IStreamingController
             }
 
             // Synchronous send — blocking syscall on the dedicated OS thread, no thread-pool hop
-            long preSendAt = System.Diagnostics.Stopwatch.GetTimestamp();
             _transportManager.SendBatchSync(client, rtpBatch);
-            long postSendAt = System.Diagnostics.Stopwatch.GetTimestamp();
-
-            // Detailed latency breakdown every 25 frames:
-            //   queue  = frame wait in channel (scheduling latency target: <5ms)
-            //   build  = IDR detection + RTP packet construction
-            //   send   = socket.Send() syscall (target: <2ms on LAN)
-            if (h264Frame.EncodedAt > 0 && client.FrameCount % 25 == 1)
-            {
-                double freq = System.Diagnostics.Stopwatch.Frequency;
-                double queueMs = (dequeuedAt  - h264Frame.EncodedAt) * 1000.0 / freq;
-                double buildMs = (preSendAt   - dequeuedAt)          * 1000.0 / freq;
-                double sendMs  = (postSendAt  - preSendAt)            * 1000.0 / freq;
-                BaluLogger.Info("H264Latency", $"Stream path: queue={queueMs:F1}ms build={buildMs:F1}ms send={sendMs:F1}ms (client {client.Id[..8]}, frame {client.FrameCount})");
-            }
 
             return true;
         }

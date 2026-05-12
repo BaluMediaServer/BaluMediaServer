@@ -523,11 +523,10 @@ public class H264Encoder : IDisposable
                 // Use SetInteger (not SetFloat) — MediaTek MT6768 misinterprets sub-second float
                 // values as 0, causing EVERY frame to be an IDR keyframe, which exhausts the
                 // encoder's internal buffers and causes it to stall after ~1000 frames.
-                // Value 2 = IDR every 2 seconds. IDR frames cause 120-220ms encoding stalls on
-                // MT6768; halving their frequency halves the jitter. New clients still get an IDR
-                // within ~40ms via RequestKeyFrame(). IntraRefresh every 10 frames provides
-                // continuous partial recovery for packet-loss robustness.
-                format.SetInteger(MediaFormat.KeyIFrameInterval, 2);
+                // IDR frames cause 120-220ms encoding stalls on MT6768; set a long interval to
+                // minimise scheduled stalls. New clients still get an IDR within ~40ms via
+                // RequestKeyFrame(), so stream start is unaffected.
+                format.SetInteger(MediaFormat.KeyIFrameInterval, 30);
                 
                 // Set profile and level for better compatibility
                 format.SetInteger(MediaFormat.KeyProfile, (int)MediaCodecProfileType.Avcprofilebaseline);
@@ -539,11 +538,6 @@ public class H264Encoder : IDisposable
                     format.SetInteger(MediaFormat.KeyPriority, 0); // Real-time priority (added in API 23)
                     format.SetInteger(MediaFormat.KeyOperatingRate, short.MaxValue);
 
-                    // Only set intra refresh if supported
-                    if (_bestEncoder.SupportsIntraRefresh)
-                    {
-                        format.SetInteger(MediaFormat.KeyIntraRefreshPeriod, 10);
-                    }
                 }
 
                 if (Build.VERSION.SdkInt >= BuildVersionCodes.P) // API 28+
@@ -558,17 +552,25 @@ public class H264Encoder : IDisposable
 
                 if (OperatingSystem.IsAndroidVersionAtLeast(30)) // API 30+
                 {
-                    format.SetInteger(MediaFormat.KeyLowLatency, 1);
+                    // KeyLowLatency=1 disabled on MT6768 — empirically suppresses the rate
+                    // controller. With it on, baseline P-frames stay ~50 KB and the stream
+                    // sits at ~10-12 Mbps regardless of KeyBitRate=2_000_000.
+                    // format.SetInteger(MediaFormat.KeyLowLatency, 1);
                 }
 
                 if (_bestEncoder.Name.Contains("MTK"))
                 {
                     try
                     {
-                        format.SetInteger("vendor.mtk-ext-enc-low-latency.enable", 1);
-                        // Non-reference P-frames: encoder can drop them under load without
-                        // breaking the reference chain, reducing encoding stalls.
-                        format.SetInteger("vendor.mtk-ext-enc-nonrefp.enable", 1);
+                        // NOTE: All MTK low-latency vendor extensions disabled on MT6768.
+                        //  - nonrefp.enable=1     → made every frame an IDR (12.7 Mbps actual).
+                        //  - low-latency.enable=1 → defeats the rate controller; output stays
+                        //    keyframe-sized (~50 KB) even after the all-IDR fix, holding the
+                        //    stream at ~10 Mbps and producing 50 KB LOS allocations every frame.
+                        // KeyPriority=0 + KeyOperatingRate stay set above; those don't trigger
+                        // the rate-control suppression.
+                        // format.SetInteger("vendor.mtk-ext-enc-low-latency.enable", 1);
+                        // format.SetInteger("vendor.mtk-ext-enc-nonrefp.enable", 1);
                     }
                     catch { }
                 }
@@ -788,8 +790,6 @@ public class H264Encoder : IDisposable
         long now = Stopwatch.GetTimestamp();
         _lastOutputTicks = now;
         _lastInputTicks = 0;
-        int _outputFrameCount = 0;
-        long _prevOutputTicks = 0;
 
         BaluLogger.Debug("H264MTK", "Encoding loop started");
 
@@ -815,23 +815,7 @@ public class H264Encoder : IDisposable
 
                     if (processedOutput)
                     {
-                        long outputNow = Stopwatch.GetTimestamp();
-                        _outputFrameCount++;
-
-                        // Log encoder output interval every 25 frames to diagnose pipeline depth.
-                        // Expected: ~40ms at 25fps. If consistently >80ms, encoder is buffering multiple frames.
-                        if (_outputFrameCount % 25 == 0 && _prevOutputTicks > 0)
-                        {
-                            double intervalMs = (_lastOutputTicks > 0)
-                                ? (outputNow - _prevOutputTicks) * 1000.0 / Stopwatch.Frequency / 25.0
-                                : 0;
-                            double inputToOutputMs = (_lastInputTicks > 0)
-                                ? (outputNow - _lastInputTicks) * 1000.0 / Stopwatch.Frequency
-                                : 0;
-                            BaluLogger.Info("H264Latency", $"Encoder: avg output interval={intervalMs:F1}ms, last input→output={inputToOutputMs:F1}ms, frames={_outputFrameCount}");
-                        }
-                        _prevOutputTicks = outputNow;
-                        _lastOutputTicks = outputNow;
+                        _lastOutputTicks = Stopwatch.GetTimestamp();
                     }
 
                     // Check disposed again before feeding input
@@ -970,6 +954,11 @@ public class H264Encoder : IDisposable
 
                     _encoder.QueueInputBuffer(inputIndex, 0, dataSize, frame.Timestamp, 0);
                     _lastTimestamp = frame.Timestamp;
+                    // Release the JNI GREF immediately after submitting. After QueueInputBuffer
+                    // the Java ByteBuffer is marked inaccessible by the Android runtime, so this
+                    // wrapper is already dead. Disposing it just drops the C# JNI handle —
+                    // it does NOT touch native memory, which MediaCodec owns and manages.
+                    inputBuffer.Dispose();
                 }
             }
         }
@@ -1292,57 +1281,66 @@ public class H264Encoder : IDisposable
                     outputBuffer = buffers?[outputIndex];
 #pragma warning restore CS0618
                 }
-                
-                if (outputBuffer != null && bufferInfo.Size > 0)
+
+                try
                 {
-                    var data = new byte[bufferInfo.Size];
-                    outputBuffer.Position(bufferInfo.Offset);
-                    outputBuffer.Limit(bufferInfo.Offset + bufferInfo.Size);
-                    outputBuffer.Get(data);
-
-                    // Check if this is config data
-                    if ((bufferInfo.Flags & MediaCodecBufferFlags.CodecConfig) != 0)
+                    if (outputBuffer != null && bufferInfo.Size > 0)
                     {
-                        ParseConfigFrame(data, ref sps, ref pps);
-                        BaluLogger.Debug("H264MTK", "Got config frame");
-                    }
-                    else
-                    {
-                        // Regular frame - extract all NAL units properly
-                        var nalUnits = new List<byte[]>();
+                        var data = new byte[bufferInfo.Size];
+                        outputBuffer.Position(bufferInfo.Offset);
+                        outputBuffer.Limit(bufferInfo.Offset + bufferInfo.Size);
+                        outputBuffer.Get(data);
 
-                        // MediaTek might not include start codes, so add them
-                        if (!HasStartCode(data))
+                        // Check if this is config data
+                        if ((bufferInfo.Flags & MediaCodecBufferFlags.CodecConfig) != 0)
                         {
-                            var withStartCode = new byte[data.Length + 4];
-                            withStartCode[0] = 0;
-                            withStartCode[1] = 0;
-                            withStartCode[2] = 0;
-                            withStartCode[3] = 1;
-                            Array.Copy(data, 0, withStartCode, 4, data.Length);
-                            nalUnits.Add(withStartCode);
+                            ParseConfigFrame(data, ref sps, ref pps);
+                            BaluLogger.Debug("H264MTK", "Got config frame");
                         }
                         else
                         {
-                            // Extract all NAL units (encoder may output multiple NALs in one buffer)
-                            nalUnits = ExtractNalUnits(data);
+                            // Regular frame - extract all NAL units properly
+                            var nalUnits = new List<byte[]>();
+
+                            // MediaTek might not include start codes, so add them
+                            if (!HasStartCode(data))
+                            {
+                                var withStartCode = new byte[data.Length + 4];
+                                withStartCode[0] = 0;
+                                withStartCode[1] = 0;
+                                withStartCode[2] = 0;
+                                withStartCode[3] = 1;
+                                Array.Copy(data, 0, withStartCode, 4, data.Length);
+                                nalUnits.Add(withStartCode);
+                            }
+                            else
+                            {
+                                // Extract all NAL units (encoder may output multiple NALs in one buffer)
+                                nalUnits = ExtractNalUnits(data);
+                            }
+
+                            var frameEvent = new H264FrameEventArgs
+                            {
+                                NalUnits = nalUnits,
+                                IsKeyFrame = (bufferInfo.Flags & MediaCodecBufferFlags.KeyFrame) != 0,
+                                Timestamp = bufferInfo.PresentationTimeUs,
+                                Sps = sps,
+                                Pps = pps,
+                                EncodedAt = Stopwatch.GetTimestamp()
+                            };
+
+                            FrameEncoded?.Invoke(this, frameEvent);
                         }
-
-                        var frameEvent = new H264FrameEventArgs
-                        {
-                            NalUnits = nalUnits,
-                            IsKeyFrame = (bufferInfo.Flags & MediaCodecBufferFlags.KeyFrame) != 0,
-                            Timestamp = bufferInfo.PresentationTimeUs,
-                            Sps = sps,
-                            Pps = pps,
-                            EncodedAt = Stopwatch.GetTimestamp()
-                        };
-
-                        FrameEncoded?.Invoke(this, frameEvent);
                     }
                 }
-                
-                _encoder.ReleaseOutputBuffer(outputIndex, false);
+                finally
+                {
+                    // Release the slot first so the encoder can immediately reuse it,
+                    // then drop the JNI GREF. After ReleaseOutputBuffer the Java ByteBuffer
+                    // is inaccessible, so Dispose() only releases the C# JNI handle.
+                    _encoder.ReleaseOutputBuffer(outputIndex, false);
+                    outputBuffer?.Dispose();
+                }
                 return true;
             }
             else if (outputIndex == (int)MediaCodecInfoState.OutputFormatChanged)
@@ -1707,6 +1705,7 @@ public class H264Encoder : IDisposable
             {
                 BaluLogger.Error("H264MTK", $"Error stopping encoder: {ex.Message}");
             }
+
 
             _encoder = null;
             BaluLogger.Info("H264MTK", "Encoder stopped and disposed");
