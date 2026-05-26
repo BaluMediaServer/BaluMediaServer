@@ -24,6 +24,7 @@ public class RtspProtocolHandler : IRtspProtocolHandler
     private readonly int _backCameraHeight;
     private readonly int _frontCameraWidth;
     private readonly int _frontCameraHeight;
+    private readonly bool _audioTrackEnabled;
 
     /// <summary>
     /// Creates a new RtspProtocolHandler.
@@ -39,7 +40,8 @@ public class RtspProtocolHandler : IRtspProtocolHandler
         int backCameraWidth,
         int backCameraHeight,
         int frontCameraWidth,
-        int frontCameraHeight)
+        int frontCameraHeight,
+        bool audioTrackEnabled = false)
     {
         _authManager = authManager;
         _sdpGenerator = sdpGenerator;
@@ -52,6 +54,24 @@ public class RtspProtocolHandler : IRtspProtocolHandler
         _backCameraHeight = backCameraHeight;
         _frontCameraWidth = frontCameraWidth;
         _frontCameraHeight = frontCameraHeight;
+        _audioTrackEnabled = audioTrackEnabled;
+    }
+
+    /// <summary>
+    /// Extracts <c>trackID=N</c> from a URI (SETUP or other). Returns 0 (video) when no
+    /// trackID is present — preserving backwards compatibility with single-track clients
+    /// that issue SETUP against the base URI.
+    /// </summary>
+    private static int ParseTrackIdFromUri(string uri)
+    {
+        const string marker = "trackID=";
+        int idx = uri.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (idx < 0) return 0;
+        int start = idx + marker.Length;
+        int end = start;
+        while (end < uri.Length && char.IsDigit(uri[end])) end++;
+        if (end == start) return 0;
+        return int.TryParse(uri.AsSpan(start, end - start), out var trackId) ? trackId : 0;
     }
 
     /// <inheritdoc/>
@@ -164,7 +184,20 @@ public class RtspProtocolHandler : IRtspProtocolHandler
             return;
         }
 
-        BaluLogger.Debug("[RtspProtocol]", $"Transport: {transport}");
+        // Parse trackID from the SETUP URI. Track 0 is video (default if absent),
+        // track 1 is audio. Audio SETUP populates a separate set of Client.Audio* fields
+        // so that both tracks can co-exist on a single RTSP session.
+        int trackId = ParseTrackIdFromUri(request.Uri);
+        bool isAudio = trackId == 1;
+
+        if (isAudio && !_audioTrackEnabled)
+        {
+            // Audio not advertised in SDP — reject any SETUP for trackID=1.
+            await SendResponseAsync(writer, 404, "Not Found", request.CSeq).ConfigureAwait(false);
+            return;
+        }
+
+        BaluLogger.Debug("[RtspProtocol]", $"Transport (track={trackId}): {transport}");
         var transportParams = _transportManager.ParseTransport(transport);
         var responseHeaders = new Dictionary<string, string>
         {
@@ -174,31 +207,35 @@ public class RtspProtocolHandler : IRtspProtocolHandler
         if (transportParams.ContainsKey("interleaved"))
         {
             client.Transport = TransportMode.TCPInterleaved;
+            byte rtpChannel, rtcpChannel;
             if (transportParams["interleaved"].Contains("-"))
             {
                 var channels = transportParams["interleaved"].Split('-');
-                client.RtpChannel = byte.Parse(channels[0]);
-                client.RtcpChannel = byte.Parse(channels[1]);
+                rtpChannel = byte.Parse(channels[0]);
+                rtcpChannel = byte.Parse(channels[1]);
             }
             else
             {
-                client.RtpChannel = 0;
-                client.RtcpChannel = 1;
+                // Defaults — video on 0/1, audio on 2/3 — only used when the client
+                // didn't specify channels explicitly (rare; VLC always specifies).
+                rtpChannel = isAudio ? (byte)2 : (byte)0;
+                rtcpChannel = isAudio ? (byte)3 : (byte)1;
             }
 
-            // Set client dimensions based on camera configuration
-            if (client.CameraId == 1) // Front camera
+            if (isAudio)
             {
-                client.Width = _frontCameraWidth;
-                client.Height = _frontCameraHeight;
+                client.AudioRtpChannel = rtpChannel;
+                client.AudioRtcpChannel = rtcpChannel;
+                client.AudioSetupComplete = true;
             }
-            else // Back camera
+            else
             {
-                client.Width = _backCameraWidth;
-                client.Height = _backCameraHeight;
+                client.RtpChannel = rtpChannel;
+                client.RtcpChannel = rtcpChannel;
+                AssignVideoDimensions(client);
             }
 
-            responseHeaders["Transport"] = $"RTP/AVP/TCP;unicast;interleaved={client.RtpChannel}-{client.RtcpChannel}";
+            responseHeaders["Transport"] = $"RTP/AVP/TCP;unicast;interleaved={rtpChannel}-{rtcpChannel}";
         }
         else if (transportParams.ContainsKey("client_port"))
         {
@@ -208,36 +245,36 @@ public class RtspProtocolHandler : IRtspProtocolHandler
             var rtcpPort = int.Parse(ports[1]);
 
             var clientIp = ((IPEndPoint?)client.Socket.RemoteEndPoint)?.Address;
-            client.RtpEndPoint = new IPEndPoint(clientIp!, rtpPort);
-            client.RtcpEndPoint = new IPEndPoint(clientIp!, rtcpPort);
-
-            // Create UDP socket for this client
-            client.UdpSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-            client.UdpSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-            client.UdpSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendBuffer, 65536);
-            client.UdpSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 65536);
-
             var serverRtpPort = _transportManager.GetAvailablePort();
             var serverRtcpPort = serverRtpPort + 1;
 
-            // Bind RTP socket to the negotiated server port
-            client.UdpSocket.Bind(new IPEndPoint(IPAddress.Any, serverRtpPort));
+            var udpSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            udpSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            udpSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.SendBuffer, 65536);
+            udpSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 65536);
+            udpSocket.Bind(new IPEndPoint(IPAddress.Any, serverRtpPort));
 
-            client.RtcpSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-            IPEndPoint endPoint = new(IPAddress.Any, serverRtcpPort);
-            client.RtcpSocket.Bind(endPoint);
-            _ = Task.Run(() => _rtcpManager.ListenRtcpPortAsync(client), _cancellationToken);
+            var rtcpSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            rtcpSocket.Bind(new IPEndPoint(IPAddress.Any, serverRtcpPort));
 
-            // Set client dimensions based on camera configuration
-            if (client.CameraId == 1) // Front camera
+            if (isAudio)
             {
-                client.Width = _frontCameraWidth;
-                client.Height = _frontCameraHeight;
+                client.AudioRtpEndPoint = new IPEndPoint(clientIp!, rtpPort);
+                client.AudioRtcpEndPoint = new IPEndPoint(clientIp!, rtcpPort);
+                client.AudioUdpSocket = udpSocket;
+                client.AudioRtcpSocket = rtcpSocket;
+                client.AudioSetupComplete = true;
+                // No RTCP listener spawned for the audio track yet — there is no audio RTP
+                // flow in this build, so receiver reports for trackID=1 are uninteresting.
             }
-            else // Back camera
+            else
             {
-                client.Width = _backCameraWidth;
-                client.Height = _backCameraHeight;
+                client.RtpEndPoint = new IPEndPoint(clientIp!, rtpPort);
+                client.RtcpEndPoint = new IPEndPoint(clientIp!, rtcpPort);
+                client.UdpSocket = udpSocket;
+                client.RtcpSocket = rtcpSocket;
+                _ = Task.Run(() => _rtcpManager.ListenRtcpPortAsync(client), _cancellationToken);
+                AssignVideoDimensions(client);
             }
 
             responseHeaders["Transport"] = $"RTP/AVP/UDP;unicast;client_port={rtpPort}-{rtcpPort};server_port={serverRtpPort}-{serverRtcpPort}";
@@ -249,6 +286,24 @@ public class RtspProtocolHandler : IRtspProtocolHandler
         }
 
         await SendResponseAsync(writer, 200, "OK", request.CSeq, responseHeaders).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Sets the client's stream width/height from the active camera configuration.
+    /// Only called for the video track SETUP.
+    /// </summary>
+    private void AssignVideoDimensions(Client client)
+    {
+        if (client.CameraId == 1)
+        {
+            client.Width = _frontCameraWidth;
+            client.Height = _frontCameraHeight;
+        }
+        else
+        {
+            client.Width = _backCameraWidth;
+            client.Height = _backCameraHeight;
+        }
     }
 
     /// <inheritdoc/>
@@ -266,14 +321,28 @@ public class RtspProtocolHandler : IRtspProtocolHandler
             client.SequenceNumber = (ushort)Random.Shared.Next(0, ushort.MaxValue);
             client.RtpTimestamp = (uint)Random.Shared.Next(0, int.MaxValue);
             client.LastRtpTime = DateTime.UtcNow;
+
+            if (client.AudioSetupComplete)
+            {
+                client.AudioSequenceNumber = (ushort)Random.Shared.Next(0, ushort.MaxValue);
+                client.AudioRtpTimestamp = (uint)Random.Shared.Next(0, int.MaxValue);
+            }
         }
 
-        var baseUri = request.Uri.TrimEnd('/') + "/";
+        // The PLAY URI may itself include /trackID=N when the client issues PLAY per-track.
+        // Strip it so the RTP-Info url= entries are anchored at the aggregate session URI.
+        var baseUri = StripTrackSuffix(request.Uri).TrimEnd('/') + "/";
+        var rtpInfo = $"url={baseUri}trackID=0;seq={client.SequenceNumber};rtptime={client.RtpTimestamp}";
+        if (client.AudioSetupComplete)
+        {
+            rtpInfo += $",url={baseUri}trackID=1;seq={client.AudioSequenceNumber};rtptime={client.AudioRtpTimestamp}";
+        }
+
         var responseHeaders = new Dictionary<string, string>
         {
             ["Session"] = $"{client.SessionId};timeout=60",
             ["Range"] = "npt=0.000-",
-            ["RTP-Info"] = $"url={baseUri}trackID=0;seq={client.SequenceNumber};rtptime={client.RtpTimestamp}"
+            ["RTP-Info"] = rtpInfo
         };
 
         await SendResponseAsync(writer, 200, "OK", request.CSeq, responseHeaders).ConfigureAwait(false);
@@ -284,6 +353,16 @@ public class RtspProtocolHandler : IRtspProtocolHandler
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Returns the URI with any trailing <c>/trackID=N</c> segment removed.
+    /// </summary>
+    private static string StripTrackSuffix(string uri)
+    {
+        const string marker = "/trackID=";
+        int idx = uri.LastIndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        return idx < 0 ? uri : uri.Substring(0, idx);
     }
 
     /// <inheritdoc/>

@@ -108,10 +108,19 @@ public class TransportManager : ITransportManager
 
     /// <inheritdoc/>
     public bool SendBatchSync(Client client, List<byte[]> packets)
+        => SendBatchSyncCore(client, packets, isAudio: false);
+
+    /// <inheritdoc/>
+    public bool SendAudioBatchSync(Client client, List<byte[]> packets)
+        => SendBatchSyncCore(client, packets, isAudio: true);
+
+    private bool SendBatchSyncCore(Client client, List<byte[]> packets, bool isAudio)
     {
         if (packets.Count == 0) return true;
 
-        // Acquire lock synchronously — avoids SemaphoreSlim.WaitAsync continuation dispatch
+        // Acquire lock synchronously — avoids SemaphoreSlim.WaitAsync continuation dispatch.
+        // The same SendLock guards video and audio because TCP interleaved framing must not
+        // overlap between the two streams (4-byte frame headers + payload).
         try
         {
             if (!client.SendLock.Wait(3000))
@@ -129,24 +138,26 @@ public class TransportManager : ITransportManager
         {
             if (client.Transport == TransportMode.TCPInterleaved)
             {
-                return SendInterleavedBatchSync(client, packets);
+                byte channel = isAudio ? client.AudioRtpChannel : client.RtpChannel;
+                return SendInterleavedBatchSync(client, packets, channel);
             }
             else if (client.Transport == TransportMode.UDP)
             {
+                var sock = isAudio ? client.AudioUdpSocket : client.UdpSocket;
+                var ep = isAudio ? client.AudioRtpEndPoint : client.RtpEndPoint;
                 bool allOk = true;
                 foreach (var pkt in packets)
                 {
                     try
                     {
-                        var ep = client.RtpEndPoint;
-                        if (client.UdpSocket != null && ep != null)
-                            client.UdpSocket.SendTo(pkt, SocketFlags.None, ep);
+                        if (sock != null && ep != null)
+                            sock.SendTo(pkt, SocketFlags.None, ep);
                         else
                             allOk = false;
                     }
                     catch (SocketException ex)
                     {
-                        BaluLogger.Error("[TransportManager]", $"UDP sync send error for client {client.Id}: {ex.SocketErrorCode}");
+                        BaluLogger.Error("[TransportManager]", $"UDP sync send error for client {client.Id} ({(isAudio ? "audio" : "video")}): {ex.SocketErrorCode}");
                         allOk = false;
                     }
                 }
@@ -168,7 +179,7 @@ public class TransportManager : ITransportManager
         }
     }
 
-    private bool SendInterleavedBatchSync(Client client, List<byte[]> packets)
+    private bool SendInterleavedBatchSync(Client client, List<byte[]> packets, byte channel)
     {
         int totalSize = 0;
         for (int i = 0; i < packets.Count; i++)
@@ -182,7 +193,7 @@ public class TransportManager : ITransportManager
             {
                 var rtpPacket = packets[i];
                 frame[offset]     = 0x24; // $ magic byte
-                frame[offset + 1] = client.RtpChannel;
+                frame[offset + 1] = channel;
                 frame[offset + 2] = (byte)(rtpPacket.Length >> 8);
                 frame[offset + 3] = (byte)(rtpPacket.Length & 0xFF);
                 Buffer.BlockCopy(rtpPacket, 0, frame, offset + 4, rtpPacket.Length);

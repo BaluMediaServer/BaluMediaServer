@@ -17,6 +17,7 @@ public class StreamingController : IStreamingController
     private readonly IRtpPacketBuilder _rtpBuilder;
     private readonly ITransportManager _transportManager;
     private readonly IClientManager _clientManager;
+    private readonly AacEncoderManager? _aacManager;
 
     // 0 = not streaming, 1 = streaming.
     // Use Interlocked.CompareExchange (not volatile bool) so the 0→1 transition is atomic:
@@ -74,18 +75,23 @@ public class StreamingController : IStreamingController
     /// <summary>
     /// Creates a new StreamingController.
     /// </summary>
+    /// <param name="aacManager">Optional AAC encoder/fan-out manager. When supplied, callers
+    /// that invoke <see cref="StreamAudioToClientAsync"/> will receive RFC 3640 AAC RTP packets
+    /// on the audio track. When null, audio streaming is disabled regardless of SDP advertisement.</param>
     public StreamingController(
         IH264EncoderManager encoderManager,
         JpegEncoderService jpegEncoder,
         IRtpPacketBuilder rtpBuilder,
         ITransportManager transportManager,
-        IClientManager clientManager)
+        IClientManager clientManager,
+        AacEncoderManager? aacManager = null)
     {
         _encoderManager = encoderManager;
         _jpegEncoder = jpegEncoder;
         _rtpBuilder = rtpBuilder;
         _transportManager = transportManager;
         _clientManager = clientManager;
+        _aacManager = aacManager;
     }
 
     /// <summary>
@@ -562,6 +568,112 @@ public class StreamingController : IStreamingController
             return frame;
         }
         catch (OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Per-client audio streaming loop. Runs in parallel with the video loop on its own
+    /// LongRunning task. Pulls encoded AAC frames from <see cref="AacEncoderManager"/>'s
+    /// per-client channel, builds a single RFC 3640 mpeg4-generic AAC-hbr RTP packet per
+    /// access unit, and sends via <see cref="ITransportManager.SendAudioBatchSync"/>
+    /// (which uses the client's <c>Audio*</c> transport state).
+    /// </summary>
+    /// <remarks>
+    /// Idempotent on the AAC channel-registration call. Safe to invoke even if
+    /// <see cref="AacEncoderManager"/> is null or the audio encoder hasn't been started
+    /// yet — the loop simply waits and times out repeatedly until frames arrive.
+    /// </remarks>
+    public async Task StreamAudioToClientAsync(Models.Client client, CancellationToken cancellationToken)
+    {
+        if (_aacManager == null)
+        {
+            BaluLogger.Debug("[StreamingController]", $"Audio stream task started for {client.Id} but AacEncoderManager is null — exiting");
+            return;
+        }
+
+        if (!client.AudioSetupComplete)
+        {
+            BaluLogger.Debug("[StreamingController]", $"Audio stream task started for {client.Id} but AudioSetupComplete=false — exiting");
+            return;
+        }
+
+        _aacManager.RegisterClientChannel(client.Id);
+        var channel = _aacManager.GetClientChannelRef(client.Id);
+
+        BaluLogger.Info("[StreamingController]", $"Audio streaming loop started for client {client.Id} (transport={client.Transport})");
+
+        // Single-packet batch; allocated once per session.
+        var rtpBatch = new List<byte[]>(1);
+        int sampleRateHint = 44100; // Refined once a frame arrives (frame carries no rate but encoder is single-stream).
+        const int DequeueTimeoutMs = 200;
+        bool sentFirstPacket = false;
+
+        try
+        {
+            while (client.IsPlaying && !cancellationToken.IsCancellationRequested)
+            {
+                if (channel == null)
+                {
+                    // Channel was unregistered (e.g. encoder stopped) — bail out.
+                    break;
+                }
+
+                AacFrameEventArgs? frame;
+                if (!channel.Reader.TryRead(out frame))
+                {
+                    frame = await WaitOnAacChannel(channel, DequeueTimeoutMs, cancellationToken).ConfigureAwait(false);
+                    if (frame == null)
+                    {
+                        // Timeout — keep looping. Audio is silent during encoder warmup,
+                        // which is OK because the client is happy as long as video flows.
+                        continue;
+                    }
+                }
+
+                if (frame.Data == null || frame.Data.Length == 0) continue;
+
+                uint rtpTs = _rtpBuilder.EncoderTimestampToAudioRtp(frame.Timestamp, sampleRateHint, ref client);
+                var packet = _rtpBuilder.BuildAacRtpPacket(client, frame.Data, rtpTs);
+
+                rtpBatch.Clear();
+                rtpBatch.Add(packet);
+                _transportManager.SendAudioBatchSync(client, rtpBatch);
+
+                if (!sentFirstPacket)
+                {
+                    sentFirstPacket = true;
+                    BaluLogger.Info("[StreamingController]", $"First AAC RTP packet sent to client {client.Id} ({packet.Length} bytes, rtpTs={rtpTs})");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            BaluLogger.Error("[StreamingController]", $"Audio streaming error for client {client.Id}: {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            _aacManager.UnregisterClientChannel(client.Id);
+            BaluLogger.Info("[StreamingController]", $"Audio streaming loop exited for client {client.Id}");
+        }
+    }
+
+    private static async Task<AacFrameEventArgs?> WaitOnAacChannel(Channel<AacFrameEventArgs> channel, int timeoutMs, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(timeoutMs);
+            if (!await channel.Reader.WaitToReadAsync(timeoutCts.Token).ConfigureAwait(false)) return null;
+            channel.Reader.TryRead(out var frame);
+            return frame;
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
+        }
+        catch (ChannelClosedException)
         {
             return null;
         }

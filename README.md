@@ -41,6 +41,7 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 - **Dual Codec Support**:
   - **MJPEG**: Works smoothly, high bandwidth, no compression
   - **H.264**: Hardware-accelerated encoding, optimized for MediaTek devices
+- **Optional AAC Audio Track** (v1.5.28+): Hardware-encoded AAC-LC delivered as a second `m=audio` SDP track (`trackID=1`), packetized per RFC 3640 mpeg4-generic AAC-hbr. Toggle with `ServerConfiguration.EnableAudioTrack = true`; off by default so existing single-track clients see byte-identical SDP. Sample rate and channel count are configurable.
 - **High Concurrency**: Can handle at least 12 simultaneous clients (tested)
 - **Authentication**: Digest authentication included for basic security
 - **Transport Modes**: UDP and TCP interleaved support
@@ -75,16 +76,19 @@ The RTSP server has been refactored into focused, testable modules for better ma
 ```
 RTSP/
 ├── Server.cs                    # Main composition root (~700 lines)
+├── H264Encoder.cs               # MediaCodec H.264 wrapper
+├── AacEncoder.cs                # MediaCodec AAC-LC wrapper (audio/mp4a-latm)
 ├── Protocol/
-│   ├── RtspProtocolHandler.cs   # RTSP request parsing and response handling
-│   └── SdpGenerator.cs          # SDP generation for H.264/MJPEG
+│   ├── RtspProtocolHandler.cs   # RTSP request parsing and response handling (trackID-aware)
+│   └── SdpGenerator.cs          # SDP generation for H.264 / MJPEG / optional AAC audio
 ├── Transport/
-│   ├── TransportManager.cs      # UDP/TCP sending, port management (sync + async)
-│   ├── RtpPacketBuilder.cs      # RTP packet creation and NAL fragmentation
+│   ├── TransportManager.cs      # UDP/TCP sending for video + audio tracks (sync + async)
+│   ├── RtpPacketBuilder.cs      # RTP packet creation: H.264 NAL fragmentation + AAC-hbr
 │   └── RtcpManager.cs           # RTCP sender reports and receiver feedback
 ├── Streaming/
-│   ├── StreamingController.cs   # Main streaming orchestration (synchronous hot path)
+│   ├── StreamingController.cs   # Main streaming orchestration (per-client video + audio loops)
 │   ├── H264EncoderManager.cs    # H.264 encoder lifecycle management
+│   ├── AacEncoderManager.cs     # AAC encoder lifecycle + per-client audio frame fan-out
 │   ├── JpegEncoderService.cs    # Shared JPEG encoding for MJPEG clients
 │   └── FramePacer.cs            # Frame delivery timing and burst throttling
 ├── Security/
@@ -95,8 +99,19 @@ RTSP/
 Services/
 ├── BackCameraService.cs         # Back camera capture (JNI-free processing thread)
 ├── FrontCameraService.cs        # Front camera capture (JNI-free processing thread)
+├── AudioCaptureService.cs       # Microphone capture (Android AudioRecord, 1024-sample PCM frames)
 ├── MjpegServer.cs               # HTTP MJPEG streaming server
 └── FrameOverlay.cs              # YUV-level text overlay burn-in (up to 4 slots)
+
+Interfaces/
+├── ICameraService.cs            # Camera capture contract
+└── IAudioCaptureService.cs      # Microphone capture contract
+
+Models/
+├── FrameEventArgs.cs            # Raw YUV video frame payload
+├── H264FrameEventArgs.cs        # Encoded H.264 frame (NAL units + SPS/PPS)
+├── AudioFrameEventArgs.cs       # Raw PCM-16 audio frame payload
+└── AacFrameEventArgs.cs         # Encoded AAC access unit (+ AudioSpecificConfig on first frame)
 
 BaluLogger.cs                    # Static logger: writes to logcat + fires OnLog event
 ```
@@ -118,7 +133,7 @@ BaluLogger.cs                    # Static logger: writes to logcat + fires OnLog
 
 ### NuGet Package
 ```xml
-<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.25" />
+<PackageReference Include="BaluMediaServer.CameraStreamer" Version="1.5.28" />
 ```
 
 ### Manual Installation
@@ -137,7 +152,11 @@ Add these permissions to your `Platforms/Android/AndroidManifest.xml`:
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+<!-- Only required when ServerConfiguration.EnableAudioTrack = true -->
+<uses-permission android:name="android.permission.RECORD_AUDIO" />
 ```
+
+> **Runtime permission for audio:** `RECORD_AUDIO` is a [dangerous permission](https://developer.android.com/guide/topics/permissions/overview#dangerous-permission-prompt). Request it at runtime (e.g. `await Permissions.RequestAsync<Permissions.Microphone>()`) before calling `server.Start()` when `EnableAudioTrack` is enabled. If the runtime grant is missing, the camera/video pipeline keeps working normally and the audio track stays silent — `AudioCaptureService` raises `ErrorOccurred` instead of crashing.
 
 ## 🚀 Quick Start
 
@@ -425,8 +444,88 @@ public class ServerConfiguration
     // null  → no overlay on front camera (no default)
     // [...] → custom slots (up to 4)
     public OverlaySlot[]? FrontCameraOverlaySlots { get; set; }     // Front camera H.264 overlay
+
+    // AAC audio track (v1.5.28+) — off by default so existing clients see byte-identical SDP.
+    // When true, an m=audio AAC-LC track (trackID=1) is advertised in the SDP and the
+    // microphone is captured + encoded only while at least one client is connected.
+    // Requires android.permission.RECORD_AUDIO in the host manifest and runtime grant.
+    public bool EnableAudioTrack { get; set; } = false;             // Enable AAC audio stream
+    public int  AudioSampleRateHz { get; set; } = 44100;            // 44100 / 48000 / 22050 / 16000 / 8000
+    public int  AudioChannels { get; set; } = 1;                    // 1 = mono, 2 = stereo
 }
 ```
+
+### Audio Streaming (AAC over RTP)
+
+The library can optionally publish a hardware-encoded **AAC-LC** audio stream alongside the H.264 video, exposed as a second `m=audio` track in the SDP (`a=control:trackID=1`). The feature is **off by default** so existing clients see byte-identical SDP and no microphone is opened.
+
+**Enabling it** (via `ServerConfiguration`):
+
+```csharp
+var server = new Server(new ServerConfiguration
+{
+    Port = 7778,
+    AuthRequired = false,
+    BackCameraResolution = VideoResolution.HD_720p,
+
+    // Add an AAC-LC m=audio track to the RTSP SDP
+    EnableAudioTrack  = true,
+    AudioSampleRateHz = 44100,   // 44100 / 48000 / 22050 / 16000 / 8000
+    AudioChannels     = 1,       // 1 = mono, 2 = stereo
+});
+server.Start();
+```
+
+> Don't forget `android.permission.RECORD_AUDIO` in your manifest **and** a runtime permission grant — see [Required Permissions](#-required-permissions).
+
+**What the client sees** (SDP excerpt):
+
+```
+m=video 0 RTP/AVP 96
+a=rtpmap:96 H264/90000
+a=control:trackID=0
+m=audio 0 RTP/AVP 97
+a=rtpmap:97 mpeg4-generic/44100/1
+a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;config=1208;sizelength=13;indexlength=3;indexdeltalength=3
+a=control:trackID=1
+```
+
+**Verifying with ffplay:**
+
+```bash
+ffplay -loglevel verbose -rtsp_transport tcp rtsp://your-ip:7778/live/back
+```
+
+You should see both streams listed in `Input #0`:
+
+```
+Stream #0:0: Video: h264 (Baseline), ... 640x480
+Stream #0:1: Audio: aac, 44100 Hz, mono, fltp
+```
+
+**How it works under the hood:**
+
+| Stage          | Component                                                 |
+|----------------|-----------------------------------------------------------|
+| Capture        | `Services/AudioCaptureService.cs` — `AudioRecord` reads 1024-sample PCM-16 chunks (one AAC-LC access unit each) on a dedicated background thread. |
+| Encode         | `RTSP/AacEncoder.cs` — `MediaCodec("audio/mp4a-latm")` with `AAC-LC` profile. Captures `csd-0` (AudioSpecificConfig) on first output. |
+| Fan-out        | `RTSP/Streaming/AacEncoderManager.cs` — one shared encoder, per-client bounded channels (capacity 4, `DropOldest`). |
+| Packetize      | `RTSP/Transport/RtpPacketBuilder.BuildAacRtpPacket` — RFC 3640 `mode=AAC-hbr`, one access unit per packet: `[12-byte RTP][AU-headers-length=0010][AU-header=(size<<3)][AAC AU bytes]`. |
+| Send           | `RTSP/Transport/TransportManager.SendAudioBatchSync` — routes through `Client.AudioRtpChannel` (TCP interleaved) or `Client.AudioUdpSocket` / `Client.AudioRtpEndPoint` (UDP). Shares the per-client `SendLock` with video so TCP framing stays atomic. |
+| SDP sync       | `RTSP/Protocol/SdpGenerator.UpdateAudioSpecificConfig` — the first encoder ASC overrides the hardcoded `config=` value, keeping the SDP truthful even if a vendor codec reports something exotic. |
+
+**Lifecycle:**
+- The microphone + AAC encoder start on the first `SETUP` that touches `trackID=1` (mirrors the `PreStartCameraAndEncoder` warm-up used for H.264).
+- The watchdog stops both when `ClientCount == 0`, mirroring the H.264 idle-stall policy.
+- `Server.Stop()` and `Dispose()` tear the audio pipeline down alongside the camera pipeline.
+
+**Independent RTP streams per RFC 3550 §5.1:**
+The audio track has its own `SSRC`, sequence number, and 44.1 kHz (or configured) RTP timestamp space, all stored on the `Client` instance in `AudioSsrcId`, `AudioSequenceNumber`, `AudioRtpTimestamp`, `AudioBaseEncoderTimestamp`, and `AudioBaseRtpTimestamp` — fully isolated from the video state.
+
+**Known limitations (planned for v1.6+):**
+- No RTCP Sender Reports yet for the audio track (video SR works as before).
+- No explicit lip-sync alignment between the H.264 and AAC streams — both use a wall-clock-based timestamp anchor and align within a few frames, but rigorous A/V sync hardening is on the roadmap.
+- One microphone per server — there's no per-camera audio source.
 
 ### VideoProfile Class
 
@@ -1383,15 +1482,17 @@ Unit tests cover pure C# components. Android-dependent classes (camera services,
 - ✅ **Hot-path CPU & memory optimisation + simultaneous-connect race fix — SpinWait escalation, cached channel refs, selective buffer zeroing, fan-out lock reduction, atomic CAS start gate** (v1.5.25)
 - ✅ **Server restart hardening — Stop() tears down cameras + clears clients, OnStreaming fires only on state change, SetStreamingState guarded on SETUP** (v1.5.25)
 - ✅ **In-process log subscription — BaluLogger.OnLog exposes all 264+ internal log calls as a subscribable event (tag, level, message, timestamp)** (v1.5.25)
+- ✅ **AAC audio streaming — optional second m=audio RTSP track (trackID=1) carrying hardware-encoded AAC-LC via RFC 3640 mpeg4-generic; backward compatible (flag-gated, off by default)** (v1.5.28)
 
 ### Planned (v1.6+)
 - ⬜ Fix image rotation on some devices
 - ⬜ Add H.265 (HEVC) codec support
 - ⬜ Add integration tests for Android-dependent code
+- ⬜ RTCP Sender Reports for the AAC audio track + explicit lip-sync hardening between video and audio
+- ⬜ Per-camera audio source selection (currently one shared microphone)
 
 ### Long Term (v2.0+)
 - ⬜ iOS support via .NET MAUI
-- ⬜ Audio streaming support
 - ⬜ WebRTC integration
 - ⬜ Cloud streaming integration
 - ⬜ Advanced analytics and monitoring
@@ -1434,6 +1535,46 @@ There are few (if any) options to integrate RTSP servers with Android using C# a
 4. **Community**: Join discussions with other developers
 
 ## Patch Notes
+
+- v1.5.28: **AAC Audio Streaming** — optional second RTSP track carrying hardware-encoded AAC-LC alongside the H.264 video stream. Backward compatible: the new behaviour is gated on `ServerConfiguration.EnableAudioTrack` (default `false`) so existing single-track clients see byte-identical SDP and no microphone is opened.
+
+  **Protocol & SDP:**
+  - `SdpGenerator.GenerateSdp` now appends a second `m=audio 0 RTP/AVP 97` block when audio is enabled: `a=rtpmap:97 mpeg4-generic/<sampleRate>/<channels>` plus RFC 3640 AAC-hbr `a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;config=<ASC>;sizelength=13;indexlength=3;indexdeltalength=3` and `a=control:trackID=1`. The video block remains unchanged with `a=control:trackID=0`.
+  - `RtspProtocolHandler.HandleSetupAsync` parses `trackID=N` from the SETUP URI. `trackID=0` (or absent) populates the existing video fields on `Client`; `trackID=1` populates a parallel set of `Audio*` transport fields without disturbing the video state. When audio is not enabled, `SETUP trackID=1` returns 404.
+  - PLAY emits a multi-track `RTP-Info` header (`url=<base>/trackID=0;seq=...;rtptime=...,url=<base>/trackID=1;seq=...;rtptime=...`) when the audio track has been set up.
+
+  **New Client state (RFC 3550 §5.1 — independent RTP streams):**
+  - `Models/Client.cs` gains `AudioSetupComplete`, `AudioRtpChannel`, `AudioRtcpChannel`, `AudioRtpEndPoint`, `AudioRtcpEndPoint`, `AudioUdpSocket`, `AudioRtcpSocket`, `AudioSsrcId`, `AudioSequenceNumber`, `AudioRtpTimestamp`, `AudioBaseEncoderTimestamp`, `AudioBaseRtpTimestamp`. `Dispose()` closes the audio sockets.
+
+  **Capture & encoder pipeline:**
+  - `Services/AudioCaptureService.cs` — `Android.Media.AudioRecord` wrapper. Reads PCM-16 frames sized exactly to the AAC-LC access-unit length (1024 samples/channel) on a dedicated background thread. Timestamps are derived from a monotonic sample cursor, avoiding the MediaTek PTS-unit corruption observed on the video encoder. Checks `RECORD_AUDIO` before opening the device and raises `ErrorOccurred` instead of crashing when the permission is missing.
+  - `RTSP/AacEncoder.cs` — `Android.Media.MediaCodec` wrapper for `audio/mp4a-latm` (AAC-LC). Background encoder thread driving `FeedInputBuffer` / `DrainOutputBuffer`, mirroring `H264Encoder.EncodingLoop`. Captures `csd-0` (AudioSpecificConfig) from `OutputFormatChanged` or the `CodecConfig` frame and surfaces it on the first `FrameEncoded` event so downstream SDP can sync.
+  - `RTSP/Streaming/AacEncoderManager.cs` — single shared encoder fanned out to per-client bounded channels (capacity 4, `DropOldest`). Snapshot-then-write pattern matches `H264EncoderManager` so registering / unregistering a client never blocks the fan-out loop.
+
+  **RTP packetisation:**
+  - `RTSP/Transport/RtpPacketBuilder.BuildAacRtpPacket` — RFC 3640 `mode=AAC-hbr`, one access unit per RTP packet (no fragmentation; AAC AUs at typical rates are far below MTU). Layout: 12-byte RTP fixed header → 2-byte AU-headers-length (`0010` = 16 bits) → 2-byte AU header (`(size << 3) | au-index(0)`) → AAC bytes. Marker bit set (single AU per packet). Uses the audio-side `AudioSequenceNumber` / `AudioSsrcId` so video sequence space is untouched.
+  - `RtpPacketBuilder.EncoderTimestampToAudioRtp` — converts the AAC PTS in microseconds into the audio sample-rate RTP clock with `(elapsedUs * sampleRate) / 1_000_000`. Establishes the baseline on the first call and increments from there.
+
+  **Transport:**
+  - `ITransportManager.SendAudioBatchSync` + `TransportManager.SendBatchSyncCore(..., isAudio)` route through `Client.AudioRtpChannel` (TCP interleaved) or `Client.AudioUdpSocket` + `Client.AudioRtpEndPoint` (UDP). Shares the per-client `SendLock` with video so TCP-interleaved 4-byte framing (`0x24 channel length payload`) stays atomic across the two tracks.
+  - The interleaved batch helper is now parameterised by channel byte, so video continues using `Client.RtpChannel` and audio uses the new `AudioRtpChannel` field without any duplication.
+
+  **Streaming orchestration:**
+  - `StreamingController.StreamAudioToClientAsync` runs as a parallel `LongRunning` task per client, gated on `Client.AudioSetupComplete`. Dequeues encoded AAC frames, builds one RTP packet per access unit, sends via `SendAudioBatchSync`. Exits on `IsPlaying=false`, channel-closed, or cancellation. The constructor takes an optional `AacEncoderManager` — when null (audio disabled), the loop returns immediately.
+
+  **Server lifecycle:**
+  - `Server.cs` instantiates `AudioCaptureService` + `AacEncoderManager` only when `EnableAudioTrack` is true and wires `AudioCapture.FrameReceived → AacEncoderManager.QueueFrame` and `AacEncoderManager.FrameEncoded → SdpGenerator.UpdateAudioSpecificConfig` (so the SDP `config=` value tracks the actual hardware ASC).
+  - `PreStartAudioPipelineIfNeeded` warms the AAC encoder + mic on first audio `SETUP` so PLAY can immediately emit packets.
+  - `WatchDog` stops the audio pipeline when `ClientCount == 0` — mirrors the H.264 idle-stall policy and ensures the microphone isn't held open with no listeners.
+  - `Server.Stop()` and `Dispose()` tear the audio pipeline down alongside cameras.
+
+  **Configuration:**
+  - New `ServerConfiguration` properties: `EnableAudioTrack` (bool, default `false`), `AudioSampleRateHz` (int, default 44100), `AudioChannels` (int, default 1). All three flow through to the param-based `Server` ctor.
+
+  **Permissions:**
+  - `android.permission.RECORD_AUDIO` must be declared in the host `AndroidManifest.xml` and granted at runtime when audio is enabled. If the runtime grant is missing, `AudioCaptureService.StartCapture` logs an error via `ErrorOccurred` and returns — the video pipeline keeps working, audio simply stays silent.
+
+  **Tested with:** VLC and ffplay multi-track SDP parsing on `net9.0-android`, dual-track SETUP / PLAY exchange, AAC AU dispatch over both TCP interleaved and UDP transports.
 
 - v1.5.25: **Hot-Path Optimisation, Server Restart Hardening, Simultaneous-Connect Race Fix, In-Process Logging**
 

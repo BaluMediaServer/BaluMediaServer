@@ -215,6 +215,48 @@ public class Client : IDisposable
     /// </summary>
     public SemaphoreSlim SendLock { get; } = new SemaphoreSlim(1, 1);
 
+    // ---------------------------------------------------------------------
+    // Audio track (trackID=1) transport state. Populated only when the
+    // server is configured with EnableAudioTrack=true and the client has
+    // issued a SETUP for the audio track. Mirrors the video fields above.
+    // ---------------------------------------------------------------------
+
+    /// <summary>True once SETUP for the audio track (trackID=1) has been accepted.</summary>
+    public bool AudioSetupComplete { get; set; }
+
+    /// <summary>RTP channel for the audio track in TCP interleaved mode.</summary>
+    public byte AudioRtpChannel { get; set; }
+
+    /// <summary>RTCP channel for the audio track in TCP interleaved mode.</summary>
+    public byte AudioRtcpChannel { get; set; }
+
+    /// <summary>UDP RTP endpoint for the audio track.</summary>
+    public IPEndPoint? AudioRtpEndPoint { get; set; }
+
+    /// <summary>UDP RTCP endpoint for the audio track.</summary>
+    public IPEndPoint? AudioRtcpEndPoint { get; set; }
+
+    /// <summary>Server-side UDP socket carrying audio RTP packets.</summary>
+    public Socket? AudioUdpSocket { get; set; }
+
+    /// <summary>Server-side UDP socket carrying audio RTCP packets.</summary>
+    public Socket? AudioRtcpSocket { get; set; }
+
+    /// <summary>Random SSRC for the audio RTP stream (independent from video).</summary>
+    public uint AudioSsrcId { get; set; } = (uint)Random.Shared.Next();
+
+    /// <summary>Sequence number for the audio RTP stream.</summary>
+    public ushort AudioSequenceNumber { get; set; }
+
+    /// <summary>Current RTP timestamp (audio clock units) for the audio stream.</summary>
+    public uint AudioRtpTimestamp { get; set; }
+
+    /// <summary>Base Stopwatch tick captured the first time an audio RTP packet is built.</summary>
+    public ulong AudioBaseEncoderTimestamp { get; set; }
+
+    /// <summary>Initial RTP timestamp for the audio stream, used as the rtptime baseline.</summary>
+    public uint AudioBaseRtpTimestamp { get; set; }
+
     /// <summary>
     /// Releases all resources used by this client including sockets.
     /// </summary>
@@ -226,8 +268,14 @@ public class Client : IDisposable
         this.UdpSocket?.Dispose();
         this.RtcpSocket?.Close();
         this.RtcpSocket?.Dispose();
+        this.AudioUdpSocket?.Close();
+        this.AudioUdpSocket?.Dispose();
+        this.AudioRtcpSocket?.Close();
+        this.AudioRtcpSocket?.Dispose();
         this.RtcpSocket = null;
         this.UdpSocket = null;
+        this.AudioUdpSocket = null;
+        this.AudioRtcpSocket = null;
         this.SendLock?.Dispose();
     }
 }

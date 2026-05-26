@@ -30,6 +30,15 @@ public interface ITransportManager
     bool SendBatchSync(Client client, List<byte[]> packets);
 
     /// <summary>
+    /// Synchronously sends RTP packets for the <em>audio</em> track (trackID=1). Uses
+    /// <see cref="Client.AudioRtpChannel"/> for TCP interleaved sessions and
+    /// <see cref="Client.AudioUdpSocket"/> / <see cref="Client.AudioRtpEndPoint"/> for UDP.
+    /// Shares the per-client <see cref="Client.SendLock"/> so audio and video sends are
+    /// serialized — required to prevent interleaved-framing corruption over TCP.
+    /// </summary>
+    bool SendAudioBatchSync(Client client, List<byte[]> packets);
+
+    /// <summary>
     /// Sends data via TCP interleaved transport.
     /// </summary>
     /// <param name="socket">The socket.</param>

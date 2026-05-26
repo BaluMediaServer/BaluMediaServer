@@ -9,18 +9,18 @@
 		<!-- NuGet Package Properties -->
 		<GeneratePackageOnBuild>false</GeneratePackageOnBuild>
 		<PackageId>BaluMediaServer.CameraStreamer</PackageId>
-		<PackageVersion>1.5.25</PackageVersion>
+		<PackageVersion>1.5.28</PackageVersion>
 		<Authors>Nakano Miku 13</Authors>
 		<Company>Balu Media Server</Company>
 		<Product>Balu Media Camera Streamer</Product>
-		<Description>Android camera streaming library with dual camera support for MAUI applications</Description>
+		<Description>Android camera streaming library with dual camera support and optional AAC audio for MAUI applications</Description>
 		<Copyright>Copyright © Balu Media Server 2025</Copyright>
-		<PackageTags>android;camera;streaming;maui;dual-camera;rtsp;h264;mjpeg;rtp;rtcp;video;aac;h265;RTSP;rtsp</PackageTags>
+		<PackageTags>android;camera;streaming;maui;dual-camera;rtsp;h264;mjpeg;rtp;rtcp;video;aac;audio;h265;RTSP;rtsp</PackageTags>
 		<PackageProjectUrl>https://github.com/BaluMediaServer</PackageProjectUrl>
 		<RepositoryUrl>https://github.com/BaluMediaServer/BaluMediaServer</RepositoryUrl>
 		<RepositoryType>git</RepositoryType>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
-		<PackageReleaseNotes>v1.5.25: Performance, Stability, Server Restart Hardening &amp; In-Process Logging — Hot-path: persistent SpinWait escalation fix (was resetting each iteration, burning CPU); per-client Channel ref caching eliminates 50 dict-lock acquisitions/s/client; selective encoder buffer zeroing (zero Array.Clear on common path); fan-out lock narrowed to snapshot only; dead ConvertNV21ToNV12Pooled removed; ProbeSupportedResolution uses cached encoder. Simultaneous-connect race fix: volatile bool replaced with Interlocked.CompareExchange int flag so CameraStartRequested and StreamingStateChanged(true) each fire exactly once. Server restart hardening: Stop() now calls StopCapture() on both cameras (fixes hung camera2 session surviving watchdog restarts), ClearAllClients(), SetStreamingState(false), and resets _isCapturingBack/Front flags; OnStreaming fires only on real state transitions (was firing every 5s unconditionally); PreStartCameraAndEncoder guards SetStreamingState with if(!_isStreaming). In-process logging: BaluLogger static class wraps all 264+ Log.X() calls — writes to logcat AND fires BaluLogger.OnLog (BaluLogEventArgs with Level/Tag/Message/Timestamp) so apps receive full internal diagnostics without ADB. FrameOverlay: YUV-level text burn-in via ServerConfiguration.BackCameraOverlaySlots/FrontCameraOverlaySlots; BT.601, drop-shadow, configurable anchor/size/color; H.264 only; ~2µs/frame. Build: CA1416 guards replaced with OperatingSystem.IsAndroidVersionAtLeast(); CS8603/CS1572/CS0169 fixed; Xamarin.AndroidX.Collection.Ktx 1.5.0.1 pinned; Metadata.xml rewritten removing 30 stale BG8A00 rules.</PackageReleaseNotes>
+		<PackageReleaseNotes>v1.5.28: AAC Audio Streaming — Optional second m=audio RTSP track (trackID=1) carrying hardware-encoded AAC-LC alongside the existing H.264 video track. New ServerConfiguration flags: EnableAudioTrack (default false — fully backward compatible), AudioSampleRateHz (default 44100), AudioChannels (default 1). When enabled, SDP advertises mpeg4-generic/sampleRate/channels with RFC 3640 AAC-hbr fmtp parameters; SETUP for trackID=1 is honoured with its own SSRC, sequence number, and Audio* transport fields on Client (so video and audio share the RTSP session but have fully independent RTP streams). New components: AudioCaptureService (Android AudioRecord wrapper producing 1024-sample PCM-16 frames), AacEncoder (MediaCodec audio/mp4a-latm wrapper), AacEncoderManager (fan-out to per-client channels). New RtpPacketBuilder methods: BuildAacRtpPacket (one access unit per RFC 3640 packet, 4-byte AU-headers section) and EncoderTimestampToAudioRtp (audio-clock conversion). New ITransportManager.SendAudioBatchSync routes through Client.AudioRtpChannel / AudioRtpEndPoint / AudioUdpSocket while sharing the per-client SendLock with video to keep TCP-interleaved framing atomic. SdpGenerator.UpdateAudioSpecificConfig syncs the fmtp config= parameter to the actual AudioSpecificConfig the hardware codec reports. Server lifecycle: audio pipeline is started on first audio-track SETUP and torn down by WatchDog when ClientCount==0, mirroring the H.264 idle-stall policy. Verified with VLC and ffplay multi-track SDP parsing on net9.0-android.</PackageReleaseNotes>
 		
 		<!-- Include symbols for debugging -->
 		<IncludeSymbols>true</IncludeSymbols>

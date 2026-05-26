@@ -15,9 +15,11 @@ using AuthManager = BaluMediaServer.RTSP.Security.AuthenticationManager;
 namespace BaluMediaServer.Services;
 
 /// <summary>
-/// Main RTSP server implementation that handles client connections and video streaming.
-/// Supports H.264 and MJPEG codecs with both TCP interleaved and UDP transport modes.
-/// Manages front and back camera services and provides authentication support.
+/// Main RTSP server implementation that handles client connections and media streaming.
+/// Supports H.264 and MJPEG video codecs with both TCP interleaved and UDP transport modes,
+/// plus an optional AAC-LC audio track (exposed as a second <c>m=audio</c> SDP section,
+/// <c>trackID=1</c>) enabled via <see cref="ServerConfiguration.EnableAudioTrack"/>.
+/// Manages front and back camera services, microphone capture, and authentication.
 /// </summary>
 public class Server : IDisposable
 {
@@ -42,6 +44,15 @@ public class Server : IDisposable
     private int _backCameraWidth, _backCameraHeight, _frontCameraWidth, _frontCameraHeight;
     private readonly bool _frontCameraEnabled;
     private readonly bool _backCameraEnabled;
+
+    // Audio track configuration. When _audioTrackEnabled is true the RTSP SDP
+    // advertises a second m=audio track (trackID=1) and the audio pipeline
+    // (AudioCaptureService + AacEncoderManager) is instantiated.
+    private readonly bool _audioTrackEnabled;
+    private readonly int _audioSampleRateHz;
+    private readonly int _audioChannels;
+    private readonly AudioCaptureService? _audioCapture;
+    private readonly AacEncoderManager? _aacEncoderManager;
 
     // MJPEG server configuration
     private readonly int _mjpegServerQuality;
@@ -117,7 +128,8 @@ public class Server : IDisposable
         bool FrontCameraEnabled = true, bool AuthRequired = true, int MjpegServerQuality = 80,
         int MjpegServerPort = 8089, bool UseHttps = false, string? CertificatePath = null,
         string? CertificatePassword = null, VideoResolution BackCameraResolution = VideoResolution.VGA_640x480,
-        VideoResolution FrontCameraResolution = VideoResolution.VGA_640x480)
+        VideoResolution FrontCameraResolution = VideoResolution.VGA_640x480,
+        bool AudioTrackEnabled = false, int AudioSampleRateHz = 44100, int AudioChannels = 1)
     {
         _enabled = true;
         _port = Port;
@@ -134,6 +146,9 @@ public class Server : IDisposable
         _backCameraHeight = BackCameraResolution.GetHeight();
         _frontCameraWidth = FrontCameraResolution.GetWidth();
         _frontCameraHeight = FrontCameraResolution.GetHeight();
+        _audioTrackEnabled = AudioTrackEnabled;
+        _audioSampleRateHz = AudioSampleRateHz;
+        _audioChannels = AudioChannels;
 
         // Ensure enough thread pool threads to avoid scheduling jitter on the streaming loop.
         // The default minimum is ProcessorCount (8 on MT6768), which is insufficient when
@@ -156,14 +171,24 @@ public class Server : IDisposable
             }
         }
 
-        _sdpGenerator = new SdpGenerator();
+        _sdpGenerator = new SdpGenerator(_audioTrackEnabled, _audioSampleRateHz, _audioChannels);
         _transportManager = new TransportManager(_cts);
         _rtpBuilder = new RtpPacketBuilder(_transportManager);
         _rtcpManager = new RtcpManager(_transportManager, _cts.Token);
         _encoderManager = new H264EncoderManager();
         _jpegEncoder = new JpegEncoderService(quality: _mjpegServerQuality);
         _clientManager = new ClientManager(_transportManager);
-        _streamingController = new StreamingController(_encoderManager, _jpegEncoder, _rtpBuilder, _transportManager, _clientManager);
+
+        if (_audioTrackEnabled)
+        {
+            _audioCapture = new AudioCaptureService();
+            _aacEncoderManager = new AacEncoderManager();
+            _audioCapture.FrameReceived += OnAudioFrameAvailable;
+            _audioCapture.ErrorOccurred += (_, msg) => BaluLogger.Error("[RTSP Server]", $"AudioCapture: {msg}");
+            _aacEncoderManager.FrameEncoded += OnAacFrameEncoded;
+        }
+
+        _streamingController = new StreamingController(_encoderManager, _jpegEncoder, _rtpBuilder, _transportManager, _clientManager, _aacEncoderManager);
 
         // Wire up events with exception safety
         _clientManager.OnClientsChange += clients =>
@@ -212,7 +237,10 @@ public class Server : IDisposable
             CertificatePath: configuration.CertificatePath,
             CertificatePassword: configuration.CertificatePassword,
             BackCameraResolution: configuration.BackCameraResolution,
-            FrontCameraResolution: configuration.FrontCameraResolution)
+            FrontCameraResolution: configuration.FrontCameraResolution,
+            AudioTrackEnabled: configuration.EnableAudioTrack,
+            AudioSampleRateHz: configuration.AudioSampleRateHz,
+            AudioChannels: configuration.AudioChannels)
     {
         _enabled = configuration.EnableServer;
         if (configuration.StartMjpegServer)
@@ -360,6 +388,17 @@ public class Server : IDisposable
             _isCapturingFront = false;
         }
 
+        // Stop the audio pipeline alongside the camera pipeline. Both must be idle
+        // before the next Start() so the watchdog state machine restarts cleanly.
+        if (_audioCapture != null && _audioCapture.IsCapturing)
+        {
+            try { _audioCapture.StopCapture(); } catch (Exception ex) { BaluLogger.Warn("[RTSP Server]", $"Stop: audio capture stop error: {ex.Message}"); }
+        }
+        if (_aacEncoderManager != null && _aacEncoderManager.IsRunning)
+        {
+            try { _aacEncoderManager.Stop(); } catch (Exception ex) { BaluLogger.Warn("[RTSP Server]", $"Stop: AAC encoder stop error: {ex.Message}"); }
+        }
+
         // Reset streaming flag so the first new client after Start() wins the CAS gate correctly
         if (_isStreaming)
         {
@@ -388,6 +427,8 @@ public class Server : IDisposable
         EventBuss.Command -= OnCommandSend;
         _mjpegServer?.Dispose();
         _jpegEncoder?.Dispose();
+        try { _audioCapture?.Dispose(); } catch { }
+        try { _aacEncoderManager?.Dispose(); } catch { }
         _cts?.Cancel();
         _socket?.Dispose();
     }
@@ -985,6 +1026,56 @@ public class Server : IDisposable
         }
     }
 
+    /// <summary>
+    /// Forwards captured PCM frames into the AAC encoder. Wired only when
+    /// audio is enabled in the configuration.
+    /// </summary>
+    private void OnAudioFrameAvailable(object? sender, AudioFrameEventArgs arg)
+    {
+        try
+        {
+            _aacEncoderManager?.QueueFrame(arg);
+        }
+        catch (Exception ex)
+        {
+            BaluLogger.Error("[RTSP Server]", $"OnAudioFrameAvailable error: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Syncs the SDP <c>fmtp config=</c> to the AudioSpecificConfig the hardware
+    /// encoder actually produces. Today both are typically 1208 (44.1 kHz mono);
+    /// this guards against any vendor-specific deviation.
+    /// </summary>
+    private void OnAacFrameEncoded(object? sender, AacFrameEventArgs e)
+    {
+        if (e.AudioSpecificConfig != null)
+        {
+            _sdpGenerator.UpdateAudioSpecificConfig(e.AudioSpecificConfig);
+        }
+    }
+
+    /// <summary>
+    /// Starts the AudioCapture + AAC encoder if not already running. Idempotent.
+    /// Called when the first audio-aware client SETUPs the audio track so the
+    /// encoder is warm by PLAY time.
+    /// </summary>
+    private void PreStartAudioPipelineIfNeeded(Client client)
+    {
+        if (!_audioTrackEnabled || !client.AudioSetupComplete) return;
+        if (_audioCapture == null || _aacEncoderManager == null) return;
+
+        if (!_aacEncoderManager.IsRunning)
+        {
+            _aacEncoderManager.Start(_audioSampleRateHz, _audioChannels);
+            BaluLogger.Info("[RTSP Server]", $"AAC encoder started ({_audioSampleRateHz} Hz, {_audioChannels}ch)");
+        }
+        if (!_audioCapture.IsCapturing)
+        {
+            _audioCapture.StartCapture(_audioSampleRateHz, _audioChannels);
+        }
+    }
+
     private async Task WatchDog()
     {
         while (!_cts.IsCancellationRequested)
@@ -1021,6 +1112,15 @@ public class Server : IDisposable
                     {
                         BaluLogger.Info("[RTSP Server]", "WatchDog: no clients — stopping front H264 encoder (idle stall prevention)");
                         _encoderManager.StopEncoder(1);
+                    }
+                    if (_audioCapture != null && _audioCapture.IsCapturing)
+                    {
+                        BaluLogger.Info("[RTSP Server]", "WatchDog: no clients — stopping audio capture + AAC encoder");
+                        _audioCapture.StopCapture();
+                    }
+                    if (_aacEncoderManager != null && _aacEncoderManager.IsRunning)
+                    {
+                        _aacEncoderManager.Stop();
                     }
                     if (_isStreaming)
                     {
@@ -1114,7 +1214,8 @@ public class Server : IDisposable
                 _backCameraWidth,
                 _backCameraHeight,
                 _frontCameraWidth,
-                _frontCameraHeight);
+                _frontCameraHeight,
+                _audioTrackEnabled);
 
             while (!_cts.IsCancellationRequested)
             {
@@ -1197,6 +1298,9 @@ public class Server : IDisposable
                 // PLAY is received. This prevents live555/VLC timeout on first connect,
                 // since the encoder needs ~500ms to start producing frames.
                 PreStartCameraAndEncoder(client);
+                // Same idea for audio: if SETUP touched the audio track, warm the
+                // AAC encoder + mic so PLAY can immediately emit AAC RTP packets.
+                PreStartAudioPipelineIfNeeded(client);
                 break;
             case "PLAY":
                 if (await protocolHandler.HandlePlayAsync(writer, request, client).ConfigureAwait(false))
@@ -1216,6 +1320,21 @@ public class Server : IDisposable
                             BaluLogger.Error("[RTSP Server]", $"StreamToClient unhandled error: {ex.Message}");
                         }
                     }, _cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+
+                    if (client.AudioSetupComplete && _audioTrackEnabled)
+                    {
+                        _ = Task.Factory.StartNew(async () =>
+                        {
+                            try
+                            {
+                                await _streamingController.StreamAudioToClientAsync(client, _cts.Token);
+                            }
+                            catch (Exception ex)
+                            {
+                                BaluLogger.Error("[RTSP Server]", $"StreamAudioToClient unhandled error: {ex.Message}");
+                            }
+                        }, _cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+                    }
                 }
                 break;
             case "TEARDOWN":

@@ -48,6 +48,20 @@ public interface IRtpPacketBuilder
     uint EncoderTimestampToRtp(ulong encoderTimestamp, ref Client client);
 
     /// <summary>
+    /// Builds a single RFC 3640 mpeg4-generic AAC-hbr RTP packet wrapping one access unit.
+    /// One AU per RTP packet (no fragmentation): the AAC frame is always &lt; MTU at typical
+    /// rates. Updates the client's audio sequence number and audio packet/octet counters.
+    /// </summary>
+    byte[] BuildAacRtpPacket(Client client, byte[] accessUnit, uint timestamp, byte payloadType = 97);
+
+    /// <summary>
+    /// Converts an audio encoder presentation timestamp (microseconds) into the audio RTP
+    /// timestamp space (clock = <paramref name="sampleRateHz"/>). Stores the baseline on the
+    /// client on first call so subsequent timestamps are deltas from a stable origin.
+    /// </summary>
+    uint EncoderTimestampToAudioRtp(long encoderTimestampUs, int sampleRateHz, ref Client client);
+
+    /// <summary>
     /// Gets the standard JPEG quantization tables.
     /// </summary>
     /// <returns>The quantization tables.</returns>

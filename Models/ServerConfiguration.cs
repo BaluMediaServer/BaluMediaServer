@@ -18,6 +18,13 @@ namespace BaluMediaServer.Models;
 /// Higher resolutions require more processing power and bandwidth. The encoder buffer size is
 /// calculated as (width * height * 3) / 2 for YUV420 format.
 /// </para>
+/// <para>
+/// <b>Audio:</b> Set <see cref="EnableAudioTrack"/> to <c>true</c> to publish a hardware-encoded
+/// AAC-LC audio stream as a second SDP track (<c>m=audio</c>, <c>trackID=1</c>). Sample rate and
+/// channel count are controlled by <see cref="AudioSampleRateHz"/> and <see cref="AudioChannels"/>.
+/// The feature is off by default so existing single-track clients see byte-identical SDP. Enabling
+/// it requires <c>android.permission.RECORD_AUDIO</c> in the host manifest plus a runtime grant.
+/// </para>
 /// </remarks>
 public class ServerConfiguration
 {
@@ -200,4 +207,29 @@ public class ServerConfiguration
     /// effectively disables the server without having to dispose of it.
     /// </remarks>
     public bool EnableServer { get; set; } = true;
+
+    /// <summary>
+    /// Gets or sets a value indicating whether RTSP SDP should advertise a second
+    /// <c>m=audio</c> track alongside the video track. Default is false.
+    /// </summary>
+    /// <remarks>
+    /// When true, the SDP includes an AAC-LC audio track (payload type 97,
+    /// <c>a=control:trackID=1</c>) and SETUP for <c>trackID=1</c> is accepted.
+    /// In the current build no audio RTP packets are actually emitted — this flag
+    /// only exercises the multi-track RTSP/SDP path so player compatibility
+    /// (VLC, FFmpeg) can be validated ahead of the real AAC encoder work.
+    /// </remarks>
+    public bool EnableAudioTrack { get; set; } = false;
+
+    /// <summary>
+    /// Audio sample rate in Hz advertised in the SDP <c>a=rtpmap</c> for the audio
+    /// track. Default is 44100. Only used when <see cref="EnableAudioTrack"/> is true.
+    /// </summary>
+    public int AudioSampleRateHz { get; set; } = 44100;
+
+    /// <summary>
+    /// Audio channel count advertised in the SDP <c>a=rtpmap</c> for the audio
+    /// track. Default is 1 (mono). Only used when <see cref="EnableAudioTrack"/> is true.
+    /// </summary>
+    public int AudioChannels { get; set; } = 1;
 }

@@ -301,6 +301,82 @@ public class RtpPacketBuilder : IRtpPacketBuilder
     }
 
     /// <inheritdoc/>
+    public byte[] BuildAacRtpPacket(Client client, byte[] accessUnit, uint timestamp, byte payloadType = 97)
+    {
+        // RFC 3640 AAC-hbr, one AU per packet:
+        //   12 bytes  RTP fixed header
+        //    2 bytes  AU-headers-length  = 16 (length of AU-headers section IN BITS)
+        //    2 bytes  AU-header          = (size << 3) | au-index(0)
+        //    N bytes  access-unit data
+        int auLen = accessUnit.Length;
+        var packet = new byte[12 + 2 + 2 + auLen];
+
+        // Single AU per packet → marker bit set (this is the last/only AU in the RTP frame).
+        WriteAudioRtpHeader(client, packet, timestamp, marker: true, payloadType, auLen);
+
+        packet[12] = 0x00;
+        packet[13] = 0x10; // 16 bits of AU-headers
+
+        ushort auHeader = (ushort)((auLen & 0x1FFF) << 3); // 13-bit size, 3-bit index = 0
+        packet[14] = (byte)(auHeader >> 8);
+        packet[15] = (byte)(auHeader & 0xFF);
+
+        Buffer.BlockCopy(accessUnit, 0, packet, 16, auLen);
+        return packet;
+    }
+
+    /// <inheritdoc/>
+    public uint EncoderTimestampToAudioRtp(long encoderTimestampUs, int sampleRateHz, ref Client client)
+    {
+        if (sampleRateHz <= 0) sampleRateHz = 44100;
+        lock (client)
+        {
+            if (client.AudioBaseEncoderTimestamp == 0)
+            {
+                client.AudioBaseEncoderTimestamp = (ulong)encoderTimestampUs;
+                client.AudioBaseRtpTimestamp = client.AudioRtpTimestamp;
+                return client.AudioBaseRtpTimestamp;
+            }
+
+            long elapsedUs = encoderTimestampUs - (long)client.AudioBaseEncoderTimestamp;
+            // (elapsedUs * sampleRate) / 1_000_000 — use 64-bit math to avoid overflow.
+            ulong rtpAdd = (ulong)((elapsedUs * (long)sampleRateHz) / 1_000_000L);
+            return (uint)(client.AudioBaseRtpTimestamp + rtpAdd);
+        }
+    }
+
+    /// <summary>
+    /// Writes the 12-byte RTP fixed header into a pre-allocated buffer using the
+    /// <em>audio</em> track's per-client state (SSRC, sequence number) — kept separate
+    /// from the video <see cref="WriteRtpHeader"/> so audio and video have independent
+    /// streams as required by RFC 3550 §5.1.
+    /// </summary>
+    private static void WriteAudioRtpHeader(Client client, byte[] packet, uint timestamp, bool marker, byte payloadType, int payloadLength)
+    {
+        packet[0] = 0x80; // V=2, P=0, X=0, CC=0
+        packet[1] = (byte)(marker ? 0x80 | payloadType : payloadType);
+
+        ushort seqNum;
+        lock (client)
+        {
+            seqNum = client.AudioSequenceNumber++;
+            client.AudioRtpTimestamp = timestamp;
+        }
+        packet[2] = (byte)(seqNum >> 8);
+        packet[3] = (byte)(seqNum & 0xFF);
+        packet[4] = (byte)(timestamp >> 24);
+        packet[5] = (byte)(timestamp >> 16);
+        packet[6] = (byte)(timestamp >> 8);
+        packet[7] = (byte)(timestamp & 0xFF);
+        packet[8]  = (byte)(client.AudioSsrcId >> 24);
+        packet[9]  = (byte)(client.AudioSsrcId >> 16);
+        packet[10] = (byte)(client.AudioSsrcId >> 8);
+        packet[11] = (byte)(client.AudioSsrcId & 0xFF);
+        // payloadLength is unused for audio today — no per-track Sender Report logic yet.
+        _ = payloadLength;
+    }
+
+    /// <inheritdoc/>
     public byte[] GetStandardQuantizationTables() => _standardQuantizationTables;
 
     private static byte[] CreateStandardQuantizationTables()
