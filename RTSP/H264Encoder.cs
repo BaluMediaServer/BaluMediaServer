@@ -1,5 +1,6 @@
 using Android.Media;
 using Android.OS;
+using Android.Runtime;
 using Java.Nio;
 using System.Collections.Concurrent;
 using System.Threading.Channels;
@@ -42,6 +43,26 @@ public class H264Encoder : IDisposable
     /// </summary>
     public Services.FrameOverlay? Overlay { get; set; }
 
+    /// <summary>
+    /// When <c>true</c>, the H.264 Main profile (CABAC) is used if the hardware encoder
+    /// supports it; otherwise Baseline (CAVLC). Default is <c>false</c> (Baseline): on
+    /// MediaTek VENC, CABAC encode time scales with the entropy-coded bit count, so at high
+    /// resolutions Main throttles the frame rate exactly when motion inflates frame sizes.
+    /// Wired from <c>ServerConfiguration.PreferMainProfile</c>. Applies to encoders started
+    /// after the value changes (not to an already-running encoder).
+    /// </summary>
+    public static volatile bool PreferMainProfile = false;
+
+    /// <summary>
+    /// H.264 keyframe (IDR) interval in seconds, used as a scheduled backstop. Default 5.
+    /// The primary reference-chain recovery is the drop-triggered IDR in the streaming loop;
+    /// this bounds worst-case corruption if a drop is somehow missed. Lower = faster recovery
+    /// but more IDR encode stalls (each ~120-220ms on MT6768); higher = smoother but slower
+    /// recovery. Wired from <c>ServerConfiguration.KeyFrameIntervalSeconds</c>. Applies to
+    /// encoders started after the value changes.
+    /// </summary>
+    public static volatile int KeyFrameIntervalSeconds = 5;
+
     // Color formats supported by your device
     private const int COLOR_FormatYUV420Planar = 19;
     private const int COLOR_FormatYUV420SemiPlanar = 21;  // NV12
@@ -68,6 +89,17 @@ public class H264Encoder : IDisposable
 
     // Output stall detection: if input is fed but no output for this duration, encoder is stalled
     private long _lastOutputTicks;
+
+    // Output-rate diagnostic: counts encoded frames over a rolling window and logs the
+    // achieved FPS plus average frame size, so a frame-rate drop can be attributed to the
+    // encoder (low FPS here) vs. the network/send path (full FPS here but stutter at client).
+    private int _outFrameCount;
+    private long _outBytesInWindow;
+    private long _outFpsWindowStart;
+
+    // Monotonic output-order frame counter (see H264FrameEventArgs.FrameNumber). Only touched
+    // on the single encoding thread, so no synchronization needed.
+    private long _outputFrameNumber;
     private long _lastInputTicks;
     private static readonly long StallThresholdTicks = Stopwatch.Frequency; // 1 second
 
@@ -138,7 +170,7 @@ public class H264Encoder : IDisposable
         _height = height;
         _bitrate = bitrate;
         _frameRate = frameRate;
-        _frameIntervalUs = 1_000_000L / frameRate; // e.g., 40000us for 25fps
+        _frameIntervalUs = 1_000_000L / frameRate; // e.g., 33333us for 30fps
 
         // Create bounded channel with DropOldest to prevent latency buildup.
         // All frame input MUST go through this channel so that FeedInputBuffer()
@@ -368,6 +400,8 @@ public class H264Encoder : IDisposable
                 if (supportsBaseline) encoderInfo.Score += 5;
                 if (supportsMain) encoderInfo.Score += 3;
                 if (supportsHigh) encoderInfo.Score += 2;
+
+                encoderInfo.SupportsMainProfile = supportsMain;
             }
 
             return encoderInfo;
@@ -388,7 +422,10 @@ public class H264Encoder : IDisposable
     private bool IsResolutionSupported(int width, int height)
     {
         if (_bestEncoder?.Capabilities?.VideoCapabilities == null) return true;
-        return _bestEncoder.Capabilities.VideoCapabilities.IsSizeSupported(width, height);
+        // Probe the aligned encode height (see EncodeHeightFor), clamped to the encoder max so the
+        // top resolution (2K) isn't rejected, so non-16-aligned heights like 1080p aren't falsely
+        // rejected and downgraded before _encodeHeight is even computed.
+        return _bestEncoder.Capabilities.VideoCapabilities.IsSizeSupported(width, ClampedEncodeHeight(height, _bestEncoder.MaxSupportedHeight));
     }
 
     /// <summary>
@@ -418,10 +455,34 @@ public class H264Encoder : IDisposable
 
         foreach (var (w, h) in resolutions)
         {
-            if (w <= width && h <= height && videoCaps.IsSizeSupported(w, h))
+            if (w <= width && h <= height && videoCaps.IsSizeSupported(w, ClampedEncodeHeight(h, _bestEncoder?.MaxSupportedHeight ?? 0)))
                 return (w, h);
         }
         return (640, 480); // Safe fallback
+    }
+
+    /// <summary>
+    /// The height the encoder is actually configured at for a given display height: rounded up to
+    /// a 16px macroblock boundary plus one extra row pair (the MediaTek crop workaround applied in
+    /// <see cref="Start"/>). Capability checks must probe this height, not the raw display height,
+    /// or non-16-aligned heights such as 1080p are wrongly reported as unsupported.
+    /// </summary>
+    private static int EncodeHeightFor(int displayHeight) => ((displayHeight / 16) + 2) * 16;
+
+    /// <summary>
+    /// <see cref="EncodeHeightFor"/> clamped so it never exceeds the encoder's maximum supported
+    /// height (aligned down to a 16px macroblock boundary). The crop workaround adds two macroblock
+    /// rows; at the encoder's top resolution that overshoots the hardware cap — e.g. 2560x1440 would
+    /// become 2560x1472, and configure() fails with -EINVAL. Clamping lets the maximum resolution
+    /// (2K) configure; the only cost is that the padding/crop row is dropped at that one size, so the
+    /// MediaTek bottom-row chroma artifact may be visible there. Pass maxSupportedHeight = 0 to skip
+    /// the clamp (capabilities unknown).
+    /// </summary>
+    private static int ClampedEncodeHeight(int displayHeight, int maxSupportedHeight)
+    {
+        int desired = EncodeHeightFor(displayHeight);
+        int maxAligned = (maxSupportedHeight / 16) * 16;
+        return maxAligned > 0 ? Math.Min(desired, maxAligned) : desired;
     }
 
     /// <summary>
@@ -440,7 +501,15 @@ public class H264Encoder : IDisposable
                 return (requestedWidth, requestedHeight);
 
             var videoCaps = best.Capabilities.VideoCapabilities;
-            if (videoCaps.IsSizeSupported(requestedWidth, requestedHeight))
+
+            // IMPORTANT: probe the height Start() will actually configure, not the raw height.
+            // Start() rounds the encode height up to a macroblock boundary (see _encodeHeight:
+            // ((h / 16) + 2) * 16) for the MediaTek crop workaround, then crops on output. Testing
+            // the raw height here falsely rejects sizes whose height isn't a multiple of 16 — e.g.
+            // 1080p (1080 % 16 == 8), which was silently downgraded to 720p. Conversely it also
+            // catches sizes whose aligned height exceeds the encoder max (e.g. QHD 1440 → 1472 > the
+            // 1440 cap), so those correctly fall through to a size that will actually configure.
+            if (videoCaps.IsSizeSupported(requestedWidth, ClampedEncodeHeight(requestedHeight, best.MaxSupportedHeight)))
                 return (requestedWidth, requestedHeight);
 
             // Try common resolutions in descending order
@@ -451,7 +520,7 @@ public class H264Encoder : IDisposable
 
             foreach (var (w, h) in resolutions)
             {
-                if (w <= requestedWidth && h <= requestedHeight && videoCaps.IsSizeSupported(w, h))
+                if (w <= requestedWidth && h <= requestedHeight && videoCaps.IsSizeSupported(w, ClampedEncodeHeight(h, best.MaxSupportedHeight)))
                 {
                     BaluLogger.Info("H264", $"ProbeSupportedResolution: {requestedWidth}x{requestedHeight} not supported, using {w}x{h}");
                     return (w, h);
@@ -493,7 +562,9 @@ public class H264Encoder : IDisposable
                 // encoded bitstream regardless of input data. By pushing that row into padding
                 // and setting SPS frame_crop_bottom_offset, the decoder hides it — all real
                 // content (rows 0.._height-1) is preserved and displayed correctly.
-                _encodeHeight = ((_height / 16) + 2) * 16; // e.g. 480 → 512 (2 extra macroblock rows)
+                // e.g. 480 → 512 (2 extra macroblock rows); clamped to the encoder max so the top
+                // resolution (2K, 2560x1440) configures instead of overshooting to 1472 and failing.
+                _encodeHeight = ClampedEncodeHeight(_height, _bestEncoder?.MaxSupportedHeight ?? 0);
 
                 // Create format with encoder's supported color format
                 var format = MediaFormat.CreateVideoFormat(MediaFormat.MimetypeVideoAvc, _width, _encodeHeight);
@@ -523,14 +594,30 @@ public class H264Encoder : IDisposable
                 // Use SetInteger (not SetFloat) — MediaTek MT6768 misinterprets sub-second float
                 // values as 0, causing EVERY frame to be an IDR keyframe, which exhausts the
                 // encoder's internal buffers and causes it to stall after ~1000 frames.
-                // IDR frames cause 120-220ms encoding stalls on MT6768; set a long interval to
-                // minimise scheduled stalls. New clients still get an IDR within ~40ms via
-                // RequestKeyFrame(), so stream start is unaffected.
-                format.SetInteger(MediaFormat.KeyIFrameInterval, 30);
+                // IDR frames cause 120-220ms encoding stalls on MT6768, so we don't want a tiny
+                // GOP — but a 30s interval (the old value) means any dropped P-frame corrupts the
+                // stream for up to 30s. KeyFrameIntervalSeconds (default 5s) is a backstop: the
+                // primary recovery is drop-triggered RequestKeyFrame() in the streaming loop, and
+                // new clients still get an immediate IDR via RequestKeyFrame(). At 5s the scheduled
+                // IDR overhead is ~3% of encode time, negligible for frame rate.
+                format.SetInteger(MediaFormat.KeyIFrameInterval, KeyFrameIntervalSeconds);
                 
-                // Set profile and level for better compatibility
-                format.SetInteger(MediaFormat.KeyProfile, (int)MediaCodecProfileType.Avcprofilebaseline);
+                // Set profile and level for better compatibility.
+                // Baseline (CAVLC) is the default: on MediaTek VENC the per-frame encode time
+                // scales almost linearly with the entropy-coded bit count under Main/CABAC
+                // (measured on MT6768 at 2K: ~98KB frame → 73ms, ~139KB frame → 106ms), so at
+                // high resolutions CABAC throttles throughput exactly when motion inflates the
+                // frames — frame rate sags during motion. CAVLC trades ~10-15% compression
+                // efficiency for substantially faster entropy coding.
+                // Main can be opted in via PreferMainProfile (ServerConfiguration.PreferMainProfile)
+                // for low resolutions or SoCs with fast CABAC hardware. Main shares Baseline's SPS
+                // layout up to the crop fields, so PatchSpsForCrop works with both (it only bails
+                // on High/extended profiles).
+                bool useMain = PreferMainProfile && _bestEncoder?.SupportsMainProfile == true;
+                format.SetInteger(MediaFormat.KeyProfile,
+                    (int)(useMain ? MediaCodecProfileType.Avcprofilemain : MediaCodecProfileType.Avcprofilebaseline));
                 format.SetInteger(MediaFormat.KeyLevel, 0x100);
+                BaluLogger.Info("H264", $"Using H.264 {(useMain ? "Main" : "Baseline")} profile");
 
                 // Low latency configuration
                 if (Build.VERSION.SdkInt >= BuildVersionCodes.M) // API 23+
@@ -540,15 +627,13 @@ public class H264Encoder : IDisposable
 
                 }
 
-                if (Build.VERSION.SdkInt >= BuildVersionCodes.P) // API 28+
-                {
-                    // Explicitly request 0-frame encoder pipeline depth. Without this, hardware
-                    // encoders buffer N frames internally before outputting the first result,
-                    // adding N × frame_interval of latency. This forces immediate output.
-#pragma warning disable CA1416
-                    format.SetInteger(MediaFormat.KeyLatency, 0);
-#pragma warning restore CA1416
-                }
+                // NOTE: KeyLatency=0 (zero-frame pipeline depth) was removed deliberately.
+                // It forces a single frame in flight, so throughput collapses to
+                // 1 / hw_encode_time — ~11fps at 2560x1440 on MT6768 (~90ms/frame) even
+                // though the camera delivers 30fps. Harmless at VGA (encode is a few ms),
+                // catastrophic at high resolutions. Letting MediaCodec keep its natural
+                // pipeline depth (a few frames) restores full throughput at the cost of
+                // 1-2 frame intervals of extra latency.
 
                 if (OperatingSystem.IsAndroidVersionAtLeast(30)) // API 30+
                 {
@@ -722,7 +807,12 @@ public class H264Encoder : IDisposable
     /// MediaCodec access is serialized on a single thread.
     /// </summary>
     /// <param name="frameData">The raw YUV420 frame data.</param>
-    /// <param name="timestamp">The presentation timestamp in microseconds.</param>
+    /// <param name="timestamp">
+    /// The presentation timestamp in <b>microseconds</b>. WARNING: camera2 sensor timestamps
+    /// are nanoseconds — divide by 1000 first. Feeding nanoseconds makes consecutive frames
+    /// appear 1000x further apart, which drives the MediaTek time-based GOP logic to force an
+    /// IDR on every frame and breaks the rate controller (see H264EncoderManager.FeedFrame).
+    /// </param>
     public void QueueFrame(byte[] frameData, long timestamp, int sourceWidth = 0, int sourceHeight = 0)
     {
         if (!_isRunning) return;
@@ -1074,12 +1164,13 @@ public class H264Encoder : IDisposable
             int dstOff = dstYPlaneSize + row * stride;
             if (srcOff + copyUvWidth > frameData.Length) break;
             if (dstOff + copyUvWidth > encoderDataSize) break;
-            // Swap V,U → U,V while copying
-            for (int i = 0; i < copyUvWidth - 1; i += 2)
-            {
-                encoderData[dstOff + i] = frameData[srcOff + i + 1];     // U
-                encoderData[dstOff + i + 1] = frameData[srcOff + i];     // V
-            }
+            // Swap V,U → U,V while copying. Each interleaved VU pair is one little-endian
+            // ushort, so a vectorized 16-bit byte-reverse performs the whole row's swap with
+            // SIMD instead of a per-byte managed loop (~1.8 MB/frame at 2K, which alone cost
+            // ~15-20ms/frame on the encoder thread's single core).
+            var srcRow = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ushort>(frameData.AsSpan(srcOff, copyUvWidth));
+            var dstRow = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ushort>(encoderData.AsSpan(dstOff, copyUvWidth));
+            System.Buffers.Binary.BinaryPrimitives.ReverseEndianness(srcRow, dstRow);
             // Fill UV column padding with neutral chroma (0x80) — U=128, V=128 is gray.
             // Cleared-to-zero UV (U=0, V=0) decodes to green (R:0 G:135 B:0 in BT.601).
             if (stride > copyUvWidth)
@@ -1134,7 +1225,24 @@ public class H264Encoder : IDisposable
         }
 
         int writeSize = Math.Min(encoderDataSize, inputBuffer.Capacity());
-        inputBuffer.Put(encoderData, 0, writeSize);
+
+        // Write through the direct buffer's native address with a single Marshal.Copy.
+        // The Java binding for ByteBuffer.Put(byte[], int, int) marshals the managed array
+        // into a brand-new Java byte[] (5.5 MB at 2K), then Java copies it again into the
+        // codec buffer — two extra 5.5 MB copies plus 5.5 MB of Java GC garbage PER FRAME.
+        // That overhead kept the H264-Encoder thread at ~85% of a core and capped the
+        // pipeline at ~12fps at 2K. MediaCodec input buffers are always direct, but keep
+        // the Put() fallback in case a vendor returns a non-direct buffer.
+        IntPtr direct = JNIEnv.GetDirectBufferAddress(inputBuffer.Handle);
+        if (direct != IntPtr.Zero)
+        {
+            System.Runtime.InteropServices.Marshal.Copy(encoderData, 0, direct, writeSize);
+        }
+        else
+        {
+            inputBuffer.Put(encoderData, 0, writeSize);
+        }
+
         _bufferPool.Return(encoderData);
         return writeSize;
     }
@@ -1287,9 +1395,23 @@ public class H264Encoder : IDisposable
                     if (outputBuffer != null && bufferInfo.Size > 0)
                     {
                         var data = new byte[bufferInfo.Size];
-                        outputBuffer.Position(bufferInfo.Offset);
-                        outputBuffer.Limit(bufferInfo.Offset + bufferInfo.Size);
-                        outputBuffer.Get(data);
+
+                        // Read through the direct buffer's native address with one Marshal.Copy.
+                        // The Java binding for ByteBuffer.Get(byte[]) allocates a Java-side array,
+                        // copies into it, then copies back to managed — two extra copies plus Java
+                        // GC garbage per encoded frame. Get() is kept as a fallback for non-direct
+                        // buffers.
+                        IntPtr direct = JNIEnv.GetDirectBufferAddress(outputBuffer.Handle);
+                        if (direct != IntPtr.Zero)
+                        {
+                            System.Runtime.InteropServices.Marshal.Copy(direct + bufferInfo.Offset, data, 0, bufferInfo.Size);
+                        }
+                        else
+                        {
+                            outputBuffer.Position(bufferInfo.Offset);
+                            outputBuffer.Limit(bufferInfo.Offset + bufferInfo.Size);
+                            outputBuffer.Get(data);
+                        }
 
                         // Check if this is config data
                         if ((bufferInfo.Flags & MediaCodecBufferFlags.CodecConfig) != 0)
@@ -1326,10 +1448,29 @@ public class H264Encoder : IDisposable
                                 Timestamp = bufferInfo.PresentationTimeUs,
                                 Sps = sps,
                                 Pps = pps,
-                                EncodedAt = Stopwatch.GetTimestamp()
+                                EncodedAt = Stopwatch.GetTimestamp(),
+                                FrameNumber = ++_outputFrameNumber
                             };
 
                             FrameEncoded?.Invoke(this, frameEvent);
+
+                            // Output-rate diagnostic — log achieved FPS + avg frame size every ~5s.
+                            long nowTicks = Stopwatch.GetTimestamp();
+                            if (_outFpsWindowStart == 0) _outFpsWindowStart = nowTicks;
+                            _outFrameCount++;
+                            _outBytesInWindow += data.Length;
+                            long windowTicks = nowTicks - _outFpsWindowStart;
+                            if (windowTicks >= Stopwatch.Frequency * 5)
+                            {
+                                double seconds = (double)windowTicks / Stopwatch.Frequency;
+                                double fps = _outFrameCount / seconds;
+                                double avgKb = _outBytesInWindow / (double)_outFrameCount / 1024.0;
+                                double mbps = _outBytesInWindow * 8.0 / seconds / 1_000_000.0;
+                                BaluLogger.Info("H264", $"Output rate: {fps:F1} fps, avg {avgKb:F1} KB/frame, {mbps:F2} Mbps (target {_frameRate}fps @ {_bitrate}bps)");
+                                _outFrameCount = 0;
+                                _outBytesInWindow = 0;
+                                _outFpsWindowStart = nowTicks;
+                            }
                         }
                     }
                 }

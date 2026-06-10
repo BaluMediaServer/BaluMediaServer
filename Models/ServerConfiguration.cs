@@ -73,8 +73,10 @@ public class ServerConfiguration
     /// Default is <see cref="VideoResolution.VGA_640x480"/>.
     /// </summary>
     /// <remarks>
-    /// Setting this property automatically configures the appropriate bitrate for H.264 encoding.
-    /// For custom resolutions, use <see cref="BackCameraWidth"/> and <see cref="BackCameraHeight"/> instead.
+    /// The effective resolution (this preset, or <see cref="BackCameraWidth"/>/<see cref="BackCameraHeight"/>
+    /// when set) drives the automatic H.264 bitrate, scaled at ~0.1 bits/pixel/frame. Override the bitrate
+    /// at runtime with <c>Server.SetBackCameraBitrate(int)</c>, or pass 0 / call <c>SetBackCameraAutoBitrate()</c>
+    /// to return to automatic. For custom resolutions, use <see cref="BackCameraWidth"/> and <see cref="BackCameraHeight"/>.
     /// </remarks>
     public VideoResolution BackCameraResolution { get; set; } = VideoResolution.VGA_640x480;
 
@@ -97,8 +99,10 @@ public class ServerConfiguration
     /// Default is <see cref="VideoResolution.VGA_640x480"/>.
     /// </summary>
     /// <remarks>
-    /// Setting this property automatically configures the appropriate bitrate for H.264 encoding.
-    /// For custom resolutions, use <see cref="FrontCameraWidth"/> and <see cref="FrontCameraHeight"/> instead.
+    /// The effective resolution (this preset, or <see cref="FrontCameraWidth"/>/<see cref="FrontCameraHeight"/>
+    /// when set) drives the automatic H.264 bitrate, scaled at ~0.1 bits/pixel/frame. Override the bitrate
+    /// at runtime with <c>Server.SetFrontCameraBitrate(int)</c>, or pass 0 / call <c>SetFrontCameraAutoBitrate()</c>
+    /// to return to automatic. For custom resolutions, use <see cref="FrontCameraWidth"/> and <see cref="FrontCameraHeight"/>.
     /// </remarks>
     public VideoResolution FrontCameraResolution { get; set; } = VideoResolution.VGA_640x480;
 
@@ -115,6 +119,49 @@ public class ServerConfiguration
     /// Default is 0 (use resolution preset).
     /// </summary>
     public int FrontCameraHeight { get; set; } = 0;
+
+    /// <summary>
+    /// Gets or sets whether RTCP-driven adaptive bitrate is enabled. Default is <c>true</c>.
+    /// <para>
+    /// When enabled, the server reduces the encoder bitrate on detected packet loss and restores
+    /// it (up to the configured auto/manual value) when the network recovers — useful for lossy
+    /// or remote links. The configured bitrate (resolution auto-scaling, or a manual
+    /// <c>Server.SetBackCameraBitrate</c>) is the ceiling; adaptation never raises it above that,
+    /// so on a clean LAN it stays exactly at the configured value.
+    /// </para>
+    /// <para>
+    /// Set to <c>false</c> to pin the encoder strictly to the configured bitrate and ignore RTCP
+    /// entirely — recommended when you select the bitrate manually and want it honored verbatim.
+    /// </para>
+    /// </summary>
+    public bool AdaptiveBitrate { get; set; } = true;
+
+    /// <summary>
+    /// Gets or sets whether the H.264 Main profile (CABAC entropy coding) should be used when
+    /// the hardware encoder supports it. Default is <c>false</c> (Baseline / CAVLC).
+    /// <para>
+    /// Main yields ~10-15% better compression at the same bitrate, but on MediaTek VENC the
+    /// per-frame encode time scales with the entropy-coded bit count under CABAC — at high
+    /// resolutions this throttles the frame rate precisely when motion inflates frame sizes
+    /// (measured on MT6768 at 2560x1440: static ~13.6fps, motion dropping to ~9.4fps as frames
+    /// grew 98→139KB). Baseline keeps encode time roughly resolution-bound instead of
+    /// bitrate-bound. Enable Main only for low resolutions or SoCs with fast CABAC hardware.
+    /// </para>
+    /// </summary>
+    public bool PreferMainProfile { get; set; } = false;
+
+    /// <summary>
+    /// Gets or sets the H.264 keyframe (IDR) interval in seconds. Default is 5.
+    /// <para>
+    /// This is a scheduled backstop for reference-chain recovery. The primary mechanism is a
+    /// drop-triggered IDR: when a client's send loop falls behind and the fan-out drops an encoded
+    /// frame, the streaming loop immediately requests a keyframe. This interval bounds worst-case
+    /// corruption if a drop is ever missed. Lower values recover faster but add more IDR encode
+    /// stalls (each ~120-220ms on MediaTek at 2K); higher values are smoother but slower to recover.
+    /// New/reconnecting clients always receive an immediate IDR regardless of this value.
+    /// </para>
+    /// </summary>
+    public int KeyFrameIntervalSeconds { get; set; } = 5;
 
     /// <summary>
     /// Gets the effective width for the back camera.

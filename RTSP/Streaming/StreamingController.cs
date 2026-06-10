@@ -354,6 +354,7 @@ public class StreamingController : IStreamingController
 
         BaluLogger.Info("[StreamingController]", $"Starting H264 encoder with {reportedWidth}x{reportedHeight}");
         _encoderManager.StartEncoder(client.CameraId, reportedWidth, reportedHeight, frameSize);
+        SyncClientBitrateToEncoder(client);
 
         // Check if encoder fell back to a different resolution
         var (actualW, actualH) = _encoderManager.GetActualResolution(client.CameraId);
@@ -381,7 +382,31 @@ public class StreamingController : IStreamingController
 
             BaluLogger.Info("[StreamingController]", $"Got frame at {frame.Width}x{frame.Height} after camera restart, starting encoder");
             _encoderManager.StartEncoder(client.CameraId, frame.Width, frame.Height, frame.Data.Length);
+            SyncClientBitrateToEncoder(client);
         }
+    }
+
+    /// <summary>
+    /// Aligns the client's RTCP bitrate operating point with the encoder's configured (auto or
+    /// manual) bitrate. Without this, <see cref="Models.Client.CurrentBitrate"/> (default 2 Mbps)
+    /// and <see cref="Models.VideoProfile.MaxBitrate"/> (default 4 Mbps) cap RTCP's target far
+    /// below the configured value, so the first receiver report drags the encoder down — the
+    /// stream looks clean at start, then degrades after a few seconds. Setting both to the
+    /// configured bitrate makes that value the ceiling: on a clean link the bitrate holds, and on
+    /// loss RTCP may dip then recover back up to it.
+    /// </summary>
+    private void SyncClientBitrateToEncoder(Models.Client client)
+    {
+        int configured = _encoderManager.GetBitrate(client.CameraId);
+        if (configured <= 0) return;
+
+        lock (client)
+        {
+            client.CurrentBitrate = configured;
+            if (client.VideoProfile.MaxBitrate < configured)
+                client.VideoProfile.MaxBitrate = configured;
+        }
+        BaluLogger.Info("[StreamingController]", $"RTCP bitrate ceiling aligned to encoder: {configured}bps (camera {client.CameraId})");
     }
 
     /// <summary>
@@ -443,6 +468,28 @@ public class StreamingController : IStreamingController
             return false;
         }
 
+        // Detect frames dropped by the DropOldest fan-out channel (gap in FrameNumber). A dropped
+        // P-frame breaks the decoder's reference chain — moving regions smear ("melted" look) until
+        // the next IDR. Request an IDR to resync, but RATE-LIMIT it: an IDR is large and slow to
+        // encode, so firing one per dropped frame spirals (bigger frames → more drops → more IDRs;
+        // observed pushing the stream to 16 Mbps / 2 fps). At most one drop-IDR every 3s — enough to
+        // repair an occasional drop without a storm. The 4-frame channel buffer should make drops
+        // rare; frequent drops here mean the resolution is too high for the SoC's encode+send rate.
+        if (h264Frame.FrameNumber > 0 && client.LastH264FrameNumber > 0
+            && h264Frame.FrameNumber != client.LastH264FrameNumber + 1
+            && !h264Frame.IsKeyFrame)
+        {
+            long dropped = h264Frame.FrameNumber - client.LastH264FrameNumber - 1;
+            long now = Environment.TickCount64;
+            if (now - client.LastDropIdrTick >= 3000)
+            {
+                client.LastDropIdrTick = now;
+                BaluLogger.Warn("[StreamingController]", $"Client {client.Id} dropped {dropped} encoded frame(s) (send fell behind) — requesting IDR to repair reference chain");
+                _encoderManager.RequestKeyFrame(client.CameraId);
+            }
+        }
+        client.LastH264FrameNumber = h264Frame.FrameNumber;
+
         // Skip frames with timestamps older than the last sent frame.
         // Use strict less-than to allow frames with equal timestamps through,
         // since MediaCodec on some SoCs can output consecutive frames with the same PTS.
@@ -469,7 +516,7 @@ public class StreamingController : IStreamingController
             }
         }
 
-        // No pacer delay: the encoder's 25fps output rate is the natural throttle, and the
+        // No pacer delay: the encoder's 30fps output rate is the natural throttle, and the
         // per-client channel (DropOldest, size=1) already discards stale frames on bursts.
         // A software pacer would add 33ms of Thread.Sleep per frame on the now-synchronous path.
 

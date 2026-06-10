@@ -116,11 +116,29 @@ public interface IH264EncoderManager
     void FeedFrame(int cameraId, FrameEventArgs frame);
 
     /// <summary>
-    /// Updates the encoder bitrate.
+    /// Updates the encoder bitrate (runtime adjustment, e.g. RTCP congestion control).
+    /// Does not change the configured auto/manual mode used on the next encoder start.
     /// </summary>
     /// <param name="cameraId">The camera ID.</param>
     /// <param name="bitrate">The new bitrate.</param>
     void UpdateBitrate(int cameraId, int bitrate);
+
+    /// <summary>
+    /// Sets the bitrate mode for a camera. Pass a positive value (bits/sec) for a manual
+    /// override that is honored as-is — even below the auto recommendation — or 0 (or less)
+    /// to use automatic resolution-scaled bitrate. Applied immediately if the encoder is
+    /// running and persisted for subsequent encoder (re)starts.
+    /// </summary>
+    /// <param name="cameraId">The camera ID (0 = back, 1 = front).</param>
+    /// <param name="bitrate">Manual bitrate in bits/sec, or &lt;= 0 for automatic.</param>
+    void SetBitrate(int cameraId, int bitrate);
+
+    /// <summary>
+    /// Gets the effective bitrate (bits/sec) currently in use for a camera: the manual
+    /// override if set, otherwise the automatic resolution-scaled value.
+    /// </summary>
+    /// <param name="cameraId">The camera ID.</param>
+    int GetBitrate(int cameraId);
 
     /// <summary>
     /// Gets the expected frame size for the encoder.

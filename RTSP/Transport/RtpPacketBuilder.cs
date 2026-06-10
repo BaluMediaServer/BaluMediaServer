@@ -276,10 +276,12 @@ public class RtpPacketBuilder : IRtpPacketBuilder
     /// <inheritdoc/>
     /// <remarks>
     /// Uses wall-clock time (Stopwatch) instead of encoder timestamps for RTP clock
-    /// derivation. MediaTek MT6768 (and possibly other SoCs) report PresentationTimeUs
-    /// in units ~1000x larger than documented microseconds, causing RTP timestamp deltas
-    /// of ~3,000,000 per frame instead of the expected ~3,600 (at 25fps/90kHz).
-    /// Wall-clock based timestamps are robust regardless of encoder timestamp units.
+    /// derivation. Historical note: the encoder output PTS once appeared "~1000x larger
+    /// than microseconds" on MT6768 — the real cause (found in v1.5.29) was that camera2
+    /// SENSOR_TIMESTAMP nanoseconds were fed into MediaCodec unconverted, and the encoder
+    /// simply echoes input PTS on output. That is fixed at the source in
+    /// H264EncoderManager.FeedFrame (ns → µs), but wall-clock derivation is kept because
+    /// it remains robust regardless of upstream timestamp units or camera clock domains.
     /// BaseEncoderTimestamp is repurposed to store the Stopwatch start tick.
     /// </remarks>
     public uint EncoderTimestampToRtp(ulong encoderTimestamp, ref Client client)

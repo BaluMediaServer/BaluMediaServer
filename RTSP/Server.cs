@@ -54,6 +54,12 @@ public class Server : IDisposable
     private readonly AudioCaptureService? _audioCapture;
     private readonly AacEncoderManager? _aacEncoderManager;
 
+    // When true, RTCP receiver reports may reduce the encoder bitrate on packet loss (and
+    // restore it up to the configured ceiling). When false, the encoder is pinned to its
+    // configured auto/manual bitrate and RTCP adjustments are ignored. Defaults to true;
+    // overridden from ServerConfiguration.AdaptiveBitrate and via SetAdaptiveBitrate().
+    private volatile bool _adaptiveBitrate = true;
+
     // MJPEG server configuration
     private readonly int _mjpegServerQuality;
     private readonly int _mjpegServerPort;
@@ -243,6 +249,10 @@ public class Server : IDisposable
             AudioChannels: configuration.AudioChannels)
     {
         _enabled = configuration.EnableServer;
+        _adaptiveBitrate = configuration.AdaptiveBitrate;
+        H264Encoder.PreferMainProfile = configuration.PreferMainProfile;
+        if (configuration.KeyFrameIntervalSeconds > 0)
+            H264Encoder.KeyFrameIntervalSeconds = configuration.KeyFrameIntervalSeconds;
         if (configuration.StartMjpegServer)
             _mjpegServer?.Start(true);
 
@@ -316,6 +326,45 @@ public class Server : IDisposable
     /// Gets the current front camera resolution.
     /// </summary>
     public (int Width, int Height) GetFrontCameraResolution() => (_frontCameraWidth, _frontCameraHeight);
+
+    /// <summary>
+    /// Sets the back camera H.264 bitrate. Pass a positive value (bits/sec) for a manual
+    /// bitrate that is honored exactly — even below the auto recommendation (e.g. 2 Mbps at 2K) —
+    /// or 0 to use the automatic resolution-scaled bitrate. Applied live if the encoder is running.
+    /// </summary>
+    public void SetBackCameraBitrate(int bitrate) => _encoderManager.SetBitrate(0, bitrate);
+
+    /// <summary>
+    /// Sets the front camera H.264 bitrate. See <see cref="SetBackCameraBitrate"/> for semantics.
+    /// </summary>
+    public void SetFrontCameraBitrate(int bitrate) => _encoderManager.SetBitrate(1, bitrate);
+
+    /// <summary>
+    /// Switches the back camera to automatic (resolution-scaled) bitrate.
+    /// </summary>
+    public void SetBackCameraAutoBitrate() => _encoderManager.SetBitrate(0, 0);
+
+    /// <summary>
+    /// Switches the front camera to automatic (resolution-scaled) bitrate.
+    /// </summary>
+    public void SetFrontCameraAutoBitrate() => _encoderManager.SetBitrate(1, 0);
+
+    /// <summary>
+    /// Gets the effective back camera bitrate in bits/sec (manual if set, otherwise auto).
+    /// </summary>
+    public int GetBackCameraBitrate() => _encoderManager.GetBitrate(0);
+
+    /// <summary>
+    /// Gets the effective front camera bitrate in bits/sec (manual if set, otherwise auto).
+    /// </summary>
+    public int GetFrontCameraBitrate() => _encoderManager.GetBitrate(1);
+
+    /// <summary>
+    /// Computes the recommended automatic bitrate (bits/sec) for a resolution, so the consuming
+    /// app can display or default to it in a bitrate selector.
+    /// </summary>
+    public static int GetRecommendedBitrate(int width, int height)
+        => H264EncoderManager.CalculateAutoBitrate(width, height);
 
     /// <summary>
     /// Adds a video profile configuration for streaming.
@@ -1014,8 +1063,27 @@ public class Server : IDisposable
 
     private void OnBitrateAdjustmentRequired(object? sender, (Client client, int newBitrate) args)
     {
-        _encoderManager.UpdateBitrate(args.client.CameraId, args.newBitrate);
+        // When adaptive bitrate is disabled the encoder is pinned to its configured auto/manual
+        // value — ignore RTCP-driven changes entirely so a manually chosen bitrate is honored.
+        if (!_adaptiveBitrate) return;
+
+        // Never let RTCP raise the encoder above its configured ceiling (the auto/manual value).
+        // RTCP only ever *reduces* on loss and recovers back up to this ceiling.
+        int ceiling = _encoderManager.GetBitrate(args.client.CameraId);
+        int target = ceiling > 0 ? Math.Min(args.newBitrate, ceiling) : args.newBitrate;
+        _encoderManager.UpdateBitrate(args.client.CameraId, target);
     }
+
+    /// <summary>
+    /// Enables or disables RTCP-driven adaptive bitrate at runtime. When disabled, the encoder
+    /// stays pinned to its configured auto/manual bitrate regardless of network conditions.
+    /// </summary>
+    public void SetAdaptiveBitrate(bool enabled) => _adaptiveBitrate = enabled;
+
+    /// <summary>
+    /// Gets whether RTCP-driven adaptive bitrate is currently enabled.
+    /// </summary>
+    public bool IsAdaptiveBitrateEnabled() => _adaptiveBitrate;
 
     private void OnEncoderFrameEncoded(object? sender, H264FrameEventArgs e)
     {

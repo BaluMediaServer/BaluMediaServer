@@ -1,5 +1,6 @@
 using System.Threading.Channels;
 using Android.Content;
+using Android.Runtime;
 using BaluMediaServer.Interfaces;
 using BaluMediaServer.Models;
 using Com.BaluMedia.CameraStreamer;
@@ -22,6 +23,18 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
     private Task? _thread;
     private DateTime _lastFrameTime;
     private readonly TimeSpan _minFrameInterval = TimeSpan.FromMilliseconds(22); // +- 45 fps
+
+    // Ring of reusable managed frame buffers. VideoFrame.GetData() allocates a fresh managed
+    // byte[] per frame (7.4 MB at 2560x1440); at 30fps that is ~220 MB/s of large-object-heap
+    // churn, which triggered a GC-bridge storm (16 explicit ART GCs/sec) and throttled the whole
+    // pipeline to ~7fps. Copying into a fixed ring via JNIEnv.CopyArray eliminates the per-frame
+    // allocation entirely. Depth 6 gives downstream consumers (encoder input copy, MJPEG, event
+    // subscribers) ~200ms at 30fps before a buffer is reused — far longer than any consumer
+    // holds the data. Subscribers that need a frame beyond that window must copy it.
+    private const int FrameBufferRingSize = 6;
+    private readonly byte[]?[] _frameBufferRing = new byte[FrameBufferRingSize][];
+    private int _frameBufferIndex;
+    private IntPtr _getDataMethodId = IntPtr.Zero;
     private volatile bool _disposed;  // Prevents JNI access after disposal
     private int _channelCapacity;
 
@@ -156,7 +169,9 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
 
             // Marshal all data from Java object NOW (we're on the Java callback thread,
             // already in JNI context) so the processing thread stays pure managed code.
-            var data = frame.GetData();
+            // Uses a pooled ring buffer + JNIEnv.CopyArray instead of frame.GetData(),
+            // which would allocate a new multi-MB managed array per frame (see ring docs).
+            var data = CopyFrameDataPooled(frame);
             if (data == null || data.Length == 0)
             {
                 SafeRecycleFrame(frame);
@@ -186,6 +201,55 @@ public class BackCameraService : Java.Lang.Object, ICameraService, IBackCameraFr
                 SafeInvokeError($"Error processing frame: {ex.Message}");
             }
             SafeRecycleFrame(frame);
+        }
+    }
+
+    /// <summary>
+    /// Copies the Java frame data into a reusable managed ring buffer using raw JNI,
+    /// avoiding the per-frame multi-MB managed allocation that <c>VideoFrame.GetData()</c>
+    /// performs (it materializes a brand-new <c>byte[]</c> via <c>JNIEnv.GetArray</c>).
+    /// Returns <c>null</c> if the Java array is missing or empty.
+    /// </summary>
+    private byte[]? CopyFrameDataPooled(VideoFrame frame)
+    {
+        IntPtr arrHandle = IntPtr.Zero;
+        try
+        {
+            // Cache the getData()[B method id once — method ids are stable per class.
+            if (_getDataMethodId == IntPtr.Zero)
+            {
+                IntPtr cls = JNIEnv.GetObjectClass(frame.Handle);
+                try { _getDataMethodId = JNIEnv.GetMethodID(cls, "getData", "()[B"); }
+                finally { JNIEnv.DeleteLocalRef(cls); }
+            }
+
+            arrHandle = JNIEnv.CallObjectMethod(frame.Handle, _getDataMethodId);
+            if (arrHandle == IntPtr.Zero) return null;
+
+            int len = JNIEnv.GetArrayLength(arrHandle);
+            if (len <= 0) return null;
+
+            // Exact-size ring slot: reallocated only when the frame size changes
+            // (resolution change), so steady-state operation allocates nothing.
+            var buf = _frameBufferRing[_frameBufferIndex];
+            if (buf == null || buf.Length != len)
+            {
+                buf = new byte[len];
+                _frameBufferRing[_frameBufferIndex] = buf;
+            }
+            _frameBufferIndex = (_frameBufferIndex + 1) % FrameBufferRingSize;
+
+            JNIEnv.CopyArray(arrHandle, buf);
+            return buf;
+        }
+        catch (Exception ex)
+        {
+            if (!_disposed) SafeInvokeError($"Frame data copy error: {ex.Message}");
+            return null;
+        }
+        finally
+        {
+            if (arrHandle != IntPtr.Zero) JNIEnv.DeleteLocalRef(arrHandle);
         }
     }
 

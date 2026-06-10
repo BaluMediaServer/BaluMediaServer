@@ -28,16 +28,44 @@ public class H264EncoderManager : IH264EncoderManager
     private int _h264BackEncoderExpectedFrameSize = 0;
     private int _h264FrontEncoderExpectedFrameSize = 0;
 
+    // Manual bitrate override per camera, in bits/sec. 0 = automatic (resolution-scaled).
+    // A positive value is used verbatim — even below the auto recommendation — so the
+    // consuming app can deliberately run, e.g., 2 Mbps at 2K if it wants the smaller stream.
+    private int _backManualBitrate = 0;
+    private int _frontManualBitrate = 0;
+
+    // Encoder frame rate. Kept here (not just at the constructor call site) so the auto
+    // bitrate calculation matches what the encoder is actually configured with.
+    // 30 matches the camera sensor's delivery rate (measured steady 30fps on MT6768);
+    // configuring the encoder below the camera rate just drops frames for no benefit.
+    private const int EncoderFrameRate = 30;
+
+    // Auto bitrate target in bits per pixel per frame. ~0.1 bpp is a good quality/size
+    // balance for camera content (e.g. 2560x1440@30 → ~11.1 Mbps, 1280x720@30 → ~2.8 Mbps).
+    private const double AutoBitsPerPixel = 0.1;
+
+    // Bounds for the *automatic* calculation only. Manual overrides are not clamped up to
+    // AutoBitrateMin — they are honored down to ManualBitrateMin.
+    private const int AutoBitrateMin = 1_500_000;
+    private const int AutoBitrateMax = 20_000_000;
+    private const int ManualBitrateMin = 100_000;
+    private const int ManualBitrateMax = 100_000_000;
+
     // Global SPS/PPS cache for SDP generation
     private byte[]? _currentSps;
     private byte[]? _currentPps;
     private readonly object _spsPpsLock = new();
 
-    // Per-client buffer: 1 frame — always deliver the freshest encoded frame.
-    // DropOldest ensures slow clients never stall the fan-out loop.
-    // The fan-out callbacks snapshot this list under lock then write outside the lock,
-    // so registering/unregistering clients does not block on pending TryWrite calls.
-    private const int MaxH264QueueSize = 1;
+    // Per-client buffer: a few frames of slack to absorb encoder/send timing jitter.
+    // Capacity 1 was too aggressive — the encoder produces ~12-30fps and the send loop drains
+    // one frame per iteration, so the slightest jitter (a large motion frame, a scheduling hiccup)
+    // left the channel momentarily full and DropOldest discarded an encoded frame. Dropping a
+    // P-frame breaks the decoder's reference chain → "melted" smearing on moving regions until the
+    // next IDR. A 4-frame buffer absorbs that jitter so steady-state drops disappear; it only drops
+    // under genuine sustained overload (which then signals the resolution is too high for the SoC).
+    // Cost is bounded latency: up to ~4 frame intervals (~130ms at 30fps) — invisible for live view.
+    // DropOldest still guarantees a slow client never stalls the shared fan-out loop.
+    private const int MaxH264QueueSize = 4;
 
     /// <inheritdoc/>
     public event EventHandler<H264FrameEventArgs>? FrameEncoded;
@@ -135,8 +163,9 @@ public class H264EncoderManager : IH264EncoderManager
             {
                 try
                 {
-                    BaluLogger.Debug("[EncoderManager]", $"Starting H264 encoder: {width}x{height}");
-                    _h264BackEncoder = new H264Encoder(width, height, bitrate: 2000000, frameRate: 25);
+                    int bitrate = ResolveBitrate(_backManualBitrate, width, height);
+                    BaluLogger.Debug("[EncoderManager]", $"Starting H264 encoder: {width}x{height} @ {bitrate}bps ({(_backManualBitrate > 0 ? "manual" : "auto")})");
+                    _h264BackEncoder = new H264Encoder(width, height, bitrate: bitrate, frameRate: EncoderFrameRate);
 
                     // Check if encoder fell back to different resolution
                     if (_h264BackEncoder.ActualWidth != width || _h264BackEncoder.ActualHeight != height)
@@ -188,8 +217,9 @@ public class H264EncoderManager : IH264EncoderManager
             {
                 try
                 {
-                    BaluLogger.Debug("[EncoderManager]", $"Starting H264 front encoder: {width}x{height}");
-                    _h264FrontEncoder = new H264Encoder(width, height, bitrate: 2000000, frameRate: 25);
+                    int bitrate = ResolveBitrate(_frontManualBitrate, width, height);
+                    BaluLogger.Debug("[EncoderManager]", $"Starting H264 front encoder: {width}x{height} @ {bitrate}bps ({(_frontManualBitrate > 0 ? "manual" : "auto")})");
+                    _h264FrontEncoder = new H264Encoder(width, height, bitrate: bitrate, frameRate: EncoderFrameRate);
 
                     // Check if encoder fell back to different resolution
                     if (_h264FrontEncoder.ActualWidth != width || _h264FrontEncoder.ActualHeight != height)
@@ -366,13 +396,23 @@ public class H264EncoderManager : IH264EncoderManager
     /// <inheritdoc/>
     public void FeedFrame(int cameraId, FrameEventArgs frame)
     {
+        // CRITICAL: camera2 SENSOR_TIMESTAMP is in NANOSECONDS, but MediaCodec presentation
+        // timestamps must be MICROSECONDS. Feeding raw nanoseconds makes consecutive frames
+        // appear 1000x further apart (e.g. 40ms -> 40 apparent seconds). The MediaTek C2
+        // encoder's time-based GOP logic then sees "last IDR > sync-frame-interval (30s) ago"
+        // on EVERY frame and forces all-IDR output: ~190KB per frame, 2x bitrate overshoot,
+        // and 80-220ms IDR encode times that capped the pipeline at ~7-11fps at 2K. The same
+        // ns-scale PTS echoed on encoder output is what historically looked like "MT6768
+        // reports PresentationTimeUs in units ~1000x larger than microseconds".
+        long timestampUs = frame.Timestamp / 1000;
+
         if (cameraId == 1) // Front camera
         {
-            _h264FrontEncoder?.QueueFrame(frame.Data, frame.Timestamp, frame.Width, frame.Height);
+            _h264FrontEncoder?.QueueFrame(frame.Data, timestampUs, frame.Width, frame.Height);
         }
         else // Back camera
         {
-            _h264BackEncoder?.QueueFrame(frame.Data, frame.Timestamp, frame.Width, frame.Height);
+            _h264BackEncoder?.QueueFrame(frame.Data, timestampUs, frame.Width, frame.Height);
         }
     }
 
@@ -387,6 +427,75 @@ public class H264EncoderManager : IH264EncoderManager
         {
             _h264BackEncoder?.UpdateBitrate(bitrate);
         }
+    }
+
+    /// <inheritdoc/>
+    public void SetBitrate(int cameraId, int bitrate)
+    {
+        // bitrate <= 0 selects automatic (resolution-scaled) mode.
+        int manual = bitrate <= 0 ? 0 : Math.Clamp(bitrate, ManualBitrateMin, ManualBitrateMax);
+
+        if (cameraId == 1) // Front camera
+        {
+            lock (_h264FrontLock)
+            {
+                _frontManualBitrate = manual;
+                if (_h264FrontEncoder != null)
+                {
+                    int effective = ResolveBitrate(manual, _h264FrontEncoder.ActualWidth, _h264FrontEncoder.ActualHeight);
+                    _h264FrontEncoder.UpdateBitrate(effective);
+                    BaluLogger.Info("[EncoderManager]", $"Front camera bitrate set to {effective}bps ({(manual > 0 ? "manual" : "auto")})");
+                }
+            }
+        }
+        else // Back camera
+        {
+            lock (_h264BackLock)
+            {
+                _backManualBitrate = manual;
+                if (_h264BackEncoder != null)
+                {
+                    int effective = ResolveBitrate(manual, _h264BackEncoder.ActualWidth, _h264BackEncoder.ActualHeight);
+                    _h264BackEncoder.UpdateBitrate(effective);
+                    BaluLogger.Info("[EncoderManager]", $"Back camera bitrate set to {effective}bps ({(manual > 0 ? "manual" : "auto")})");
+                }
+            }
+        }
+    }
+
+    /// <inheritdoc/>
+    public int GetBitrate(int cameraId)
+    {
+        if (cameraId == 1) // Front camera
+        {
+            lock (_h264FrontLock)
+                return ResolveBitrate(_frontManualBitrate, _h264FrontEncoder?.ActualWidth ?? 0, _h264FrontEncoder?.ActualHeight ?? 0);
+        }
+        lock (_h264BackLock)
+            return ResolveBitrate(_backManualBitrate, _h264BackEncoder?.ActualWidth ?? 0, _h264BackEncoder?.ActualHeight ?? 0);
+    }
+
+    /// <summary>
+    /// Returns the effective bitrate to use: the manual override when positive, otherwise the
+    /// automatic resolution-scaled value. The manual value is honored as-is (it may be lower than
+    /// the auto recommendation).
+    /// </summary>
+    private static int ResolveBitrate(int manualBitrate, int width, int height)
+        => manualBitrate > 0 ? manualBitrate : CalculateAutoBitrate(width, height, EncoderFrameRate);
+
+    /// <summary>
+    /// Computes the recommended bitrate (bits/sec) for a resolution using a fixed
+    /// bits-per-pixel target, clamped to a sane hardware range. Exposed so the consuming
+    /// app can show the auto value in its bitrate UI.
+    /// </summary>
+    /// <param name="width">Frame width in pixels.</param>
+    /// <param name="height">Frame height in pixels.</param>
+    /// <param name="frameRate">Target frame rate. Defaults to the encoder frame rate.</param>
+    public static int CalculateAutoBitrate(int width, int height, int frameRate = EncoderFrameRate)
+    {
+        if (width <= 0 || height <= 0) return AutoBitrateMin;
+        long bits = (long)((double)width * height * frameRate * AutoBitsPerPixel);
+        return (int)Math.Clamp(bits, AutoBitrateMin, AutoBitrateMax);
     }
 
     /// <inheritdoc/>

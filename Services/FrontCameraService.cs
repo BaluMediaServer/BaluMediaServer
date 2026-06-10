@@ -24,6 +24,15 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
     private Task? _thread;
     private DateTime _lastFrameTime;
     private readonly TimeSpan _minFrameInterval = TimeSpan.FromMilliseconds(22); // +- 45 fps
+
+    // Ring of reusable managed frame buffers — see BackCameraService for the full rationale.
+    // VideoFrame.GetData() allocates a fresh multi-MB managed byte[] per frame, causing a
+    // GC-bridge storm at high resolutions that throttles the pipeline; copying into a fixed
+    // ring via JNIEnv.CopyArray eliminates the per-frame allocation entirely.
+    private const int FrameBufferRingSize = 6;
+    private readonly byte[]?[] _frameBufferRing = new byte[FrameBufferRingSize][];
+    private int _frameBufferIndex;
+    private IntPtr _getDataMethodId = IntPtr.Zero;
     private volatile bool _disposed;  // Prevents JNI access after disposal
     private int _channelCapacity;
 
@@ -156,7 +165,9 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
 
             // Marshal all data from Java object NOW (we're on the Java callback thread,
             // already in JNI context) so the processing thread stays pure managed code.
-            var data = frame.GetData();
+            // Uses a pooled ring buffer + JNIEnv.CopyArray instead of frame.GetData(),
+            // which would allocate a new multi-MB managed array per frame (see ring docs).
+            var data = CopyFrameDataPooled(frame);
             if (data == null || data.Length == 0)
             {
                 SafeRecycleFrame(frame);
@@ -194,6 +205,54 @@ public class FrontCameraService : Java.Lang.Object, ICameraService, IFrontCamera
     /// This reduces memory allocations at high resolutions.
     /// </summary>
     /// <param name="frame">The video frame to recycle.</param>
+    /// <summary>
+    /// Copies the Java frame data into a reusable managed ring buffer using raw JNI,
+    /// avoiding the per-frame multi-MB managed allocation that <c>VideoFrame.GetData()</c>
+    /// performs. Returns <c>null</c> if the Java array is missing or empty.
+    /// </summary>
+    private byte[]? CopyFrameDataPooled(VideoFrame frame)
+    {
+        IntPtr arrHandle = IntPtr.Zero;
+        try
+        {
+            // Cache the getData()[B method id once — method ids are stable per class.
+            if (_getDataMethodId == IntPtr.Zero)
+            {
+                IntPtr cls = JNIEnv.GetObjectClass(frame.Handle);
+                try { _getDataMethodId = JNIEnv.GetMethodID(cls, "getData", "()[B"); }
+                finally { JNIEnv.DeleteLocalRef(cls); }
+            }
+
+            arrHandle = JNIEnv.CallObjectMethod(frame.Handle, _getDataMethodId);
+            if (arrHandle == IntPtr.Zero) return null;
+
+            int len = JNIEnv.GetArrayLength(arrHandle);
+            if (len <= 0) return null;
+
+            // Exact-size ring slot: reallocated only when the frame size changes
+            // (resolution change), so steady-state operation allocates nothing.
+            var buf = _frameBufferRing[_frameBufferIndex];
+            if (buf == null || buf.Length != len)
+            {
+                buf = new byte[len];
+                _frameBufferRing[_frameBufferIndex] = buf;
+            }
+            _frameBufferIndex = (_frameBufferIndex + 1) % FrameBufferRingSize;
+
+            JNIEnv.CopyArray(arrHandle, buf);
+            return buf;
+        }
+        catch (Exception ex)
+        {
+            if (!_disposed) SafeInvokeError($"Frame data copy error: {ex.Message}");
+            return null;
+        }
+        finally
+        {
+            if (arrHandle != IntPtr.Zero) JNIEnv.DeleteLocalRef(arrHandle);
+        }
+    }
+
     private void RecycleFrame(VideoFrame? frame)
     {
         if (frame == null) return;

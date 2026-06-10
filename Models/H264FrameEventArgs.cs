@@ -40,4 +40,13 @@ public class H264FrameEventArgs : EventArgs
     /// Contains picture-specific parameters required for decoding.
     /// </summary>
     public byte[]? Pps { get; set; }
+
+    /// <summary>
+    /// Monotonically increasing frame number assigned by the encoder in output order.
+    /// The per-client fan-out channels use DropOldest, so when a client's send loop falls
+    /// behind, an encoded frame is silently discarded. A gap in this number lets the send
+    /// loop detect that drop and request an IDR to repair the broken P-frame reference chain
+    /// (otherwise the decoder smears moving regions until the next scheduled keyframe).
+    /// </summary>
+    public long FrameNumber { get; set; }
 }

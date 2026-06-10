@@ -78,4 +78,11 @@ public class EncoderInfo
     /// Gets or sets a value indicating whether the encoder supports QHD/2K (2560x1440) resolution.
     /// </summary>
     public bool SupportsQHD { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the encoder advertises support for the H.264
+    /// Main profile. Main is more efficient than Baseline (CABAC, better rate-distortion) and
+    /// shares the same SPS layout up to the crop fields, so the MediaTek crop patch still applies.
+    /// </summary>
+    public bool SupportsMainProfile { get; set; }
 }

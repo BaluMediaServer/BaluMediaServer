@@ -75,6 +75,23 @@ public class Client : IDisposable
     public long LastH264FrameTimestamp { get; set; }
 
     /// <summary>
+    /// Gets or sets the encoder frame number (<see cref="H264FrameEventArgs.FrameNumber"/>) of the
+    /// last frame this client dequeued. A gap means the DropOldest fan-out channel discarded one or
+    /// more encoded frames because this client's send loop fell behind — which breaks the H.264
+    /// P-frame reference chain, so the streaming loop requests an IDR to resync. Written and read
+    /// only by this client's streaming thread.
+    /// </summary>
+    public long LastH264FrameNumber { get; set; }
+
+    /// <summary>
+    /// <see cref="Environment.TickCount64"/> of the last drop-triggered IDR request for this
+    /// client. Used to rate-limit those requests: an IDR is large and slow to encode, so firing
+    /// one on every dropped frame creates a death spiral (bigger frames → more drops → more IDRs).
+    /// Throttled to at most one per few seconds. Written/read only by this client's streaming thread.
+    /// </summary>
+    public long LastDropIdrTick { get; set; }
+
+    /// <summary>
     /// Gets or sets the UDP endpoint for RTP packets (UDP mode only).
     /// </summary>
     public IPEndPoint? RtpEndPoint { get; set; }
