@@ -96,9 +96,12 @@ public class VideoProfile
     }
 
     /// <summary>
-    /// Gets or sets the maximum bitrate in bits per second. Default is 4,000,000 (4 Mbps).
+    /// Gets or sets the maximum bitrate in bits per second — the ceiling RTCP adaptive bitrate can
+    /// recover up to. Default is 20,000,000 (20 Mbps) to match the encoder's AutoBitrateMax. The old
+    /// 4 Mbps default capped RTCP below the configured 1080p target (~12 Mbps), so the encoder could
+    /// never use its full bitrate and motion stayed starved/blocky regardless of network headroom.
     /// </summary>
-    public int MaxBitrate { get; set; } = 4000000;
+    public int MaxBitrate { get; set; } = 20000000;
 
     /// <summary>
     /// Gets or sets the minimum bitrate in bits per second. Default is 500,000 (500 Kbps).

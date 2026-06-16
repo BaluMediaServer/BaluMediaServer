@@ -1067,10 +1067,22 @@ public class Server : IDisposable
         // value — ignore RTCP-driven changes entirely so a manually chosen bitrate is honored.
         if (!_adaptiveBitrate) return;
 
-        // Never let RTCP raise the encoder above its configured ceiling (the auto/manual value).
-        // RTCP only ever *reduces* on loss and recovers back up to this ceiling.
         int ceiling = _encoderManager.GetBitrate(args.client.CameraId);
-        int target = ceiling > 0 ? Math.Min(args.newBitrate, ceiling) : args.newBitrate;
+        if (ceiling <= 0)
+        {
+            _encoderManager.UpdateBitrate(args.client.CameraId, args.newBitrate);
+            return;
+        }
+
+        // Clamp the RTCP target into [ceiling/2, ceiling]:
+        //  - upper: never raise above the configured auto/manual value;
+        //  - lower (anti-starvation floor): never let RTCP drag the encoder below half the target.
+        // The floor is the safety net for the operating-point anchor (SyncClientBitrateToEncoder):
+        // empirically that anchor can fail to run before the first receiver report, leaving the
+        // per-client CurrentBitrate at its 2 Mbps default — which used to crater a 12 Mbps stream
+        // into macroblock smear on motion. Half the configured target is ample for 1080p motion.
+        int floor = ceiling / 2;
+        int target = Math.Clamp(args.newBitrate, floor, ceiling);
         _encoderManager.UpdateBitrate(args.client.CameraId, target);
     }
 

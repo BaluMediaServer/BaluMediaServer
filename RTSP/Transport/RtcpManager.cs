@@ -240,23 +240,27 @@ public class RtcpManager : IRtcpManager
         lock (client)
         {
             var previousBitrate = client.CurrentBitrate;
-            if (fractionLost > 10) // More than 4% loss
+            // Reaction is deliberately asymmetric-but-gentle: a brief motion burst can spike loss
+            // for a report or two, and the old ×0.6 crash + slow +10%/10s recovery meant one blip
+            // dropped the bitrate for many seconds → visible motion smear. Ease off softly on loss
+            // and recover quickly once the link is clean again.
+            if (fractionLost > 10) // Severe loss (>~4%)
             {
-                client.CurrentBitrate = Math.Max(MIN_BITRATE, (int)(client.CurrentBitrate * 0.6));
-                client.VideoProfile.Quality = Math.Max(10, (int)(client.VideoProfile.Quality * 0.6));
+                client.CurrentBitrate = Math.Max(MIN_BITRATE, (int)(client.CurrentBitrate * 0.85));
+                client.VideoProfile.Quality = Math.Max(10, (int)(client.VideoProfile.Quality * 0.85));
             }
-            else if (fractionLost > 5 && fractionLost <= 10)
+            else if (fractionLost > 5 && fractionLost <= 10) // Mild loss
             {
-                client.CurrentBitrate = Math.Max(MIN_BITRATE, (int)(client.CurrentBitrate * 0.9));
-                client.VideoProfile.Quality = Math.Max(10, (int)(client.VideoProfile.Quality * 0.9));
+                client.CurrentBitrate = Math.Max(MIN_BITRATE, (int)(client.CurrentBitrate * 0.95));
+                client.VideoProfile.Quality = Math.Max(10, (int)(client.VideoProfile.Quality * 0.95));
             }
-            else if (fractionLost < 2 && jitter < 100) // Good conditions
+            else if (fractionLost < 2 && jitter < 100) // Good conditions — recover fast
             {
                 var now = DateTime.UtcNow;
-                if (now - client.LastCodecUpdate > TimeSpan.FromSeconds(10))
+                if (now - client.LastCodecUpdate > TimeSpan.FromSeconds(3))
                 {
-                    client.CurrentBitrate = Math.Min(MAX_BITRATE, (int)(client.CurrentBitrate * 1.1));
-                    client.VideoProfile.Quality = Math.Min(100, (int)(client.VideoProfile.Quality * 0.6));
+                    client.CurrentBitrate = Math.Min(MAX_BITRATE, (int)(client.CurrentBitrate * 1.25));
+                    client.VideoProfile.Quality = Math.Min(100, (int)(client.VideoProfile.Quality * 1.1));
                 }
             }
 

@@ -666,6 +666,45 @@ public class H264Encoder : IDisposable
                 {
                     throw new Exception($"Failed to create encoder: {_bestEncoder.Name}");
                 }
+
+                // Intra-refresh: rolling per-frame intra-MB refresh lets a decoder converge
+                // within one refresh cycle (~1s here) WITHOUT waiting for the next full IDR.
+                // The 5s KeyIFrameInterval was the dominant cause of multi-second join/recovery
+                // latency — VLC/ffplay won't render until a recoverable point and effectively
+                // buffer toward a keyframe. With intra-refresh the stream is continuously
+                // recoverable, so steady-state latency drops and the big periodic IDR bursts
+                // (which also bloat the TCP send buffer) are no longer the limiter. This is the
+                // standard MediaFormat key (API 28+), NOT a vendor extension, so unlike
+                // vendor.mtk-ext-* it does not suppress the MT6768 rate controller. The periodic
+                // IDR (KeyIFrameInterval) stays as a backstop and new clients still get an
+                // immediate IDR via RequestKeyFrame() on PLAY. Only enabled when the codec
+                // advertises FeatureIntraRefresh, so it can never fail Configure() below.
+                if (OperatingSystem.IsAndroidVersionAtLeast(28))
+                {
+                    try
+                    {
+                        var caps = encoder.CodecInfo?.GetCapabilitiesForType(MediaFormat.MimetypeVideoAvc);
+                        // "intra-refresh" is the Java MediaCodecInfo.CodecCapabilities.FEATURE_IntraRefresh
+                        // value; passed as a literal because the .NET binding omits the named constant.
+                        if (caps != null && caps.IsFeatureSupported("intra-refresh"))
+                        {
+                            // Refresh the whole frame over ~1s of frames: cheap on bitrate,
+                            // ~1s worst-case convergence. Lower = faster recovery, more intra-MB cost.
+                            int refreshPeriod = Math.Clamp(_frameRate, 10, 60);
+                            format.SetInteger(MediaFormat.KeyIntraRefreshPeriod, refreshPeriod);
+                            BaluLogger.Info("H264", $"Intra-refresh enabled (period={refreshPeriod} frames) for low-latency recovery");
+                        }
+                        else
+                        {
+                            BaluLogger.Debug("H264", "Intra-refresh unsupported by encoder; relying on IDR backstop only");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        BaluLogger.Warn("H264", $"Intra-refresh setup skipped: {ex.Message}");
+                    }
+                }
+
                 encoder.Configure(format, null, null, MediaCodecConfigFlags.Encode);
 
                 // Now start the encoder

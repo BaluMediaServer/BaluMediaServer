@@ -40,9 +40,12 @@ public class H264EncoderManager : IH264EncoderManager
     // configuring the encoder below the camera rate just drops frames for no benefit.
     private const int EncoderFrameRate = 30;
 
-    // Auto bitrate target in bits per pixel per frame. ~0.1 bpp is a good quality/size
-    // balance for camera content (e.g. 2560x1440@30 → ~11.1 Mbps, 1280x720@30 → ~2.8 Mbps).
-    private const double AutoBitsPerPixel = 0.1;
+    // Auto bitrate target in bits per pixel per frame. 0.2 bpp gives motion-content headroom so
+    // fast camera movement doesn't starve the rate controller into macroblock smear (0.1 bpp was
+    // clean on static scenes but went blocky under motion — the encoder held the low rate and
+    // raised QP instead of spending bits). Examples at 30fps: 1920x1080 → ~12.4 Mbps,
+    // 2560x1440 → ~22 Mbps (clamped to AutoBitrateMax), 1280x720 → ~5.5 Mbps.
+    private const double AutoBitsPerPixel = 0.2;
 
     // Bounds for the *automatic* calculation only. Manual overrides are not clamped up to
     // AutoBitrateMin — they are honored down to ManualBitrateMin.

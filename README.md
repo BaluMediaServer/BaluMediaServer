@@ -45,7 +45,7 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 - **High Concurrency**: Can handle at least 12 simultaneous clients (tested)
 - **Authentication**: Digest authentication included for basic security
 - **Transport Modes**: UDP and TCP interleaved support
-- **Smart Bitrate** (v1.5.29+): Auto-scaled to resolution (~0.1 bits/pixel/frame), per-camera manual override honored verbatim, and optional RTCP adaptation bounded by the configured value as a ceiling (`AdaptiveBitrate = false` pins it entirely)
+- **Smart Bitrate** (v1.5.29+): Auto-scaled to resolution (~0.2 bits/pixel/frame — enough headroom that fast motion doesn't smear into macroblocks), per-camera manual override honored verbatim, and optional RTCP adaptation clamped to `[ceiling/2, ceiling]` so a transient loss spike can't starve motion (`AdaptiveBitrate = false` pins it entirely)
 - **30fps High-Resolution Pipeline** (v1.5.29+): Pooled frame buffers, hardware encoder pipelining, and µs-correct presentation timestamps deliver camera-rate streaming at 2K on MediaTek devices
 - **Multiple Profiles**: Support for `/live/front` and `/live/back` routes
 - **Robust Client Lifecycle**: Graduated error counting, timeout protection, and race-free cleanup
@@ -539,7 +539,7 @@ public class VideoProfile
     public VideoResolution? Resolution { get; set; }        // Resolution preset (auto-sets Width, Height, and bitrates)
     public int Width { get; set; } = 640;                   // Video width (setting clears Resolution preset)
     public int Height { get; set; } = 480;                  // Video height (setting clears Resolution preset)
-    public int MaxBitrate { get; set; } = 4000000;          // Maximum bitrate (bps)
+    public int MaxBitrate { get; set; } = 20000000;         // Max bitrate / RTCP recovery ceiling (bps)
     public int MinBitrate { get; set; } = 500000;           // Minimum bitrate (bps)
     public int Quality { get; set; } = 80;                  // JPEG quality (10-100)
 
@@ -1006,16 +1006,22 @@ The H.264 encoder automatically optimizes for MediaTek and other Android devices
 ```csharp
 // The encoder is automatically configured when streaming starts
 // Default settings:
-// - Bitrate: AUTOMATIC — scaled to resolution at ~0.1 bits/pixel/frame (since v1.5.29)
-//            e.g. 1280x720 -> ~2.8 Mbps, 1920x1080 -> ~6.2 Mbps, 2560x1440 -> ~11.1 Mbps
-//            (clamped to [1.5 Mbps, 20 Mbps]). Can be overridden manually — see below.
+// - Bitrate: AUTOMATIC — scaled to resolution at ~0.2 bits/pixel/frame (since v1.5.29)
+//            e.g. 1280x720 -> ~5.5 Mbps, 1920x1080 -> ~12.4 Mbps, 2560x1440 -> ~22 Mbps
+//            (clamped to [1.5 Mbps, 20 Mbps]). 0.2 bpp (raised from 0.1) gives motion-content
+//            headroom so fast camera movement doesn't starve into macroblock smear. Can be
+//            overridden manually — see below.
 // - Frame rate: 30 FPS (since v1.5.29 — matches the camera sensor's measured delivery rate; was 25)
 // - Profile: Main when the hardware encoder supports it, otherwise Baseline (since v1.5.29).
 //            Main adds CABAC + better rate-distortion, so each bit yields a sharper picture.
-// - Keyframe interval: 30 seconds, set via SetInteger not SetFloat (critical for MediaTek).
-//   New/reconnecting clients get an immediate IDR via RequestKeyFrame(), so the long interval
-//   never delays stream start. IDRs cost 80-220ms to encode on MT6768, so fewer scheduled
-//   IDRs means smoother frame pacing.
+// - Keyframe interval: 5 seconds (KeyFrameIntervalSeconds), set via SetInteger not SetFloat
+//   (critical for MediaTek). New/reconnecting clients get an immediate IDR via RequestKeyFrame(),
+//   so the interval never delays stream start. IDRs cost 80-220ms to encode on MT6768, so a
+//   modest count keeps frame pacing smooth.
+// - Intra-refresh: when the hardware encoder advertises FEATURE_IntraRefresh, a rolling intra-MB
+//   refresh (KEY_INTRA_REFRESH_PERIOD ~1s) is enabled so a decoder converges without waiting for
+//   the next full IDR. Guarded — encoders lacking the feature (e.g. MT6768's c2.mtk.avc) skip it
+//   and rely on the IDR backstop, so it is safe everywhere.
 // - Pipeline depth: MediaCodec's natural depth (a few frames in flight). KeyLatency=0 was
 //   removed in v1.5.29 — it serialized the hardware encoder to ONE frame in flight, capping
 //   throughput at 1/encode-time (~11fps at 2K on MT6768) regardless of CPU headroom.
@@ -1023,13 +1029,21 @@ The H.264 encoder automatically optimizes for MediaTek and other Android devices
 //   MediaTek notes — feeding raw nanoseconds forced an IDR on every frame)
 // - RTP timestamps: Wall-clock based (Stopwatch) for cross-SoC reliability
 
-// Runtime RTCP adaptation may reduce the bitrate on packet loss, bounded by the configured
-// value as a ceiling (since v1.5.29). Disable with AdaptiveBitrate=false to pin it — see below.
+// Runtime RTCP adaptation may reduce the bitrate on real packet loss, clamped to
+// [ceiling/2, ceiling] where the ceiling is the configured auto/manual value (since v1.5.29):
+// the half-ceiling floor stops a transient loss spike from starving motion into blocky smear,
+// and recovery back to the ceiling is quick (+25% / 3s). Disable with AdaptiveBitrate=false to
+// pin the bitrate entirely — see below.
 ```
 
 #### Bitrate Configuration (Auto & Manual)
 
 Before v1.5.29 the bitrate was hardcoded to 2 Mbps regardless of resolution. At high resolutions this starves the encoder — e.g. 2 Mbps at 2560×1440@25 is only ~0.022 bits/pixel, far below the ~0.08–0.12 bpp needed for a clean picture. The result is a soft, smeared image that **raising the bitrate from a client could not fix**, because the value never reached the encoder (only RTCP congestion control could change it at runtime, and on a LAN it never raises the rate). Since v1.5.29 the bitrate is **auto-scaled to the resolution**, with an optional **manual override**.
+
+**Motion quality (v1.5.29).** Even with auto-scaling, fast camera motion showed macroblock smearing while static scenes stayed sharp — the signature of rate-control starvation (static regions reuse the high-quality reference frame; moving regions need fresh residual bits the budget couldn't supply). Two things were fixed:
+
+1. **Headroom.** The auto target was raised from ~0.1 to ~0.2 bits/pixel/frame (e.g. 1080p@30 → ~12.4 Mbps), so motion frames have bits to spend.
+2. **Adaptive bitrate no longer anchors low.** Every client used to start at a 2 Mbps RTCP operating point with a 4 Mbps recovery ceiling — below the configured target — so the encoder was dragged to 2–4 Mbps and (on a clean LAN, with no loss to trigger recovery) effectively stuck there. Now `VideoProfile.MaxBitrate` defaults to 20 Mbps, the applied RTCP target is clamped to `[ceiling/2, ceiling]` (so it can never starve below half the configured value), the loss reaction is gentler (×0.85 instead of ×0.6), and recovery is faster (+25% every 3 s instead of +10% every 10 s).
 
 ```csharp
 // AUTO (default): bitrate is derived from the configured resolution. No action needed.
@@ -1048,22 +1062,22 @@ int back  = server.GetBackCameraBitrate();
 int front = server.GetFrontCameraBitrate();
 
 // Compute the recommended auto bitrate for a resolution (useful as a UI slider default):
-int suggested = Server.GetRecommendedBitrate(2560, 1440);  // -> 11_059_200 (@30fps)
+int suggested = Server.GetRecommendedBitrate(2560, 1440);  // -> 20_000_000 (@30fps, ~22 Mbps clamped to AutoBitrateMax)
 ```
 
 **Behavior notes:**
 - **Manual values are not clamped up.** Only a broad hardware-safety clamp of `[100 kbps, 100 Mbps]` is applied, so values below the auto recommendation (such as 2 Mbps at 2K) are allowed and used exactly.
 - A manual change is applied **live** if the encoder is running (via `MediaCodec.SetParameters`) and **persists across encoder restarts** (stall recovery, resolution change).
 - Passing `0` (or any value `<= 0`) to `SetBackCameraBitrate`/`SetFrontCameraBitrate` selects automatic mode — identical to calling the `...AutoBitrate()` helpers.
-- The configured value (auto or manual) is the **ceiling** for RTCP adaptive bitrate (see below); adaptation can only reduce below it on real packet loss, never raise above it.
+- The configured value (auto or manual) is the **ceiling** for RTCP adaptive bitrate; on real packet loss adaptation moves only within `[ceiling/2, ceiling]` — never below half the target, so motion can't collapse into blocks — and recovers back to the ceiling quickly. `AdaptiveBitrate = false` pins the bitrate and ignores RTCP entirely.
 
-| Resolution @30fps | Auto bitrate (~0.1 bpp) |
-|-------------------|--------------------------|
-| 640×480 (VGA)     | 1.5 Mbps (floor)         |
-| 1280×720 (HD)     | ~2.8 Mbps                |
-| 1920×1080 (FHD)   | ~6.2 Mbps                |
-| 2560×1440 (QHD/2K)| ~11.1 Mbps               |
-| 3840×2160 (4K)    | 20 Mbps (ceiling)        |
+| Resolution @30fps | Auto bitrate (~0.2 bpp)   |
+|-------------------|---------------------------|
+| 640×480 (VGA)     | ~1.8 Mbps                 |
+| 1280×720 (HD)     | ~5.5 Mbps                 |
+| 1920×1080 (FHD)   | ~12.4 Mbps                |
+| 2560×1440 (QHD/2K)| 20 Mbps (clamped from ~22)|
+| 3840×2160 (4K)    | 20 Mbps (ceiling)         |
 
 #### Adaptive Bitrate (RTCP) — and how to pin it (v1.5.29)
 
@@ -1080,11 +1094,11 @@ bool on = server.IsAdaptiveBitrateEnabled();
 
 **How adaptation behaves (when enabled):**
 - The configured bitrate (auto-scaled or manual) is the **ceiling**. On a clean link the bitrate holds at exactly that value.
-- On sustained packet loss the encoder bitrate is reduced (down to a floor); when the network recovers it climbs back up to — but never past — the configured ceiling.
+- On packet loss the encoder bitrate is reduced, but only within `[ceiling/2, ceiling]` — it can never starve below half the configured value, so motion stays out of macroblock breakup. Reduction is gentle (×0.85 on heavy loss, ×0.95 on mild) and recovery back to the ceiling is fast (+25% every 3 s).
 - When **disabled**, RTCP reports are ignored and the encoder stays pinned to the configured bitrate. Recommended when you set the bitrate manually and want it honored verbatim, or on a controlled LAN.
 
 > **Fixed in v1.5.29 — "stream is clean at first, then gets noisy after a few seconds."**
-> Previously the per-client RTCP state defaulted to **2 Mbps** (`Client.CurrentBitrate`) with a **4 Mbps** cap (`VideoProfile.MaxBitrate`). The first receiver report would call `UpdateBitrate(...)` and **drag the encoder down** from its configured value (e.g. 9.2 Mbps at 2K) to ≤4 Mbps within seconds — so the picture started clean and then degraded into noise, and a manually chosen bitrate was silently overridden. The RTCP operating point is now aligned to the configured encoder bitrate at stream start, and RTCP is clamped to it as a ceiling, so this no longer happens. See [Troubleshooting](#h264-stream-is-clean-at-first-then-becomes-noisy-after-a-few-seconds).
+> Previously the per-client RTCP state defaulted to **2 Mbps** (`Client.CurrentBitrate`) with a **4 Mbps** cap (`VideoProfile.MaxBitrate`). The first receiver report would call `UpdateBitrate(...)` and **drag the encoder down** from its configured value (e.g. ~12 Mbps at 1080p) to 2–4 Mbps within seconds — so the picture started clean and then degraded into blocky smear on motion, and a manually chosen bitrate was silently overridden. Fixed by three coordinated changes: the RTCP operating point is aligned to the configured bitrate at stream start, `VideoProfile.MaxBitrate` now defaults to 20 Mbps so recovery can reach the target, and — as a robust backstop should the start-time alignment ever miss — the applied bitrate is clamped to `[ceiling/2, ceiling]` at the point `UpdateBitrate` is called, so it can never starve below half the configured value. See [Troubleshooting](#h264-stream-is-clean-at-first-then-becomes-noisy-after-a-few-seconds).
 
 **MediaTek Device Notes:**
 - The encoder uses `SetInteger(KeyIFrameInterval, N)` instead of `SetFloat()`. MediaTek MT6768 (and possibly other MediaTek SoCs) misinterprets sub-second float values as `0`, causing every frame to become an IDR keyframe. This exhausts the encoder's internal buffers after ~1000 frames and causes a permanent stall.
@@ -1156,10 +1170,10 @@ backCamera.StartCapture(1280, 720);
 | Use Case | Recommended Resolution | Auto Bitrate @30fps | Notes |
 |----------|----------------------|---------------------|-------|
 | Low bandwidth / Mobile data | QVGA (320x240) or Low (480x360) | 1.5 Mbps (floor) | Minimal data usage |
-| Standard streaming | VGA (640x480) | 1.5 Mbps (floor) | Default, most compatible |
-| High quality local network | HD (1280x720) | ~2.8 Mbps | Good balance |
-| Professional quality | Full HD (1920x1080) | ~6.2 Mbps | Requires powerful device |
-| Ultra-high quality | QHD/2K (2560x1440) | ~11.1 Mbps | High-end devices only |
+| Standard streaming | VGA (640x480) | ~1.8 Mbps | Default, most compatible |
+| High quality local network | HD (1280x720) | ~5.5 Mbps | Good balance |
+| Professional quality | Full HD (1920x1080) | ~12.4 Mbps | Requires powerful device |
+| Ultra-high quality | QHD/2K (2560x1440) | 20 Mbps (clamped from ~22) | High-end devices only |
 | Maximum quality | 4K UHD (3840x2160) | 20 Mbps (ceiling) | Flagship devices, high bandwidth required |
 
 **Important:** The H.264 encoder buffer size is calculated as `(width * height * 3) / 2` for YUV420 format. Higher resolutions significantly increase memory usage. The library uses dynamic buffer management to prevent OOM crashes at high resolutions.
@@ -1368,19 +1382,20 @@ If the picture looks soft, smeared, or lacks fine detail — and increasing the 
 
 - **Symptom**: Mushy, low-detail image with no blocky/torn artifacts; bitrate changes from the client seem ignored.
 - **Cause (pre-v1.5.29)**: The encoder bitrate was hardcoded to 2 Mbps regardless of resolution. At 2560×1440@25 that is only ~0.022 bits/pixel — far below the ~0.08–0.12 bpp needed for a clean image. Client-side bitrate changes were never wired to the encoder constructor; only RTCP congestion control could change the rate at runtime, and on a LAN it never raises it.
-- **Fix (v1.5.29)**: Bitrate is now **auto-scaled to the resolution** (~0.1 bpp), and a **manual override** is exposed that is honored exactly. See [Bitrate Configuration](#bitrate-configuration-auto--manual). The encoder also prefers the **Main** profile over Baseline when supported, improving quality at the same bitrate.
+- **Fix (v1.5.29)**: Bitrate is now **auto-scaled to the resolution** (~0.2 bpp), and a **manual override** is exposed that is honored exactly. See [Bitrate Configuration](#bitrate-configuration-auto--manual). The encoder also prefers the **Main** profile over Baseline when supported, improving quality at the same bitrate.
+- **Blur only on motion (static stays sharp)?** That is the same starvation seen specifically on moving content — static regions reuse the sharp reference frame, so only fresh motion residual degrades. It usually means the **RTCP adaptive layer has dragged the rate down** (see the next section), not the auto target itself. The auto bpp was raised 0.1 → 0.2 to give motion more headroom, and the adaptive floor (`[ceiling/2, ceiling]`) keeps motion from collapsing.
 - **Quick fix from a client**: `server.SetBackCameraBitrate(Server.GetRecommendedBitrate(width, height));` or just `server.SetBackCameraAutoBitrate();`
-- **Diagnostic**: In logcat look for the encoder start line — it now logs the effective bitrate and mode, e.g. `Starting H264 encoder: 2560x1440 @ 11059200bps (auto)` and `Using H.264 Main profile`.
+- **Diagnostic**: In logcat look for the encoder start line — it now logs the effective bitrate and mode, e.g. `Starting H264 encoder: 1920x1080 @ 12441600bps (auto)` and `Using H.264 Main profile`.
 
 #### H.264 Stream Is Clean at First, Then Becomes Noisy After a Few Seconds
 
 If the stream looks correct for the first few seconds and then degrades into noise/artifacts (with the bitrate appearing to "settle" at a lower value), the **RTCP adaptive bitrate** layer is dragging the encoder down below its configured value.
 
-- **Symptom**: Clean start, then progressively noisier after ~2–10 seconds; quality stabilizes at a visibly lower level than the first moment.
-- **Cause (pre-v1.5.29)**: The per-client RTCP state defaulted to `Client.CurrentBitrate = 2 Mbps` with a `VideoProfile.MaxBitrate = 4 Mbps` cap. The first RTCP receiver report fired `UpdateBitrate(...)`, overriding the configured encoder bitrate (e.g. 9.2 Mbps at 2K) down to ≤4 Mbps. A manually selected bitrate was silently overridden the same way.
-- **Fix (v1.5.29)**: At stream start the RTCP operating point (`CurrentBitrate`, `VideoProfile.MaxBitrate`) is aligned to the configured encoder bitrate, and RTCP is clamped to that value as a **ceiling** — it can only reduce on genuine loss and recover back up to it. See [Adaptive Bitrate (RTCP)](#adaptive-bitrate-rtcp--and-how-to-pin-it-v1529).
+- **Symptom**: Clean start, then progressively noisier after ~2–10 seconds; quality stabilizes at a visibly lower level than the first moment — most obvious as **blocky smear on motion** while static scenes still look fine.
+- **Cause (pre-v1.5.29)**: The per-client RTCP state defaulted to `Client.CurrentBitrate = 2 Mbps` with a `VideoProfile.MaxBitrate = 4 Mbps` cap — below the configured target (e.g. ~12 Mbps at 1080p). The first RTCP receiver report fired `UpdateBitrate(...)` and the encoder was dragged to 2–4 Mbps; on a clean LAN (no loss to trigger recovery, slow +10%/10s climb) it stayed there. A manually selected bitrate was silently overridden the same way. At 2–4 Mbps, 1080p has too few bits for motion residual, so moving regions break into macroblocks.
+- **Fix (v1.5.29)**: Three coordinated changes — (1) at stream start the RTCP operating point (`CurrentBitrate`, `VideoProfile.MaxBitrate`) is aligned to the configured bitrate; (2) `VideoProfile.MaxBitrate` defaults to 20 Mbps so recovery can reach the target; (3) the applied bitrate is clamped to `[ceiling/2, ceiling]` in `OnBitrateAdjustmentRequired` (a robust backstop if the start-time alignment misses), and the loss reaction is gentler/faster (×0.85 down, +25%/3s up). See [Adaptive Bitrate (RTCP)](#adaptive-bitrate-rtcp--and-how-to-pin-it-v1529).
 - **To eliminate adaptation entirely** (e.g. on a controlled LAN, or to honor a manual bitrate verbatim): `server.SetAdaptiveBitrate(false);` or `new ServerConfiguration { AdaptiveBitrate = false }`.
-- **Diagnostic**: In logcat, repeated `Bitrate updated to: <n>bps` lines a few seconds into the stream indicate RTCP adjustments. The encoder also logs `RTCP bitrate ceiling aligned to encoder: <n>bps` at start, and an `Output rate: <fps> fps, avg <KB>/frame, <Mbps>` line every ~5s so you can see the achieved rate.
+- **Diagnostic**: In logcat, the `Output rate: <fps> fps, avg <KB>/frame, <Mbps> (target <fps> @ <bps>)` line (every ~5s) shows both the achieved rate and the current target — a target well below the configured value means RTCP is still reducing. With the floor in place the target should never sit below half the configured bitrate.
 
 #### Low Frame Rate at High Resolution (Camera Delivers 30fps, Stream Shows Much Less)
 
@@ -1630,10 +1645,11 @@ Unit tests cover pure C# components. Android-dependent classes (camera services,
 - ✅ **Server restart hardening — Stop() tears down cameras + clears clients, OnStreaming fires only on state change, SetStreamingState guarded on SETUP** (v1.5.25)
 - ✅ **In-process log subscription — BaluLogger.OnLog exposes all 264+ internal log calls as a subscribable event (tag, level, message, timestamp)** (v1.5.25)
 - ✅ **AAC audio streaming — optional second m=audio RTSP track (trackID=1) carrying hardware-encoded AAC-LC via RFC 3640 mpeg4-generic; backward compatible (flag-gated, off by default)** (v1.5.28)
-- ✅ **Resolution-scaled bitrate + manual override — auto bitrate at ~0.1 bpp (fixes soft/blurry high-res image from the old hardcoded 2 Mbps), per-camera manual override honored exactly, Main profile when supported** (v1.5.29)
-- ✅ **Adaptive-bitrate fix + toggle — RTCP no longer overrides the configured bitrate down to the old 2/4 Mbps defaults (fixes "clean at first, noisy after a few seconds"); configured value is now the ceiling, `AdaptiveBitrate` config flag + `SetAdaptiveBitrate()` to pin it, output-FPS diagnostic log** (v1.5.29)
+- ✅ **Resolution-scaled bitrate + manual override — auto bitrate at ~0.2 bpp (fixes soft/blurry high-res image from the old hardcoded 2 Mbps; raised from 0.1 bpp to stop motion macroblock smear), per-camera manual override honored exactly, Main profile when supported** (v1.5.29)
+- ✅ **Adaptive-bitrate fix + toggle — RTCP no longer starves the encoder: operating point aligned to the configured bitrate at start, `MaxBitrate` ceiling raised 4→20 Mbps, applied rate clamped to `[ceiling/2, ceiling]` as a backstop (fixes "clean at first, then blocky smear on motion"), gentler/faster reaction (×0.85 down, +25%/3s up), `AdaptiveBitrate` config flag + `SetAdaptiveBitrate()` to pin it, output-FPS diagnostic log** (v1.5.29)
 - ✅ **All-IDR fix — camera SENSOR_TIMESTAMP (ns) now converted to µs before MediaCodec; raw ns made the MediaTek time-based GOP logic force an IDR on every frame (~190KB frames, 2× bitrate overshoot, ~7–11fps cap at 2K). Also the true origin of the historical "MT6768 PTS 1000× larger" workaround** (v1.5.29)
 - ✅ **High-resolution frame-rate unlock — pooled 6-slot frame ring + JNIEnv.CopyArray kills the per-frame 7.4MB managed allocation and its 16-GCs/sec bridge storm; KeyLatency=0 removed to restore hardware encoder pipelining; NV21→NV12 chroma swap vectorized (SIMD); encoder raised to 30fps to match the camera sensor** (v1.5.29)
+- ✅ **Low-latency intra-refresh — rolling intra-MB refresh (`KEY_INTRA_REFRESH_PERIOD` ~1s) enabled when the codec advertises `FEATURE_IntraRefresh`, so a decoder converges without waiting for the next full IDR; guarded no-op on encoders lacking it (e.g. MT6768's c2.mtk.avc), so it is safe everywhere** (v1.5.29)
 
 ### Planned (v1.6+)
 - ⬜ Fix image rotation on some devices
@@ -1690,8 +1706,9 @@ There are few (if any) options to integrate RTSP servers with Android using C# a
 - v1.5.29: **High-Resolution Quality & Frame-Rate Overhaul** — fixes the chain of issues that made 2K streaming soft, noisy, and slow (~7fps); after this release the pipeline runs at the camera's native 30fps with resolution-appropriate bitrate.
 
   **Quality fixes:**
-  - **Resolution-scaled auto bitrate** (`H264EncoderManager`): the hardcoded 2 Mbps constructor bitrate (≈0.022 bits/pixel at 2K — the cause of the soft, smeared image) is replaced by an automatic ~0.1 bits/pixel/frame calculation clamped to [1.5, 20] Mbps (2560×1440@30 → ~11.1 Mbps). New API: `Server.SetBackCameraBitrate(int)` / `SetFrontCameraBitrate(int)` (manual override honored verbatim, even below the recommendation), `Set*AutoBitrate()`, `Get*Bitrate()`, static `GetRecommendedBitrate(w, h)`.
-  - **RTCP adaptive-bitrate override fix** (`Server`, `StreamingController`): per-client RTCP state defaulted to 2 Mbps with a 4 Mbps cap, so the first receiver report dragged the encoder below its configured bitrate within seconds ("clean at first, then noisy"). The RTCP operating point is now aligned to the configured encoder bitrate at stream start and clamped to it as a ceiling. New `ServerConfiguration.AdaptiveBitrate` flag and `Server.SetAdaptiveBitrate(bool)` disable adaptation entirely (pin the bitrate).
+  - **Resolution-scaled auto bitrate** (`H264EncoderManager`): the hardcoded 2 Mbps constructor bitrate (≈0.022 bits/pixel at 2K — the cause of the soft, smeared image) is replaced by an automatic ~0.2 bits/pixel/frame calculation clamped to [1.5, 20] Mbps (1920×1080@30 → ~12.4 Mbps; 2560×1440 clamps to 20 Mbps). Raised from 0.1 → 0.2 bpp after fast motion showed macroblock smear while static scenes stayed sharp (rate-control starvation on motion residual). New API: `Server.SetBackCameraBitrate(int)` / `SetFrontCameraBitrate(int)` (manual override honored verbatim, even below the recommendation), `Set*AutoBitrate()`, `Get*Bitrate()`, static `GetRecommendedBitrate(w, h)`.
+  - **RTCP adaptive-bitrate starvation fix** (`Server`, `StreamingController`, `RtcpManager`, `VideoProfile`): per-client RTCP state defaulted to 2 Mbps with a 4 Mbps cap — below the configured target — so the first receiver report dragged the encoder to 2–4 Mbps and (on a clean LAN) kept it there, showing as blocky smear on motion. Three coordinated fixes: the operating point is aligned to the configured bitrate at stream start; `VideoProfile.MaxBitrate` now defaults to 20 Mbps so recovery can reach the target; and the applied rate is clamped to `[ceiling/2, ceiling]` in `OnBitrateAdjustmentRequired` as a robust backstop (the start-time alignment can miss before the first report). The loss reaction was also softened (×0.85 vs ×0.6) and recovery sped up (+25%/3s vs +10%/10s). New `ServerConfiguration.AdaptiveBitrate` flag and `Server.SetAdaptiveBitrate(bool)` disable adaptation entirely (pin the bitrate).
+  - **Low-latency intra-refresh** (`H264Encoder`): when the hardware encoder advertises `FEATURE_IntraRefresh`, `KEY_INTRA_REFRESH_PERIOD` (~1s of frames) is set so the decoder converges via a rolling intra-MB refresh instead of waiting for the next full IDR — faster join/recovery and no large periodic IDR bursts. Feature-gated and wrapped in try/catch, so encoders without it (e.g. MT6768's c2.mtk.avc) silently fall back to the IDR backstop.
   - **H.264 Main profile** (`H264Encoder`): used when the hardware encoder advertises support (recorded during encoder evaluation in `EncoderInfo.SupportsMainProfile`); falls back to Baseline. CABAC + better rate-distortion = sharper picture per bit. Compatible with the MediaTek SPS crop patch (which only bails on High/extended profiles).
 
   **Frame-rate fixes (7fps → camera rate at 2K):**
