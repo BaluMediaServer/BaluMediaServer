@@ -33,13 +33,15 @@ public class VideoProfileTests
     }
 
     [Fact]
-    public void Constructor_ShouldSetDefaultMaxBitrate_To4000000()
+    public void Constructor_ShouldSetDefaultMaxBitrate_To20000000()
     {
         // Arrange & Act
         var profile = new VideoProfile();
 
         // Assert
-        profile.MaxBitrate.Should().Be(4000000);
+        // Default raised 4 Mbps -> 20 Mbps in v1.5.29 so RTCP adaptive recovery can reach the
+        // resolution-scaled target (which clamps to 20 Mbps at 2K).
+        profile.MaxBitrate.Should().Be(20000000);
     }
 
     [Fact]

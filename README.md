@@ -49,8 +49,10 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 - **30fps High-Resolution Pipeline** (v1.5.29+): Pooled frame buffers, hardware encoder pipelining, and µs-correct presentation timestamps deliver camera-rate streaming at 2K on MediaTek devices
 - **Multiple Profiles**: Support for `/live/front` and `/live/back` routes
 - **Robust Client Lifecycle**: Graduated error counting, timeout protection, and race-free cleanup
+- **Stall Resilience — "STREAM STALLED" placeholder** (v1.5.30+): If the camera stops delivering frames (sensor-privacy toggle, device-owner policy, HAL hiccup), the server feeds a synthetic dark placeholder frame — black background, a "STREAM STALLED / Reconnecting camera…" message, and a live elapsed-seconds timer — into the H.264 and MJPEG streams instead of letting the client starve and disconnect. The RTSP/MJPEG session stays open, the viewer sees an informative dark window, and real video resumes seamlessly on the same session once the watchdog re-opens the camera. A separate path detects a *hung encoder* (camera still delivering) and restarts just the encoder (~1s) rather than the whole camera (10–30s on MediaTek). Toggle with `ServerConfiguration.StallPlaceholderEnabled` (default **on**)
 - **Cross-SoC Compatibility**: Wall-clock RTP timestamps and MediaTek-safe encoder configuration
 - **VLC Compatible**: Full RFC 2326/4566 compliance — works with VLC, ffplay, OBS, and any standards-compliant RTSP client
+- **ONVIF Profile S** (v1.6.0+): Optional, opt-in ONVIF layer so the device drops into any VMS/NVR/ONVIF system. **WS-Discovery** auto-announces it on the LAN; the **Device** and **Media** SOAP services answer `GetDeviceInformation`, `GetCapabilities`, `GetProfiles`, `GetStreamUri` (returns the existing RTSP URL), `GetVideoEncoderConfigurations`, and `GetSnapshotUri` (a JPEG still). WS-UsernameToken auth reuses the existing user store. Enable via `ServerConfiguration.Onvif`; off by default so existing deployments are byte-for-byte unchanged. Adds only the discovery + description layer — the media pipeline is untouched
 - **Text Overlay**: Configurable multi-slot text burned into video frames at the YUV level (zero decode overhead for clients)
 
 ### 🔹 MJPEG HTTP Server
@@ -102,7 +104,17 @@ Services/
 ├── FrontCameraService.cs        # Front camera capture (JNI-free processing thread)
 ├── AudioCaptureService.cs       # Microphone capture (Android AudioRecord, 1024-sample PCM frames)
 ├── MjpegServer.cs               # HTTP MJPEG streaming server
-└── FrameOverlay.cs              # YUV-level text overlay burn-in (up to 4 slots)
+├── FrameOverlay.cs              # YUV-level text overlay burn-in (up to 4 slots)
+├── StallPlaceholder.cs          # "STREAM STALLED" dark-window NV21 frame shown while the camera recovers
+└── Onvif/                       # Optional ONVIF Profile S layer (opt-in)
+    ├── OnvifModels.cs           # OnvifDeviceContext + OnvifProfile (Android-free data)
+    ├── OnvifSoap.cs             # SOAP 1.2 namespaces, operation parsing, envelope/fault (Android-free)
+    ├── OnvifSecurity.cs         # WS-UsernameToken PasswordDigest validation (Android-free)
+    ├── OnvifDeviceService.cs    # Device service responses: info/capabilities/services/scopes (Android-free)
+    ├── OnvifMediaService.cs     # Media service responses: profiles/stream URI/snapshot URI (Android-free)
+    ├── WsDiscoveryMessages.cs   # WS-Discovery Hello/Bye/ProbeMatch builders + parser (Android-free)
+    ├── OnvifServer.cs           # HttpListener SOAP transport shell (port 8090)
+    └── WsDiscoveryService.cs    # UDP multicast transport + Android multicast lock
 
 Interfaces/
 ├── ICameraService.cs            # Camera capture contract
@@ -155,6 +167,9 @@ Add these permissions to your `Platforms/Android/AndroidManifest.xml`:
 <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 <!-- Only required when ServerConfiguration.EnableAudioTrack = true -->
 <uses-permission android:name="android.permission.RECORD_AUDIO" />
+<!-- Only required when ONVIF is enabled (ServerConfiguration.Onvif.Enabled = true) — lets the
+     device receive WS-Discovery multicast Probes so VMS/NVR systems can auto-discover it -->
+<uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 ```
 
 > **Runtime permission for audio:** `RECORD_AUDIO` is a [dangerous permission](https://developer.android.com/guide/topics/permissions/overview#dangerous-permission-prompt). Request it at runtime (e.g. `await Permissions.RequestAsync<Permissions.Microphone>()`) before calling `server.Start()` when `EnableAudioTrack` is enabled. If the runtime grant is missing, the camera/video pipeline keeps working normally and the audio track stays silent — `AudioCaptureService` raises `ErrorOccurred` instead of crashing.
@@ -453,6 +468,27 @@ public class ServerConfiguration
     public bool EnableAudioTrack { get; set; } = false;             // Enable AAC audio stream
     public int  AudioSampleRateHz { get; set; } = 44100;            // 44100 / 48000 / 22050 / 16000 / 8000
     public int  AudioChannels { get; set; } = 1;                    // 1 = mono, 2 = stereo
+
+    // Stall resilience (v1.5.30+) — when true (default), a stalled camera shows a dark
+    // "STREAM STALLED" placeholder (black frame + message + live elapsed timer) instead of
+    // dropping the client; real video resumes on the same session once the camera recovers.
+    public bool StallPlaceholderEnabled { get; set; } = true;       // Show dark placeholder on stall
+
+    // ONVIF Profile S (v1.6.0+) — null (default) = disabled. When .Enabled is true, the device
+    // is discoverable over WS-Discovery and exposes the Device/Media SOAP services on .Port.
+    public OnvifOptions? Onvif { get; set; }                        // ONVIF Profile S options (off by default)
+}
+
+// OnvifOptions (v1.6.0+)
+public class OnvifOptions
+{
+    public bool   Enabled { get; set; } = false;                    // Master switch
+    public int    Port { get; set; } = 8090;                        // ONVIF SOAP/HTTP port
+    public string Manufacturer { get; set; } = "Balu";              // GetDeviceInformation
+    public string Model { get; set; } = "BaluMediaServer";          // GetDeviceInformation + name scope
+    public string FirmwareVersion { get; set; } = "1.6.0";          // GetDeviceInformation
+    public string SerialNumber { get; set; } = "";                  // Set a unique value per device
+    public string HardwareId { get; set; } = "balu-1";              // GetDeviceInformation + hardware scope
 }
 ```
 
@@ -1240,6 +1276,45 @@ private async void StartPeriodicSnapshots()
 }
 ```
 
+### ONVIF Profile S (v1.6.0+)
+
+Make the device behave as a standard ONVIF camera so it auto-discovers into any VMS/NVR/ONVIF client (Milestone, Synology Surveillance Station, Blue Iris, ONVIF Device Manager, etc.). ONVIF is **opt-in** — when `ServerConfiguration.Onvif` is `null` (the default) nothing changes.
+
+```csharp
+var config = new ServerConfiguration
+{
+    Port = 7778,                                  // existing RTSP port — ONVIF advertises this
+    Users = new() { ["admin"] = "password" },     // reused for ONVIF WS-UsernameToken auth
+    AuthRequired = true,
+
+    Onvif = new OnvifOptions
+    {
+        Enabled = true,
+        Port = 8090,                              // ONVIF SOAP/HTTP port
+        Manufacturer = "Balu",
+        Model = "BodyCam-X1",
+        FirmwareVersion = "1.6.0",
+        SerialNumber = "BC-0001",                 // give each device a unique serial
+        HardwareId = "balu-bodycam-1",
+    },
+};
+
+var server = new Server(config);
+server.Start();   // starts the ONVIF service + WS-Discovery announce alongside RTSP/MJPEG
+```
+
+**What it exposes:**
+- **Device service** — `http://<device-ip>:8090/onvif/device_service` (GetSystemDateAndTime, GetDeviceInformation, GetCapabilities, GetServices, GetScopes).
+- **Media service** — `http://<device-ip>:8090/onvif/media_service` (GetProfiles, GetStreamUri, GetVideoSources, GetVideoEncoderConfigurations, GetSnapshotUri). One profile per enabled camera (`Profile_back`, `Profile_front`).
+- **GetStreamUri** returns the existing RTSP URL (e.g. `rtsp://<ip>:7778/live/back`); **GetSnapshotUri** returns a JPEG still (e.g. `http://<ip>:8089/snapshot/back.jpg`).
+- **WS-Discovery** — the device answers Probes on `239.255.255.250:3702` and sends Hello/Bye so VMS systems find it automatically.
+
+**Notes:**
+- **Permission**: WS-Discovery needs `android.permission.CHANGE_WIFI_MULTICAST_STATE` in the host manifest to *receive* Probes (see [Required Permissions](#-required-permissions)). Without it the SOAP service still works if the client is pointed at the URL manually.
+- **Auth**: ONVIF uses WS-Security UsernameToken (PasswordDigest), validated against the same `Users` as RTSP. `GetSystemDateAndTime` is always reachable unauthenticated so clients can sync their clock before building the digest. When `AuthRequired = false`, all ONVIF calls are open.
+- **Snapshot endpoint**: `GET /snapshot/back.jpg` / `/snapshot/front.jpg` on the MJPEG port (8089) returns a single cached JPEG; HTTP 503 until the first frame is encoded.
+- **Scope**: this is Profile S (streaming) — no PTZ/Events/Imaging (the bodycams are fixed). HTTP only on the ONVIF port.
+
 ## 🌐 Network Usage
 
 ### RTSP URLs
@@ -1447,6 +1522,16 @@ If the H.264 stream starts but freezes after a few seconds (while MJPEG continue
 - **Cause**: Aggressive timeout settings or premature client cleanup
 - **Fix**: The library uses graduated error counting (10 consecutive failures for TCP, 5 for UDP) and checks `IsPlaying` before marking clients as dead. Fixed since v1.5.16
 
+#### Stream Shows a Dark "STREAM STALLED" Window
+
+If a connected client briefly shows a black screen with **"STREAM STALLED / Reconnecting camera…"** and a counting-up timer, this is expected, intentional behavior (v1.5.30+) — not a bug.
+
+- **What it means**: The camera stopped delivering frames (e.g. a sensor-privacy / device-owner camera toggle, a HAL hiccup, or a camera restart). Rather than starving the client until it disconnects, the server keeps the H.264/MJPEG session alive by feeding a synthetic dark placeholder frame, so the session survives the outage.
+- **What happens next**: The watchdog re-opens the camera in the background; once real frames return, live video resumes **on the same session** with no reconnect required. The elapsed-seconds timer shows how long the camera has been down.
+- **If it never clears**: The camera itself isn't recovering — check `BaluLogger`/logcat for camera-open failures, verify the camera isn't disabled by device-owner policy, and confirm the camera permission is still granted.
+- **To disable it**: Set `ServerConfiguration.StallPlaceholderEnabled = false`. The stream will then stall and the client will eventually disconnect on its own (the pre-v1.5.30 behavior).
+- **Distinct from a frozen last frame**: A *frozen* picture with **no** message is an encoder stall (camera still delivering), handled separately by restarting just the encoder — see the freeze section above.
+
 #### App Crashes After Hours of Streaming (SIGABRT)
 
 If the app crashes after hours of continuous streaming with `Cannot transition thread from RUNNING with DONE_BLOCKING` in the logs:
@@ -1650,6 +1735,8 @@ Unit tests cover pure C# components. Android-dependent classes (camera services,
 - ✅ **All-IDR fix — camera SENSOR_TIMESTAMP (ns) now converted to µs before MediaCodec; raw ns made the MediaTek time-based GOP logic force an IDR on every frame (~190KB frames, 2× bitrate overshoot, ~7–11fps cap at 2K). Also the true origin of the historical "MT6768 PTS 1000× larger" workaround** (v1.5.29)
 - ✅ **High-resolution frame-rate unlock — pooled 6-slot frame ring + JNIEnv.CopyArray kills the per-frame 7.4MB managed allocation and its 16-GCs/sec bridge storm; KeyLatency=0 removed to restore hardware encoder pipelining; NV21→NV12 chroma swap vectorized (SIMD); encoder raised to 30fps to match the camera sensor** (v1.5.29)
 - ✅ **Low-latency intra-refresh — rolling intra-MB refresh (`KEY_INTRA_REFRESH_PERIOD` ~1s) enabled when the codec advertises `FEATURE_IntraRefresh`, so a decoder converges without waiting for the next full IDR; guarded no-op on encoders lacking it (e.g. MT6768's c2.mtk.avc), so it is safe everywhere** (v1.5.29)
+- ✅ **Stall resilience — dark "STREAM STALLED" placeholder keeps the client session alive while a stalled camera recovers (synthetic black frame + message + live elapsed timer fed to H.264/MJPEG, real video resumes on the same session); encoder-stall vs camera-stall distinction restarts just the hung encoder (~1s) instead of the whole camera (10–30s); `StallPlaceholderEnabled` config flag, default on** (v1.5.30)
+- ✅ **ONVIF Profile S — opt-in WS-Discovery + Device/Media SOAP services so the device drops into any VMS/NVR/ONVIF system; GetStreamUri returns the existing RTSP URL, GetSnapshotUri returns a JPEG still; WS-UsernameToken auth reuses the RTSP user store; protocol logic kept Android-free and unit-tested; `ServerConfiguration.Onvif`, off by default** (v1.6.0)
 
 ### Planned (v1.6+)
 - ⬜ Fix image rotation on some devices
@@ -1702,6 +1789,48 @@ There are few (if any) options to integrate RTSP servers with Android using C# a
 4. **Community**: Join discussions with other developers
 
 ## Patch Notes
+
+- v1.6.0: **ONVIF Profile S support** — the device now behaves as a standard ONVIF camera, so it auto-discovers into any VMS/NVR/ONVIF client and is queried for its streams over SOAP. Opt-in and backward compatible: gated on `ServerConfiguration.Onvif` (default `null`/disabled), so existing deployments are unchanged. Adds only the discovery + description layer — the RTSP/H.264 media pipeline is untouched.
+
+  **Discovery (`Services/Onvif/WsDiscoveryService.cs` + `WsDiscoveryMessages.cs`):**
+  - Joins multicast `239.255.255.250:3702`, answers client `Probe` with a unicast `ProbeMatch`, and announces the device with `Hello` on start / `Bye` on stop. Advertises types `dn:NetworkVideoTransmitter tds:Device` and the streaming scopes.
+  - The device's WS-Discovery UUID is derived from `SerialNumber`/`HardwareId` so it stays stable across restarts.
+  - Android note: receiving Probes requires a `WifiManager.MulticastLock` and `android.permission.CHANGE_WIFI_MULTICAST_STATE` in the host manifest. The lock is acquired/released automatically; without the permission, outbound Hello/ProbeMatch still go out but inbound Probes are dropped by the OS.
+
+  **SOAP service (`Services/Onvif/OnvifServer.cs`):**
+  - `HttpListener` on port 8090 (configurable) serving `/onvif/device_service` and `/onvif/media_service`, mirroring the `MjpegServer` listener pattern (including the Android `0.0.0.0`→`*` prefix fix).
+  - Device: `GetSystemDateAndTime`, `GetDeviceInformation`, `GetCapabilities`, `GetServices`, `GetServiceCapabilities`, `GetScopes`. Media: `GetProfiles`/`GetProfile`, `GetVideoSources`, `GetVideoSourceConfigurations`, `GetVideoEncoderConfigurations`/`GetVideoEncoderConfiguration`, `GetStreamUri`, `GetSnapshotUri`. One profile per enabled camera (`Profile_back`, `Profile_front`) built from the live encoder resolution and bitrate.
+
+  **Auth (`Services/Onvif/OnvifSecurity.cs`):**
+  - WS-Security UsernameToken `PasswordDigest` (`Base64(SHA1(nonce + created + password))`) and `PasswordText`, validated against the existing RTSP `Users` store — no new credential state. `GetSystemDateAndTime` is always reachable unauthenticated (PRE_AUTH) so clients can sync their clock first. Gated on `ServerConfiguration.AuthRequired`.
+
+  **Snapshot (`Services/MjpegServer.cs`):**
+  - New `/snapshot/back.jpg` + `/snapshot/front.jpg` endpoint on the MJPEG port returns a single cached JPEG (503 until the first frame is encoded). Referenced by ONVIF `GetSnapshotUri`.
+
+  **Architecture & testing:**
+  - All SOAP/XML/digest/discovery *logic* lives in Android-free classes (`OnvifSoap`, `OnvifSecurity`, `OnvifDeviceService`, `OnvifMediaService`, `WsDiscoveryMessages`); only the transport shells touch the platform. The logic is linked into the test project and covered by unit tests (SOAP parsing, a known-answer PasswordDigest vector, GetStreamUri/GetProfiles composition, ProbeMatch content).
+  - New config: `ServerConfiguration.Onvif` (`OnvifOptions`: `Enabled`, `Port`, `Manufacturer`, `Model`, `FirmwareVersion`, `SerialNumber`, `HardwareId`).
+  - Scope: Profile S (streaming) only — no PTZ/Events/Imaging; HTTP only on the ONVIF port.
+
+- v1.5.30: **Stall Resilience — dark "STREAM STALLED" placeholder** — a stalled camera no longer drops the client. While the camera delivers no frames, the server keeps the H.264/MJPEG session alive by feeding a synthetic dark placeholder frame, and real video resumes seamlessly on the same session once the camera recovers. Gated on `ServerConfiguration.StallPlaceholderEnabled` (default `true`).
+
+  **Placeholder rendering (`Services/StallPlaceholder.cs`):**
+  - Renders a black NV21 frame with centered status text — `STREAM STALLED` (title) / `Reconnecting camera…` — plus a live `{n}s` elapsed-seconds timer, sized to the encoder resolution so it's legible at any resolution.
+  - Only the Y (luma) plane is touched: white-on-black text is chroma-neutral, so the buffer keeps `U=V=128`. The text is re-rasterized only when the visible second changes (otherwise the same buffer is returned), so the per-frame cost during a stall is ~nil.
+
+  **Keepalive pump (`RTSP/Server.cs`):**
+  - A background `StallPump` task ticks every 200ms (~5fps, far under the ~5s starve window). When a camera has produced at least one real frame but none for >0.4s and a client is watching, it feeds the placeholder via `FeedSyntheticFrame` — the same fan-out as a real frame (H.264 encoder + JPEG/MJPEG + cached latest-frame + `OnNewFrame`).
+  - Because the encoder keeps getting fed, the per-client streaming loop never reaches its starve/disconnect branch, so the session is never torn down. PTS is kept monotonic (shared +200ms steps with real frames) so resume doesn't glitch.
+  - On connect-during-stall, the placeholder is published into the cached latest-frame so `WaitForFrameAndStartEncoder` succeeds and the encoder starts on the placeholder.
+
+  **Camera-stall vs encoder-stall distinction (`RTSP/Streaming/StreamingController.cs`):**
+  - **Camera stall** (camera stops delivering): the pump keeps the encoder fed, the loop never stalls, and the watchdog re-opens the camera in the background.
+  - **Encoder stall** (camera still delivering, but the MediaTek encoder hangs): the pump doesn't engage, so the loop hits its stall branch and restarts the encoder. A new `IsCameraFresh` delegate distinguishes the two — a fresh camera frame (<1s) means an encoder-only restart (~1s) instead of a needless full camera restart (10–30s on MediaTek). The watchdog camera self-heal threshold was lowered 15s→8s since the placeholder now hides the wait.
+
+  **Configuration:**
+  - New `ServerConfiguration.StallPlaceholderEnabled` (bool, default `true`). Set `false` to restore the pre-v1.5.30 behavior (the stream stalls and the client eventually disconnects).
+
+  **Verified:** captured the live H.264 over ffplay/ffmpeg during a `sensor_privacy` camera kill on a 1080p MediaTek device — encoder output never dropped to zero, the session never disconnected, the dark placeholder rendered with the elapsed counter incrementing, and real video resumed on the same session.
 
 - v1.5.29: **High-Resolution Quality & Frame-Rate Overhaul** — fixes the chain of issues that made 2K streaming soft, noisy, and slow (~7fps); after this release the pipeline runs at the camera's native 30fps with resolution-appropriate bitrate.
 

@@ -10,6 +10,7 @@ using BaluMediaServer.RTSP.Protocol;
 using BaluMediaServer.RTSP.Security;
 using BaluMediaServer.RTSP.Streaming;
 using BaluMediaServer.RTSP.Transport;
+using BaluMediaServer.Services.Onvif;
 using AuthManager = BaluMediaServer.RTSP.Security.AuthenticationManager;
 
 namespace BaluMediaServer.Services;
@@ -27,6 +28,11 @@ public class Server : IDisposable
     private FrontCameraService _frontService = new();
     private BackCameraService _backService = new();
     private MjpegServer? _mjpegServer;
+
+    // Optional ONVIF Profile S layer (SOAP device/media service + WS-Discovery). Non-null only
+    // when ServerConfiguration.Onvif.Enabled is true. Advertises the existing RTSP/snapshot URLs.
+    private OnvifServer? _onvifServer;
+    private WsDiscoveryService? _wsDiscovery;
 
     // Core server state
     private Socket _socket = default!;
@@ -73,6 +79,44 @@ public class Server : IDisposable
     private readonly object _frameFrontLock = new();
     private readonly object _frameBackLock = new();
 
+    // Camera stall self-heal. A camera can be latched as "capturing" (_isCapturingBack/Front == true)
+    // yet deliver zero frames forever: the native open fails ASYNCHRONOUSLY — most commonly
+    // CAMERA_DISABLED by the device-owner camera policy during/after provisioning, but also on a
+    // transient camera2 HAL hiccup — AFTER the flag was already set true. Every (re)start path guards
+    // on "!_isCapturing*", so nothing ever retries and the stream sits at 0 fps until the process is
+    // manually restarted. The WatchDog watches these timestamps and re-opens a stalled camera via
+    // StartCapture (which fully tears down + recreates the native session), retrying on a cooldown
+    // until frames flow again — e.g. once the policy re-enables the camera.
+    private DateTime _lastBackFrameUtc = DateTime.UtcNow;
+    private DateTime _lastFrontFrameUtc = DateTime.UtcNow;
+    private DateTime _lastBackRecoveryUtc = DateTime.MinValue;
+    private DateTime _lastFrontRecoveryUtc = DateTime.MinValue;
+    private int _backRecoveryAttempts, _frontRecoveryAttempts;
+    // No frames for this long while a camera is marked capturing => treat as stalled and re-open.
+    // The stall placeholder (below) keeps the client connected meanwhile, so we can re-open promptly.
+    private const int CameraStallRecoverySeconds = 8;
+    // Minimum gap between re-open attempts (a native re-open itself takes a few seconds).
+    private const int CameraRecoveryCooldownSeconds = 12;
+
+    // Stalled-stream placeholder. While the camera delivers no frames, a pump feeds synthetic
+    // "STREAM STALLED" frames (black + message + live timer) to the H.264 encoder and the
+    // MJPEG/JPEG path. This keeps the client fed so StreamingController never starves it into a
+    // disconnect (its stall path break) — the session stays open and the viewer sees an
+    // informative screen — while the WatchDog self-heal re-opens the camera in the background.
+    private bool _stallPlaceholderEnabled = true;
+    private Task? _stallPumpTask;
+    private StallPlaceholder? _backStallPlaceholder, _frontStallPlaceholder;
+    // Monotonic presentation-timestamp tracker (nanoseconds) shared by real and synthetic frames,
+    // so PTS never steps backwards across a real<->placeholder transition (which would glitch H.264).
+    private long _lastBackFedTsNs, _lastFrontFedTsNs;
+    // Set once the camera has produced a real frame, so the placeholder never shows during the
+    // initial warmup (when _lastFrameUtc is still stale from server start).
+    private volatile bool _backHadRealFrame, _frontHadRealFrame;
+    private const int StallPumpIntervalMs = 200;             // ~5fps keepalive, far under the ~5s starve window
+    private const double StallPlaceholderDelaySeconds = 0.4; // dead-air before the placeholder appears
+    private bool _backPlaceholderActive, _frontPlaceholderActive; // for episode-transition logging
+    private static readonly string[] StallMessageLines = { "STREAM STALLED", "Reconnecting camera…" };
+
 #if ANDROID
     // Raw-frame overlay — stamped once per frame before all consumers (H264, MJPEG, event callbacks)
     private OverlaySlot[]? _backOverlaySlots;
@@ -81,6 +125,10 @@ public class Server : IDisposable
     private FrameOverlay? _frontFrameOverlay;
     private bool _backOverlayInitialized;
     private bool _frontOverlayInitialized;
+
+    // Software denoise + digital stabilization for the back-camera NV21 frames (opt-in).
+    private VideoStabilizationOptions? _backStabilizationOptions;
+    private FrameStabilizer? _backFrameStabilizer;
 #endif
 
     // Per-camera locks to prevent races between resolution changes and concurrent SETUP/PLAY
@@ -211,6 +259,11 @@ public class Server : IDisposable
         _streamingController.EncoderResolutionFallback += OnEncoderResolutionFallback;
         _streamingController.GetLatestFrame = GetLatestFrame;
         _streamingController.RestartCamera = RestartCameraForStallRecovery;
+        // Tells stall recovery whether the camera is still delivering (encoder stall → restart
+        // encoder only) or not (camera stall → also restart the camera). Real frames update
+        // _lastBack/FrontFrameUtc; placeholder frames do NOT, so this reflects the true camera.
+        _streamingController.IsCameraFresh = cameraId =>
+            (DateTime.UtcNow - (cameraId == 0 ? _lastBackFrameUtc : _lastFrontFrameUtc)).TotalSeconds < 1.0;
         _rtcpManager.ClientCleanupRequired += (_, client) => _clientManager.CleanupClient(client);
         _rtcpManager.BitrateAdjustmentRequired += OnBitrateAdjustmentRequired;
         _encoderManager.FrameEncoded += OnEncoderFrameEncoded;
@@ -250,17 +303,26 @@ public class Server : IDisposable
     {
         _enabled = configuration.EnableServer;
         _adaptiveBitrate = configuration.AdaptiveBitrate;
+        _stallPlaceholderEnabled = configuration.StallPlaceholderEnabled;
         H264Encoder.PreferMainProfile = configuration.PreferMainProfile;
         if (configuration.KeyFrameIntervalSeconds > 0)
             H264Encoder.KeyFrameIntervalSeconds = configuration.KeyFrameIntervalSeconds;
         if (configuration.StartMjpegServer)
             _mjpegServer?.Start(true);
 
+        // Optional ONVIF Profile S: SOAP device/media service + WS-Discovery announce. The
+        // advertised stream/snapshot URIs point at the existing RTSP and MJPEG servers, so this
+        // adds only the discovery + description layer. Built here (not in the param ctor) to keep
+        // the wide param ctor untouched — same approach as the stall/overlay/stabilization options.
+        if (configuration.Onvif?.Enabled == true)
+            InitializeOnvif(configuration.Onvif);
+
 #if ANDROID
         // Store overlay slots — applied to raw frames in OnBackFrameAvailable/OnFrontFrameAvailable
         // so all consumers (H264, MJPEG, event callbacks) receive pre-stamped frames.
         _backOverlaySlots  = configuration.BackCameraOverlaySlots;
         _frontOverlaySlots = configuration.FrontCameraOverlaySlots;
+        _backStabilizationOptions = configuration.BackCameraStabilization;
 #endif
     }
 
@@ -403,6 +465,11 @@ public class Server : IDisposable
             _frontService.FrameReceived += OnFrontFrameAvailable;
             Task.Run(ListenAsync, _cts.Token);
             Task.Run(WatchDog, _cts.Token);
+            _stallPumpTask = Task.Run(StallPump, _cts.Token);
+
+            // ONVIF service + discovery announce (no-ops when ONVIF is disabled).
+            _onvifServer?.Start();
+            _wsDiscovery?.Start();
             return true;
         }
         return false;
@@ -462,6 +529,11 @@ public class Server : IDisposable
         _lastReportedStreamingState = null;
 
         _mjpegServer?.Stop();
+
+        // Stop ONVIF discovery (sends a WS-Discovery Bye) and the SOAP service.
+        try { _wsDiscovery?.Stop(); } catch (Exception ex) { BaluLogger.Warn("[RTSP Server]", $"Stop: WS-Discovery stop error: {ex.Message}"); }
+        try { _onvifServer?.Stop(); } catch (Exception ex) { BaluLogger.Warn("[RTSP Server]", $"Stop: ONVIF service stop error: {ex.Message}"); }
+
         _socket.Close();
         _socket?.Dispose();
     }
@@ -478,6 +550,8 @@ public class Server : IDisposable
         _jpegEncoder?.Dispose();
         try { _audioCapture?.Dispose(); } catch { }
         try { _aacEncoderManager?.Dispose(); } catch { }
+        try { _wsDiscovery?.Dispose(); } catch { }
+        try { _onvifServer?.Dispose(); } catch { }
         _cts?.Cancel();
         _socket?.Dispose();
     }
@@ -492,6 +566,90 @@ public class Server : IDisposable
         certificatePath: _mjpegCertificatePath,
         certificatePassword: _mjpegCertificatePassword
     );
+
+    // ONVIF encoder frame rate advertised in the media profile. The H.264 encoder runs at 30fps.
+    private const int OnvifFrameRate = 30;
+
+    /// <summary>
+    /// Builds the ONVIF device context + service shells from the supplied options. The advertised
+    /// IP comes from the same <see cref="SdpGenerator.GetLocalIpAddress"/> the RTSP SDP uses, so
+    /// ONVIF and RTSP agree on the address. Auth reuses the existing user store.
+    /// </summary>
+    private void InitializeOnvif(OnvifOptions onvif)
+    {
+        var ctx = new OnvifDeviceContext
+        {
+            Manufacturer = onvif.Manufacturer,
+            Model = onvif.Model,
+            FirmwareVersion = onvif.FirmwareVersion,
+            SerialNumber = onvif.SerialNumber,
+            HardwareId = onvif.HardwareId,
+            RtspPort = _port,
+            MjpegPort = _mjpegServerPort,
+            OnvifPort = onvif.Port,
+            GetIpAddress = _sdpGenerator.GetLocalIpAddress,
+        };
+
+        _onvifServer = new OnvifServer(
+            port: onvif.Port,
+            bindAddress: _address,
+            ctx: ctx,
+            getProfiles: BuildOnvifProfiles,
+            requireAuth: _authManager.RequireAuthentication,
+            getPassword: GetUserPassword);
+
+        _wsDiscovery = new WsDiscoveryService(ctx);
+    }
+
+    /// <summary>
+    /// Builds the live ONVIF media profiles — one per enabled camera — from the current encoder
+    /// resolution and bitrate. Called on every GetProfiles/GetStreamUri so the advertised values
+    /// track runtime changes (e.g. a resolution switch).
+    /// </summary>
+    private IReadOnlyList<OnvifProfile> BuildOnvifProfiles()
+    {
+        var profiles = new List<OnvifProfile>(2);
+
+        if (_backCameraEnabled)
+        {
+            var (w, h) = GetBackCameraResolution();
+            profiles.Add(new OnvifProfile
+            {
+                Token = "Profile_back",
+                Name = "BackCamera",
+                CameraKey = "back",
+                Width = w,
+                Height = h,
+                Fps = OnvifFrameRate,
+                BitrateKbps = Math.Max(1, GetBackCameraBitrate() / 1000),
+                RtspPath = "/live/back",
+                SnapshotPath = "/snapshot/back.jpg",
+            });
+        }
+
+        if (_frontCameraEnabled)
+        {
+            var (w, h) = GetFrontCameraResolution();
+            profiles.Add(new OnvifProfile
+            {
+                Token = "Profile_front",
+                Name = "FrontCamera",
+                CameraKey = "front",
+                Width = w,
+                Height = h,
+                Fps = OnvifFrameRate,
+                BitrateKbps = Math.Max(1, GetFrontCameraBitrate() / 1000),
+                RtspPath = "/live/front",
+                SnapshotPath = "/snapshot/front.jpg",
+            });
+        }
+
+        return profiles;
+    }
+
+    /// <summary>Returns the plaintext password for an ONVIF WS-UsernameToken check, or null if unknown.</summary>
+    private string? GetUserPassword(string user) =>
+        _authManager.Users.TryGetValue(user, out var password) ? password : null;
 
     private void LogError(object? sender, string error)
     {
@@ -617,6 +775,11 @@ public class Server : IDisposable
     {
         if (arg?.Data != null && arg.Data.Length > 0)
         {
+            _lastBackFrameUtc = DateTime.UtcNow; // self-heal heartbeat — proves the camera is delivering
+            // Keep PTS monotonic across any placeholder frames fed during a stall.
+            if (arg.Timestamp <= _lastBackFedTsNs) arg.Timestamp = _lastBackFedTsNs + 1_000_000L;
+            _lastBackFedTsNs = arg.Timestamp;
+            _backHadRealFrame = true;
             if (!_loggedFirstBackFrame)
             {
                 _loggedFirstBackFrame = true;
@@ -632,6 +795,14 @@ public class Server : IDisposable
                     : _backOverlaySlots.Length > 0
                         ? new FrameOverlay(arg.Width, arg.Height, _backOverlaySlots)
                         : null; // empty array = overlay disabled
+            }
+            // Denoise + stabilize the raw camera data BEFORE the overlay, so burned-in
+            // text stays crisp and screen-fixed (not smeared or shifted by stabilization).
+            // Opt-in; the stabilizer self-disables if it ever runs over its frame budget.
+            if (_backStabilizationOptions?.Enabled == true)
+            {
+                _backFrameStabilizer ??= new FrameStabilizer(_backStabilizationOptions);
+                _backFrameStabilizer.Process(arg.Data, arg.Width, arg.Height);
             }
             // Stamp in-place before all consumers so H264, MJPEG, and event subscribers
             // all receive frames with the overlay already burned in.
@@ -670,6 +841,10 @@ public class Server : IDisposable
     {
         if (arg?.Data != null && arg.Data.Length > 0)
         {
+            _lastFrontFrameUtc = DateTime.UtcNow; // self-heal heartbeat — proves the camera is delivering
+            if (arg.Timestamp <= _lastFrontFedTsNs) arg.Timestamp = _lastFrontFedTsNs + 1_000_000L;
+            _lastFrontFedTsNs = arg.Timestamp;
+            _frontHadRealFrame = true;
 #if ANDROID
             if (!_frontOverlayInitialized)
             {
@@ -1209,6 +1384,9 @@ public class Server : IDisposable
                     }
                 }
 
+                // Self-heal any camera that is latched as capturing but no longer delivering frames.
+                TryRecoverStalledCameras();
+
                 var mjpegClientCount = _mjpegServer?.ClientCount ?? 0;
                 BaluLogger.Debug("[RTSP Server]", $"WatchDog: Active clients: RTSP={playingClients}, MJPEG={mjpegClientCount}, Cameras: Back={_isCapturingBack}, Front={_isCapturingFront}, Streaming={_isStreaming}");
             }
@@ -1237,6 +1415,196 @@ public class Server : IDisposable
                 }
             }
             await Task.Delay(5000, _cts.Token).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Detects cameras that are latched as "capturing" yet delivering no frames and re-opens them.
+    /// This is the only path that recovers the documented 0-fps wedge where the first native camera
+    /// open failed asynchronously (e.g. CAMERA_DISABLED by device-owner policy during provisioning)
+    /// after <c>_isCapturing*</c> was already set true — without it the stream stays at 0 fps until the
+    /// process is manually restarted. Re-opens are spaced by a cooldown and keep retrying until frames
+    /// resume (e.g. once the policy re-enables the camera). Runs on the WatchDog thread (every 5s).
+    /// </summary>
+    private void TryRecoverStalledCameras()
+    {
+        var now = DateTime.UtcNow;
+
+        if (_backCameraEnabled)
+        {
+            if (_isCapturingBack)
+            {
+                var sinceFrame = (now - _lastBackFrameUtc).TotalSeconds;
+                if (sinceFrame <= CameraStallRecoverySeconds)
+                {
+                    _backRecoveryAttempts = 0; // frames flowing — clear the retry counter
+                }
+                else if ((now - _lastBackRecoveryUtc).TotalSeconds > CameraRecoveryCooldownSeconds)
+                {
+                    _lastBackRecoveryUtc = now;
+                    _backRecoveryAttempts++;
+                    BaluLogger.Warn("[RTSP Server]", $"Self-heal: back camera latched capturing but no frames for {sinceFrame:F0}s — re-opening (attempt {_backRecoveryAttempts})");
+                    try { RestartCameraForStallRecovery(0); }
+                    catch (Exception ex) { BaluLogger.Error("[RTSP Server]", $"Self-heal: back camera re-open failed: {ex.Message}"); }
+                }
+            }
+        }
+
+        if (_frontCameraEnabled)
+        {
+            if (_isCapturingFront)
+            {
+                var sinceFrame = (now - _lastFrontFrameUtc).TotalSeconds;
+                if (sinceFrame <= CameraStallRecoverySeconds)
+                {
+                    _frontRecoveryAttempts = 0;
+                }
+                else if ((now - _lastFrontRecoveryUtc).TotalSeconds > CameraRecoveryCooldownSeconds)
+                {
+                    _lastFrontRecoveryUtc = now;
+                    _frontRecoveryAttempts++;
+                    BaluLogger.Warn("[RTSP Server]", $"Self-heal: front camera latched capturing but no frames for {sinceFrame:F0}s — re-opening (attempt {_frontRecoveryAttempts})");
+                    try { RestartCameraForStallRecovery(1); }
+                    catch (Exception ex) { BaluLogger.Error("[RTSP Server]", $"Self-heal: front camera re-open failed: {ex.Message}"); }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Background pump that injects "STREAM STALLED" placeholder frames into the encoder + MJPEG
+    /// path whenever a camera stops delivering real frames. Keeping the encoder fed prevents
+    /// StreamingController from starving the client into a disconnect, so the RTSP/MJPEG session
+    /// stays open across a camera stall and the viewer sees a status screen with a live timer
+    /// instead of a frozen or dropped stream. Real frames seamlessly take over on recovery.
+    /// </summary>
+    private async Task StallPump()
+    {
+        BaluLogger.Info("[RTSP Server]", $"StallPump started (placeholderEnabled={_stallPlaceholderEnabled}, backEnabled={_backCameraEnabled}, frontEnabled={_frontCameraEnabled})");
+        while (!_cts.IsCancellationRequested)
+        {
+            try
+            {
+                if (_stallPlaceholderEnabled)
+                {
+                    PumpStalledCamera(0);
+                    PumpStalledCamera(1);
+                }
+            }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex) { BaluLogger.Error("[RTSP Server]", $"StallPump error: {ex.Message}"); }
+
+            try { await Task.Delay(StallPumpIntervalMs, _cts.Token).ConfigureAwait(false); }
+            catch (OperationCanceledException) { break; }
+        }
+    }
+
+    private void PumpStalledCamera(int cameraId)
+    {
+        bool enabled = cameraId == 0 ? _backCameraEnabled : _frontCameraEnabled;
+        if (!enabled) return;
+
+        ref bool active = ref (cameraId == 0 ? ref _backPlaceholderActive : ref _frontPlaceholderActive);
+
+        // Don't show the placeholder until the camera has delivered at least one real frame
+        // (otherwise initial warmup would display a stalled screen with a bogus elapsed time).
+        bool hadRealFrame = cameraId == 0 ? _backHadRealFrame : _frontHadRealFrame;
+
+        var lastFrame = cameraId == 0 ? _lastBackFrameUtc : _lastFrontFrameUtc;
+        var gap = (DateTime.UtcNow - lastFrame).TotalSeconds;
+
+        // No stall (real frames flowing or sub-second hiccup) — clear any active episode.
+        if (!hadRealFrame || gap < StallPlaceholderDelaySeconds)
+        {
+            if (active)
+            {
+                active = false;
+                BaluLogger.Info("[RTSP Server]", $"Placeholder STOPPED for camera {cameraId} — real frames resumed (gap={gap:F1}s)");
+            }
+            return;
+        }
+
+        // We WANT to show the placeholder. Determine if any consumer needs it:
+        //   encoderRunning — RTSP H.264 clients streaming;  rtspMjpeg — RTSP-protocol MJPEG clients;
+        //   httpMjpeg — the HTTP MjpegServer (fed through the OnNewFrame event);
+        //   rtspClient — any RTSP client connected. This last one is crucial for connect-DURING-stall:
+        //   a client's WaitForFrameAndStartEncoder blocks on GetLatestFrame BEFORE the encoder starts,
+        //   so we must publish the placeholder into _latestBackFrame (done unconditionally in
+        //   FeedSyntheticFrame) so that wait succeeds, the encoder starts, and the loop takes over.
+        bool encRunning = _encoderManager.IsEncoderRunning(cameraId);
+        bool encoderRunning = _isStreaming && encRunning;
+        bool rtspMjpeg = _clientManager.HasMjpegClients;
+        bool httpMjpeg = (_mjpegServer?.ClientCount ?? 0) > 0;
+        bool rtspClient = _clientManager.ClientCount > 0;
+
+        int w = cameraId == 0 ? _backCameraWidth : _frontCameraWidth;
+        int h = cameraId == 0 ? _backCameraHeight : _frontCameraHeight;
+
+        if ((!encoderRunning && !rtspMjpeg && !httpMjpeg && !rtspClient) || w <= 0 || h <= 0)
+        {
+            // Wanted to draw the placeholder but couldn't — log the blocking reason once per episode.
+            if (!active)
+            {
+                active = true; // latch so we log the diagnostic only once per stall episode
+                BaluLogger.Warn("[RTSP Server]", $"Placeholder WANTED for camera {cameraId} but not fed: gap={gap:F1}s isStreaming={_isStreaming} encRunning={encRunning} rtspMjpeg={rtspMjpeg} httpMjpeg={httpMjpeg} rtspClient={rtspClient} isCapturing={(cameraId == 0 ? _isCapturingBack : _isCapturingFront)} w={w} h={h}");
+            }
+            return;
+        }
+
+        var placeholder = cameraId == 0 ? _backStallPlaceholder : _frontStallPlaceholder;
+        if (placeholder == null || placeholder.Width != w || placeholder.Height != h)
+        {
+            placeholder?.Dispose();
+            placeholder = new StallPlaceholder(w, h, StallMessageLines);
+            if (cameraId == 0) _backStallPlaceholder = placeholder; else _frontStallPlaceholder = placeholder;
+        }
+
+        var data = placeholder.Render((int)gap);
+        FeedSyntheticFrame(cameraId, data, w, h, encoderRunning, rtspMjpeg);
+
+        if (!active)
+        {
+            active = true;
+            BaluLogger.Info("[RTSP Server]", $"Placeholder STARTED for camera {cameraId} ({w}x{h}, encoderRunning={encoderRunning}, rtspMjpeg={rtspMjpeg}, httpMjpeg={httpMjpeg})");
+        }
+    }
+
+    /// <summary>
+    /// Feeds a synthetic NV21 frame through the same consumer fan-out as a real camera frame
+    /// (encoder, JPEG, latest-frame cache, event), with a monotonically increasing PTS.
+    /// </summary>
+    private void FeedSyntheticFrame(int cameraId, byte[] data, int w, int h, bool encoderRunning, bool rtspMjpeg)
+    {
+        long stepNs = StallPumpIntervalMs * 1_000_000L;
+        long ts;
+        if (cameraId == 0) { _lastBackFedTsNs += stepNs; ts = _lastBackFedTsNs; }
+        else { _lastFrontFedTsNs += stepNs; ts = _lastFrontFedTsNs; }
+
+        var arg = new FrameEventArgs
+        {
+            Data = data,
+            Width = w,
+            Height = h,
+            Timestamp = ts,
+            Format = (int)Android.Graphics.ImageFormatType.Nv21,
+            CameraId = cameraId.ToString(),
+        };
+
+        if (cameraId == 0)
+        {
+            lock (_frameBackLock) { _latestBackFrame = arg; }
+            if (encoderRunning) _encoderManager.FeedFrame(0, arg);
+            if (rtspMjpeg) _jpegEncoder.QueueFrame(arg, 0);
+            try { OnNewBackFrame?.Invoke(this, arg); }
+            catch (Exception ex) { BaluLogger.Error("[RTSP Server]", $"OnNewBackFrame (placeholder) subscriber error: {ex.Message}"); }
+        }
+        else
+        {
+            lock (_frameFrontLock) { _latestFrontFrame = arg; }
+            if (encoderRunning) _encoderManager.FeedFrame(1, arg);
+            if (rtspMjpeg) _jpegEncoder.QueueFrame(arg, 1);
+            try { OnNewFrontFrame?.Invoke(this, arg); }
+            catch (Exception ex) { BaluLogger.Error("[RTSP Server]", $"OnNewFrontFrame (placeholder) subscriber error: {ex.Message}"); }
         }
     }
 

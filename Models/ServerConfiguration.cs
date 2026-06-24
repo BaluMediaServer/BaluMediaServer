@@ -137,6 +137,17 @@ public class ServerConfiguration
     public bool AdaptiveBitrate { get; set; } = true;
 
     /// <summary>
+    /// When <c>true</c> (default), a stalled camera no longer drops the client. While the camera
+    /// delivers no frames, the server feeds a synthetic "STREAM STALLED" placeholder (black frame
+    /// with a status message and a live elapsed-seconds timer) into the H.264 and MJPEG streams.
+    /// This keeps the RTSP/MJPEG session open — the viewer sees an informative screen instead of a
+    /// frozen or dropped stream — while the watchdog re-opens the camera in the background; real
+    /// video resumes seamlessly on the same session. Set to <c>false</c> to let the stream stall
+    /// (and the client eventually disconnect) instead.
+    /// </summary>
+    public bool StallPlaceholderEnabled { get; set; } = true;
+
+    /// <summary>
     /// Gets or sets whether the H.264 Main profile (CABAC entropy coding) should be used when
     /// the hardware encoder supports it. Default is <c>false</c> (Baseline / CAVLC).
     /// <para>
@@ -244,6 +255,14 @@ public class ServerConfiguration
 #endif
 
     /// <summary>
+    /// Software noise-reduction and digital-stabilization applied to back-camera NV21
+    /// frames before H.264 encoding. Disabled by default. See
+    /// <see cref="VideoStabilizationOptions"/> for the tuning knobs and the conservative
+    /// auto-disable behaviour. <c>null</c> is treated as disabled.
+    /// </summary>
+    public VideoStabilizationOptions? BackCameraStabilization { get; set; }
+
+    /// <summary>
     /// Gets or sets a value indicating whether the server is enabled and allowed to start.
     /// When false, calling <see cref="Server.Start"/> will return immediately without starting.
     /// Default is true.
@@ -279,4 +298,97 @@ public class ServerConfiguration
     /// track. Default is 1 (mono). Only used when <see cref="EnableAudioTrack"/> is true.
     /// </summary>
     public int AudioChannels { get; set; } = 1;
+
+    /// <summary>
+    /// Optional ONVIF Profile S support. When non-null and <see cref="OnvifOptions.Enabled"/>
+    /// is true, the server exposes an ONVIF Device + Media SOAP service and announces itself
+    /// on the LAN via WS-Discovery, so the camera drops into any ONVIF-compatible VMS/NVR.
+    /// The advertised stream URIs point at the existing RTSP server (no change to the media
+    /// pipeline). <c>null</c> (the default) leaves ONVIF disabled — existing deployments are
+    /// unaffected. See <see cref="OnvifOptions"/>.
+    /// </summary>
+    public OnvifOptions? Onvif { get; set; }
+}
+
+/// <summary>
+/// Configuration for the optional ONVIF Profile S layer. Off by default; set
+/// <see cref="Enabled"/> to advertise the device over WS-Discovery and serve the
+/// ONVIF Device/Media SOAP services. The identity fields populate the response to
+/// <c>GetDeviceInformation</c> and the discovery scopes — give each device a distinct
+/// <see cref="SerialNumber"/> so VMS systems can tell units apart.
+/// </summary>
+public class OnvifOptions
+{
+    /// <summary>Master switch. Default <c>false</c> — no ONVIF service or discovery runs unless enabled.</summary>
+    public bool Enabled { get; set; } = false;
+
+    /// <summary>
+    /// TCP port for the ONVIF SOAP/HTTP service. Default 8090 (sits alongside RTSP 7778 and
+    /// MJPEG 8089). The device service URL is <c>http://&lt;ip&gt;:&lt;port&gt;/onvif/device_service</c>.
+    /// Avoid privileged ports (&lt;1024) on Android.
+    /// </summary>
+    public int Port { get; set; } = 8090;
+
+    /// <summary>Manufacturer reported by <c>GetDeviceInformation</c> and the discovery scope. Default "Balu".</summary>
+    public string Manufacturer { get; set; } = "Balu";
+
+    /// <summary>Model name reported by <c>GetDeviceInformation</c> and the <c>name</c> discovery scope. Default "BaluMediaServer".</summary>
+    public string Model { get; set; } = "BaluMediaServer";
+
+    /// <summary>Firmware/version string reported by <c>GetDeviceInformation</c>. Default "1.6.0".</summary>
+    public string FirmwareVersion { get; set; } = "1.6.0";
+
+    /// <summary>Per-unit serial number reported by <c>GetDeviceInformation</c>. Default empty — set a unique value per device.</summary>
+    public string SerialNumber { get; set; } = string.Empty;
+
+    /// <summary>Hardware id reported by <c>GetDeviceInformation</c> and the <c>hardware</c> discovery scope. Default "balu-1".</summary>
+    public string HardwareId { get; set; } = "balu-1";
+}
+
+/// <summary>
+/// Tuning for the software <see cref="Services.FrameStabilizer"/>. All processing happens
+/// on the CPU over the raw NV21 buffer, so the defaults are deliberately conservative and
+/// the feature is opt-in. The stabilizer times itself and self-disables if it runs over
+/// budget for a sustained stretch, so enabling it can never permanently regress framerate.
+/// </summary>
+public class VideoStabilizationOptions
+{
+    /// <summary>Master switch. Default <c>false</c> — nothing runs unless explicitly enabled.</summary>
+    public bool Enabled { get; set; } = false;
+
+    /// <summary>Enable the motion-adaptive temporal denoise stage. Default <c>true</c> (when the master switch is on).</summary>
+    public bool DenoiseEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Denoise blend strength toward the previous frame for static pixels, 0..1.
+    /// 0 = no smoothing, 1 = maximum (and most prone to motion trailing). Default 0.5.
+    /// </summary>
+    public double DenoiseStrength { get; set; } = 0.5;
+
+    /// <summary>
+    /// Per-byte luma/chroma delta below which a pixel is treated as static (and denoised).
+    /// Above it the pixel is passed through unchanged to avoid ghosting on motion. Default 12.
+    /// </summary>
+    public int DenoiseThreshold { get; set; } = 12;
+
+    /// <summary>Enable the translation-only digital stabilization stage. Default <c>true</c> (when the master switch is on).</summary>
+    public bool StabilizationEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Maximum stabilization shift as a percent of frame width — also the effective crop
+    /// margin (and thus a slight permanent zoom). Default 2.0%.
+    /// </summary>
+    public double MaxShiftPercent { get; set; } = 2.0;
+
+    /// <summary>
+    /// Trajectory low-pass factor, 0..0.98. Higher = smoother but laggier; it follows slow
+    /// intentional pans while cancelling high-frequency jitter. Default 0.9.
+    /// </summary>
+    public double SmoothingFactor { get; set; } = 0.9;
+
+    /// <summary>Per-frame processing budget in milliseconds before a frame counts as over-budget. Default 12.</summary>
+    public double FrameBudgetMs { get; set; } = 12.0;
+
+    /// <summary>Consecutive over-budget frames that trigger permanent auto-disable. Default 30 (~1s at 30fps).</summary>
+    public int OverBudgetFramesToDisable { get; set; } = 30;
 }

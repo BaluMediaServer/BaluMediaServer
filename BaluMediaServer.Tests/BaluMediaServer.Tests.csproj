@@ -35,6 +35,14 @@
     <Compile Include="..\Models\FrameEventArgs.cs" Link="LinkedSources\Models\FrameEventArgs.cs" />
     <Compile Include="..\Models\H264FrameEventArgs.cs" Link="LinkedSources\Models\H264FrameEventArgs.cs" />
     <Compile Include="..\RTSP\EventBuss.cs" Link="LinkedSources\Infrastructure\EventBuss.cs" />
+    <Compile Include="..\Services\FrameStabilizerMath.cs" Link="LinkedSources\Services\FrameStabilizerMath.cs" />
+    <!-- ONVIF protocol logic (Android-free; the OnvifServer/WsDiscoveryService transport shells are excluded) -->
+    <Compile Include="..\Services\Onvif\OnvifModels.cs" Link="LinkedSources\Services\Onvif\OnvifModels.cs" />
+    <Compile Include="..\Services\Onvif\OnvifSoap.cs" Link="LinkedSources\Services\Onvif\OnvifSoap.cs" />
+    <Compile Include="..\Services\Onvif\OnvifSecurity.cs" Link="LinkedSources\Services\Onvif\OnvifSecurity.cs" />
+    <Compile Include="..\Services\Onvif\OnvifDeviceService.cs" Link="LinkedSources\Services\Onvif\OnvifDeviceService.cs" />
+    <Compile Include="..\Services\Onvif\OnvifMediaService.cs" Link="LinkedSources\Services\Onvif\OnvifMediaService.cs" />
+    <Compile Include="..\Services\Onvif\WsDiscoveryMessages.cs" Link="LinkedSources\Services\Onvif\WsDiscoveryMessages.cs" />
   </ItemGroup>
 
 </Project>

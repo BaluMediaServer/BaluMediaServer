@@ -73,6 +73,13 @@ public class StreamingController : IStreamingController
     public Action<int>? RestartCamera { get; set; }
 
     /// <summary>
+    /// Returns true if the given camera is still delivering real frames (i.e. a recent camera frame).
+    /// Used by stall recovery to tell an ENCODER stall (camera fresh → restart encoder only, ~1s)
+    /// from a CAMERA stall (not fresh → also restart the camera). Set by the Server.
+    /// </summary>
+    public Func<int, bool>? IsCameraFresh { get; set; }
+
+    /// <summary>
     /// Creates a new StreamingController.
     /// </summary>
     /// <param name="aacManager">Optional AAC encoder/fan-out manager. When supplied, callers
@@ -239,17 +246,36 @@ public class StreamingController : IStreamingController
 
                         if (consecutiveTimeouts >= maxTimeouts)
                         {
+                            // Reaching here means NO encoder output for the stall window. A *camera*
+                            // stall does not get here — the Server's pump keeps the encoder fed with
+                            // the placeholder, so frames keep flowing and consecutiveTimeouts never
+                            // builds. So this is almost always an *encoder* stall (camera still
+                            // delivering, but the MediaTek encoder hung): the right fix is to restart
+                            // the encoder, which the recovery below does. (An earlier "hold" here was a
+                            // mistake — it left a hung encoder stuck, freezing the last frame forever.)
                             stallRecoveryAttempts++;
                             BaluLogger.Warn("[StreamingController]", $"No frames for {consecutiveTimeouts * FrameDequeueTimeoutMs}ms on camera {client.CameraId} (running={_encoderManager.IsEncoderRunning(client.CameraId)}, warmup={!gotFirstFrame}) — recovery attempt {stallRecoveryAttempts}/{MaxStallRecoveryAttempts}");
                             try
                             {
                                 _encoderManager.StopEncoder(client.CameraId);
 
-                                // Restart the camera and clear the cached frame so
-                                // WaitForFrameAndStartEncoder blocks on a live frame instead
-                                // of returning instantly from a stale cache (which would restart
-                                // the encoder against a still-dead camera and loop indefinitely).
-                                RestartCamera?.Invoke(client.CameraId);
+                                // If the camera is still delivering frames this is an ENCODER stall,
+                                // not a camera stall: restart ONLY the encoder. The cached frame is
+                                // fresh, so WaitForFrameAndStartEncoder returns immediately and the
+                                // encoder restarts in ~1s. Restart the CAMERA only when it's actually
+                                // not delivering — a needless camera restart costs 10-30s on MediaTek.
+                                bool cameraFresh = IsCameraFresh?.Invoke(client.CameraId) ?? false;
+                                if (!cameraFresh)
+                                {
+                                    // Camera stall: restart the camera and clear the cached frame so
+                                    // WaitForFrameAndStartEncoder blocks on a fresh live frame instead
+                                    // of returning instantly from a stale cache.
+                                    RestartCamera?.Invoke(client.CameraId);
+                                }
+                                else
+                                {
+                                    BaluLogger.Info("[StreamingController]", $"Camera {client.CameraId} still delivering — restarting encoder only (encoder stall)");
+                                }
 
                                 await WaitForFrameAndStartEncoder(client, cancellationToken).ConfigureAwait(false);
                                 _encoderManager.RequestKeyFrame(client.CameraId);

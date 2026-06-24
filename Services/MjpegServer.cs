@@ -146,6 +146,10 @@ public class MjpegServer : IDisposable
         string protocol = _useHttps ? "https" : "http";
         _listener.Prefixes.Add($"{protocol}://{prefix}:{_port}/Back/");
         _listener.Prefixes.Add($"{protocol}://{prefix}:{_port}/Front/");
+        // Single-frame JPEG snapshots (e.g. /snapshot/back.jpg). Used by ONVIF GetSnapshotUri and
+        // any still-image client. Must be registered as its own prefix — HttpListener only
+        // dispatches paths under a registered prefix.
+        _listener.Prefixes.Add($"{protocol}://{prefix}:{_port}/snapshot/");
 
         _quality = quality;
         Server.OnNewBackFrame += OnBackFrameAvailable;
@@ -636,6 +640,14 @@ public class MjpegServer : IDisposable
             return;
         }
 
+        // Single-frame JPEG snapshot (e.g. /snapshot/back.jpg) — return one cached frame and close,
+        // rather than opening a continuous multipart stream.
+        if (uri.Contains("/snapshot", StringComparison.OrdinalIgnoreCase))
+        {
+            await WriteSnapshot(response, uri).ConfigureAwait(false);
+            return;
+        }
+
         response.ContentType = "multipart/x-mixed-replace; boundary=--frame";
         response.StatusCode = 200;
         response.SendChunked = true;
@@ -840,6 +852,35 @@ public class MjpegServer : IDisposable
                 ArrayPool<byte>.Shared.Return(combinedBuffer);
             }
         }
+    }
+
+    /// <summary>
+    /// Writes a single cached JPEG frame as a snapshot response and closes the connection.
+    /// Chooses the camera from the request path ("front" → front, otherwise back). Returns HTTP 503
+    /// if no frame has been encoded yet (cameras are started on-demand by the caller, so a retry
+    /// shortly after typically succeeds).
+    /// </summary>
+    private async Task WriteSnapshot(HttpListenerResponse response, string uri)
+    {
+        bool isFront = uri.Contains("front", StringComparison.OrdinalIgnoreCase);
+        var jpeg = isFront ? _latestFrontJpeg : _latestBackJpeg;
+
+        if (jpeg is null || jpeg.Length == 0)
+        {
+            BaluLogger.Debug("MJPEG SERVER", $"Snapshot requested for {(isFront ? "front" : "back")} camera but no frame cached yet");
+            response.StatusCode = 503;
+            response.Close();
+            return;
+        }
+
+        response.StatusCode = 200;
+        response.ContentType = "image/jpeg";
+        response.ContentLength64 = jpeg.Length;
+        response.Headers.Add("Access-Control-Allow-Origin", "*");
+        response.Headers.Add("Cache-Control", "no-cache, no-store, must-revalidate");
+        try { await response.OutputStream.WriteAsync(jpeg).ConfigureAwait(false); }
+        catch (System.Exception ex) { BaluLogger.Debug("MJPEG SERVER", $"Snapshot write failed: {ex.Message}"); }
+        finally { response.Close(); }
     }
 
     /// <summary>
