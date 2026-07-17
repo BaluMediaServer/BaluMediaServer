@@ -35,13 +35,14 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 - Ultra-low latency pipeline with minimal buffering (capacity=1 channels, batch RTP sends)
 - Default frame rate: 45 FPS (adjusts dynamically)
 - **Text overlay burn-in**: up to 4 configurable text slots stamped directly into encoded video frames (device name, IP, clock, custom text)
+- **Software noise-reduction + digital stabilization** (v1.5.31+): optional, opt-in CPU post-processing of back-camera NV21 frames before H.264 encoding — motion-adaptive temporal denoise (also lowers bitrate by removing sensor noise) plus translation-only digital stabilization. Self-times and auto-disables if it ever runs over budget, so it can never silently regress framerate. Off by default (`ServerConfiguration.BackCameraStabilization`)
 
 ### 🔹 RTSP Server (Pure C#)
 - **Full RTSP Protocol Compliance**: Follows RTSP, RTP, and RTCP specifications
 - **Dual Codec Support**:
   - **MJPEG**: Works smoothly, high bandwidth, no compression
   - **H.264**: Hardware-accelerated encoding, optimized for MediaTek devices
-- **Optional AAC Audio Track** (v1.5.28+): Hardware-encoded AAC-LC delivered as a second `m=audio` SDP track (`trackID=1`), packetized per RFC 3640 mpeg4-generic AAC-hbr. Toggle with `ServerConfiguration.EnableAudioTrack = true`; off by default so existing single-track clients see byte-identical SDP. Sample rate and channel count are configurable.
+- **Optional AAC Audio Track** (SDP track v1.5.28+, **live audio wired end-to-end in v1.5.32**): Hardware-encoded AAC-LC delivered as a second `m=audio` SDP track (`trackID=1`), packetized per RFC 3640 mpeg4-generic AAC-hbr. As of v1.5.32 the full pipeline is live — the microphone is captured, hardware-encoded to AAC-LC, and emitted as real audio RTP alongside the video (earlier builds advertised the track and accepted SETUP but did not emit audio RTP). The pipeline starts on the first audio-track SETUP and is torn down when the last client leaves. Toggle with `ServerConfiguration.EnableAudioTrack = true`; off by default so existing single-track clients see byte-identical SDP. Sample rate and channel count are configurable.
 - **High Concurrency**: Can handle at least 12 simultaneous clients (tested)
 - **Authentication**: Digest authentication included for basic security
 - **Transport Modes**: UDP and TCP interleaved support
@@ -52,7 +53,9 @@ The aim is to offer a simple, easily integrable, and lightweight RTSP server for
 - **Stall Resilience — "STREAM STALLED" placeholder** (v1.5.30+): If the camera stops delivering frames (sensor-privacy toggle, device-owner policy, HAL hiccup), the server feeds a synthetic dark placeholder frame — black background, a "STREAM STALLED / Reconnecting camera…" message, and a live elapsed-seconds timer — into the H.264 and MJPEG streams instead of letting the client starve and disconnect. The RTSP/MJPEG session stays open, the viewer sees an informative dark window, and real video resumes seamlessly on the same session once the watchdog re-opens the camera. A separate path detects a *hung encoder* (camera still delivering) and restarts just the encoder (~1s) rather than the whole camera (10–30s on MediaTek). Toggle with `ServerConfiguration.StallPlaceholderEnabled` (default **on**)
 - **Cross-SoC Compatibility**: Wall-clock RTP timestamps and MediaTek-safe encoder configuration
 - **VLC Compatible**: Full RFC 2326/4566 compliance — works with VLC, ffplay, OBS, and any standards-compliant RTSP client
-- **ONVIF Profile S** (v1.6.0+): Optional, opt-in ONVIF layer so the device drops into any VMS/NVR/ONVIF system. **WS-Discovery** auto-announces it on the LAN; the **Device** and **Media** SOAP services answer `GetDeviceInformation`, `GetCapabilities`, `GetProfiles`, `GetStreamUri` (returns the existing RTSP URL), `GetVideoEncoderConfigurations`, and `GetSnapshotUri` (a JPEG still). WS-UsernameToken auth reuses the existing user store. Enable via `ServerConfiguration.Onvif`; off by default so existing deployments are byte-for-byte unchanged. Adds only the discovery + description layer — the media pipeline is untouched
+- **ONVIF Profile S** (v1.5.31+): Optional, opt-in ONVIF layer so the device drops into any VMS/NVR/ONVIF system. **WS-Discovery** auto-announces it on the LAN; the **Device** and **Media** SOAP services answer `GetDeviceInformation`, `GetCapabilities`, `GetProfiles`, `GetStreamUri` (returns the existing RTSP URL), `GetVideoEncoderConfigurations`, and `GetSnapshotUri` (a JPEG still). WS-UsernameToken auth reuses the existing user store. Enable via `ServerConfiguration.Onvif`; off by default so existing deployments are byte-for-byte unchanged. Adds only the discovery + description layer — the media pipeline is untouched
+- **LAN-aware IP selection** (v1.5.31+): the advertised host (RTSP SDP `c=` line, ONVIF XAddr / `GetStreamUri` / `GetSnapshotUri` / WS-Discovery) prefers a directly-reachable LAN interface and only falls back to a VPN tunnel (Tailscale, WireGuard) when no LAN address exists, so a VMS on the same network always gets a reachable address
+- **Runtime camera switching** (v1.5.31+): `SwitchCameras()` and `SetCameraActive(front, start)` start/stop a single camera at runtime without tearing down the server — for devices that cannot run both cameras simultaneously, free one lens so the other can open
 - **Text Overlay**: Configurable multi-slot text burned into video frames at the YUV level (zero decode overhead for clients)
 
 ### 🔹 MJPEG HTTP Server
@@ -105,6 +108,8 @@ Services/
 ├── AudioCaptureService.cs       # Microphone capture (Android AudioRecord, 1024-sample PCM frames)
 ├── MjpegServer.cs               # HTTP MJPEG streaming server
 ├── FrameOverlay.cs              # YUV-level text overlay burn-in (up to 4 slots)
+├── FrameStabilizer.cs           # Opt-in NV21 temporal denoise + digital stabilization (back camera)
+├── FrameStabilizerMath.cs       # Android-free denoise/shift/projection kernels (unit-tested)
 ├── StallPlaceholder.cs          # "STREAM STALLED" dark-window NV21 frame shown while the camera recovers
 └── Onvif/                       # Optional ONVIF Profile S layer (opt-in)
     ├── OnvifModels.cs           # OnvifDeviceContext + OnvifProfile (Android-free data)
@@ -461,9 +466,10 @@ public class ServerConfiguration
     // [...] → custom slots (up to 4)
     public OverlaySlot[]? FrontCameraOverlaySlots { get; set; }     // Front camera H.264 overlay
 
-    // AAC audio track (v1.5.28+) — off by default so existing clients see byte-identical SDP.
-    // When true, an m=audio AAC-LC track (trackID=1) is advertised in the SDP and the
-    // microphone is captured + encoded only while at least one client is connected.
+    // AAC audio track (SDP v1.5.28+, live audio wired end-to-end in v1.5.32) — off by
+    // default so existing clients see byte-identical SDP. When true, an m=audio AAC-LC
+    // track (trackID=1) is advertised in the SDP and the microphone is captured, encoded,
+    // and emitted as live RTP only while at least one client is connected.
     // Requires android.permission.RECORD_AUDIO in the host manifest and runtime grant.
     public bool EnableAudioTrack { get; set; } = false;             // Enable AAC audio stream
     public int  AudioSampleRateHz { get; set; } = 44100;            // 44100 / 48000 / 22050 / 16000 / 8000
@@ -474,27 +480,47 @@ public class ServerConfiguration
     // dropping the client; real video resumes on the same session once the camera recovers.
     public bool StallPlaceholderEnabled { get; set; } = true;       // Show dark placeholder on stall
 
-    // ONVIF Profile S (v1.6.0+) — null (default) = disabled. When .Enabled is true, the device
+    // Software denoise + digital stabilization (v1.5.31+) — back camera only, null (default) = disabled.
+    // Opt-in CPU post-processing of NV21 frames before H.264 encoding; self-disables if it runs over budget.
+    public VideoStabilizationOptions? BackCameraStabilization { get; set; }  // Noise reduction + stabilization (off)
+
+    // ONVIF Profile S (v1.5.31+) — null (default) = disabled. When .Enabled is true, the device
     // is discoverable over WS-Discovery and exposes the Device/Media SOAP services on .Port.
     public OnvifOptions? Onvif { get; set; }                        // ONVIF Profile S options (off by default)
 }
 
-// OnvifOptions (v1.6.0+)
+// OnvifOptions (v1.5.31+)
 public class OnvifOptions
 {
     public bool   Enabled { get; set; } = false;                    // Master switch
     public int    Port { get; set; } = 8090;                        // ONVIF SOAP/HTTP port
     public string Manufacturer { get; set; } = "Balu";              // GetDeviceInformation
     public string Model { get; set; } = "BaluMediaServer";          // GetDeviceInformation + name scope
-    public string FirmwareVersion { get; set; } = "1.6.0";          // GetDeviceInformation
+    public string FirmwareVersion { get; set; } = "1.5.32";         // GetDeviceInformation
     public string SerialNumber { get; set; } = "";                  // Set a unique value per device
     public string HardwareId { get; set; } = "balu-1";              // GetDeviceInformation + hardware scope
+}
+
+// VideoStabilizationOptions (v1.5.31+) — assign to ServerConfiguration.BackCameraStabilization
+public class VideoStabilizationOptions
+{
+    public bool   Enabled { get; set; } = false;                    // Master switch (whole feature off by default)
+    public bool   DenoiseEnabled { get; set; } = true;              // Motion-adaptive temporal denoise stage
+    public double DenoiseStrength { get; set; } = 0.5;              // Blend toward previous frame for static pixels, 0..1
+    public int    DenoiseThreshold { get; set; } = 12;              // Per-byte delta below which a pixel is "static"
+    public bool   StabilizationEnabled { get; set; } = true;        // Translation-only digital stabilization stage
+    public double MaxShiftPercent { get; set; } = 2.0;             // Max shift / crop margin as % of width (slight zoom)
+    public double SmoothingFactor { get; set; } = 0.9;             // Trajectory low-pass, 0..0.98 (higher = smoother/laggier)
+    public double FrameBudgetMs { get; set; } = 12.0;              // Per-frame budget before a frame counts as over-budget
+    public int    OverBudgetFramesToDisable { get; set; } = 30;    // Consecutive over-budget frames → permanent auto-disable
 }
 ```
 
 ### Audio Streaming (AAC over RTP)
 
 The library can optionally publish a hardware-encoded **AAC-LC** audio stream alongside the H.264 video, exposed as a second `m=audio` track in the SDP (`a=control:trackID=1`). The feature is **off by default** so existing clients see byte-identical SDP and no microphone is opened.
+
+> **Live audio landed in v1.5.32.** The `m=audio` SDP track has existed since v1.5.28, but earlier builds only advertised the track and accepted `SETUP` for `trackID=1` — no audio RTP was actually emitted. As of **v1.5.32** the pipeline is complete end-to-end: `AudioCaptureService` records PCM-16 from the microphone (1024 samples per AAC access unit), `AacEncoder` hardware-encodes it to raw AAC-LC access units (`audio/mp4a-latm`, no ADTS), `AacEncoderManager` fans the frames out per client, and `RtpPacketBuilder.BuildAacRtpPacket` emits live RTP per RFC 3640. The audio pipeline starts on the first audio-track `SETUP` and is torn down when the last client disconnects or the server stops.
 
 **Enabling it** (via `ServerConfiguration`):
 
@@ -1276,7 +1302,7 @@ private async void StartPeriodicSnapshots()
 }
 ```
 
-### ONVIF Profile S (v1.6.0+)
+### ONVIF Profile S (v1.5.31+)
 
 Make the device behave as a standard ONVIF camera so it auto-discovers into any VMS/NVR/ONVIF client (Milestone, Synology Surveillance Station, Blue Iris, ONVIF Device Manager, etc.). ONVIF is **opt-in** — when `ServerConfiguration.Onvif` is `null` (the default) nothing changes.
 
@@ -1293,7 +1319,7 @@ var config = new ServerConfiguration
         Port = 8090,                              // ONVIF SOAP/HTTP port
         Manufacturer = "Balu",
         Model = "BodyCam-X1",
-        FirmwareVersion = "1.6.0",
+        FirmwareVersion = "1.5.32",
         SerialNumber = "BC-0001",                 // give each device a unique serial
         HardwareId = "balu-bodycam-1",
     },
@@ -1314,6 +1340,61 @@ server.Start();   // starts the ONVIF service + WS-Discovery announce alongside 
 - **Auth**: ONVIF uses WS-Security UsernameToken (PasswordDigest), validated against the same `Users` as RTSP. `GetSystemDateAndTime` is always reachable unauthenticated so clients can sync their clock before building the digest. When `AuthRequired = false`, all ONVIF calls are open.
 - **Snapshot endpoint**: `GET /snapshot/back.jpg` / `/snapshot/front.jpg` on the MJPEG port (8089) returns a single cached JPEG; HTTP 503 until the first frame is encoded.
 - **Scope**: this is Profile S (streaming) — no PTZ/Events/Imaging (the bodycams are fixed). HTTP only on the ONVIF port.
+
+### Software Noise-Reduction & Digital Stabilization (v1.5.31+)
+
+Optional CPU post-processing applied to **back-camera** NV21 frames *before* they reach the H.264 encoder. It never touches the native camera library — it only works over the bytes the AAR hands back. Two cooperating stages:
+
+1. **Motion-adaptive temporal denoise** — each pixel is blended toward its value in the previous frame when the inter-frame delta is small (static background → smoothed), and passed through untouched when the delta is large (moving content → no ghosting). Removing sensor noise also **lowers the H.264 bitrate**, since noise is high-entropy data the encoder would otherwise spend bits on.
+2. **Translation-only digital stabilization** — global inter-frame motion is estimated from integral projections of a downscaled luma plane, the camera trajectory is low-pass filtered to separate jitter from intentional panning, and the residual jitter is cancelled by integer-pixel shifting within a small crop margin (a slight permanent zoom). No rotation or feature matching — too heavy for these SoCs.
+
+The feature is **off by default** and deliberately conservative. Each frame is timed; if it runs over `FrameBudgetMs` for `OverBudgetFramesToDisable` consecutive frames the module **permanently self-disables** and passes frames through untouched, so enabling it can never silently regress the encoder framerate. Any processing fault does the same.
+
+```csharp
+var config = new ServerConfiguration
+{
+    BackCameraResolution = VideoResolution.HD_1080p,
+
+    BackCameraStabilization = new VideoStabilizationOptions
+    {
+        Enabled = true,               // master switch (whole feature is off until this is true)
+
+        DenoiseEnabled  = true,
+        DenoiseStrength = 0.5,        // 0 = none, 1 = max smoothing (more prone to motion trails)
+        DenoiseThreshold = 12,        // per-byte delta below which a pixel is treated as static
+
+        StabilizationEnabled = true,
+        MaxShiftPercent = 2.0,        // max correction / crop margin as % of width
+        SmoothingFactor = 0.9,        // 0..0.98 — higher follows slow pans but lags more
+
+        FrameBudgetMs = 12.0,         // per-frame budget
+        OverBudgetFramesToDisable = 30, // ~1s at 30fps over budget → permanent auto-disable
+    },
+};
+```
+
+**Notes:**
+- **Back camera only** — there is no front-camera equivalent property.
+- Leaving `BackCameraStabilization` `null`, or `Enabled = false`, is fully disabled (zero per-frame cost).
+- You can enable just one stage (e.g. `DenoiseEnabled = true`, `StabilizationEnabled = false`) if you only want noise reduction or only anti-shake.
+- The denoise/shift/projection kernels live in the Android-free `FrameStabilizerMath` and are covered by unit tests.
+
+### Runtime Camera Switching (v1.5.31+)
+
+For devices that **cannot run both cameras simultaneously**, you can start and stop a single camera at runtime without stopping the server or disturbing the other camera. This frees the native camera lock so the other lens can open.
+
+```csharp
+// Toggle a single camera on/off (front = true targets the front camera):
+server.SetCameraActive(front: false, start: false);  // stop the back camera
+server.SetCameraActive(front: true,  start: true);   // start the front camera
+
+// Or switch to the other lens in one call (stops the current camera, starts the other):
+server.SwitchCameras();
+```
+
+- `SetCameraActive(bool front, bool start)` — start or stop one camera independently. A camera disabled via `ServerConfiguration` (`FrontCameraEnabled` / `BackCameraEnabled` = false) is skipped, so starting it is a no-op.
+- `SwitchCameras()` — if only the back camera is active it switches to front; otherwise it switches to back. The stop always happens before the start so the native camera lock is released first.
+- Both go through the internal event bus (`BussCommand.SWITCH_CAMERA` / `START_CAMERA_*` / `STOP_CAMERA_*`). Unlike earlier builds — where `STOP_CAMERA_*` was ignored to protect continuous streaming — these commands now **actually release** the camera. Camera lifecycle is owned by the RTSP `Server`; the MJPEG server no longer stops cameras on its own teardown.
 
 ## 🌐 Network Usage
 
@@ -1431,6 +1512,15 @@ Console.WriteLine($"Connect to: rtsp://{localIP}:7778/live/back");
   - **NV21 UV plane offset**: MediaTek cameras may produce oversized buffers (e.g., 1843198 bytes for 1280x720). The UV plane starts at `width * height` (declared dimensions), NOT at the end of the full buffer. Reading UV from the wrong offset causes green corruption. Fixed in v1.5.20.
   - **Color format mismatch**: `COLOR_FormatYUV420Flexible` has undefined buffer layout for raw ByteBuffer writes. Use `COLOR_FormatYUV420SemiPlanar` (NV12) instead. Fixed in v1.5.20.
   - **SPS/PPS not delivered**: The server sends SPS/PPS before every keyframe and on first frame. Ensure your client requests a new DESCRIBE/SETUP/PLAY sequence rather than resuming a stale session.
+
+#### ONVIF / RTSP Advertises an Unreachable IP (VPN)
+
+If a VMS/NVR discovers the device but can't connect, or ONVIF `GetStreamUri` / `GetSnapshotUri` / the WS-Discovery `XAddrs` return an address that isn't on your LAN (e.g. a `10.x` or `100.64.x` Tailscale/WireGuard address):
+
+- **Cause**: The device has an active VPN tunnel interface in addition to its LAN interface, and an older build advertised the tunnel IP. The library picks the advertised address via `SdpGenerator.GetLocalIpAddress()`.
+- **Fix (v1.5.31+)**: Address selection now prefers the LAN interface (`wlan*`/`eth*`/`rmnet*`) and only falls back to a tunnel (`tun*`/`wg*`/`ppp*`) when no LAN address exists. Update to v1.5.31 or later.
+- **Note**: Interfaces are matched **by name**, not `NetworkInterfaceType` — Mono-on-Android reports the Wi-Fi NIC's type as `Unknown`, so a type-based check would miss it and fall through to the VPN. If you add custom interface handling, classify by name.
+- **Diagnostic**: `adb shell ip -o -4 addr` lists the device's interfaces and addresses; compare against what ONVIF returns.
 
 #### H.264 Encoding Issues
 ```csharp
@@ -1736,7 +1826,11 @@ Unit tests cover pure C# components. Android-dependent classes (camera services,
 - ✅ **High-resolution frame-rate unlock — pooled 6-slot frame ring + JNIEnv.CopyArray kills the per-frame 7.4MB managed allocation and its 16-GCs/sec bridge storm; KeyLatency=0 removed to restore hardware encoder pipelining; NV21→NV12 chroma swap vectorized (SIMD); encoder raised to 30fps to match the camera sensor** (v1.5.29)
 - ✅ **Low-latency intra-refresh — rolling intra-MB refresh (`KEY_INTRA_REFRESH_PERIOD` ~1s) enabled when the codec advertises `FEATURE_IntraRefresh`, so a decoder converges without waiting for the next full IDR; guarded no-op on encoders lacking it (e.g. MT6768's c2.mtk.avc), so it is safe everywhere** (v1.5.29)
 - ✅ **Stall resilience — dark "STREAM STALLED" placeholder keeps the client session alive while a stalled camera recovers (synthetic black frame + message + live elapsed timer fed to H.264/MJPEG, real video resumes on the same session); encoder-stall vs camera-stall distinction restarts just the hung encoder (~1s) instead of the whole camera (10–30s); `StallPlaceholderEnabled` config flag, default on** (v1.5.30)
-- ✅ **ONVIF Profile S — opt-in WS-Discovery + Device/Media SOAP services so the device drops into any VMS/NVR/ONVIF system; GetStreamUri returns the existing RTSP URL, GetSnapshotUri returns a JPEG still; WS-UsernameToken auth reuses the RTSP user store; protocol logic kept Android-free and unit-tested; `ServerConfiguration.Onvif`, off by default** (v1.6.0)
+- ✅ **ONVIF Profile S — opt-in WS-Discovery + Device/Media SOAP services so the device drops into any VMS/NVR/ONVIF system; GetStreamUri returns the existing RTSP URL, GetSnapshotUri returns a JPEG still; WS-UsernameToken auth reuses the RTSP user store; protocol logic kept Android-free and unit-tested; `ServerConfiguration.Onvif`, off by default** (v1.5.31)
+- ✅ **LAN-aware IP selection — advertised host (RTSP SDP + ONVIF/WS-Discovery) prefers a directly-reachable LAN interface and only falls back to a VPN tunnel when no LAN address exists, classified by interface name (Mono-on-Android reports the Wi-Fi NIC type as Unknown); fixes an unreachable Tailscale/WireGuard IP being advertised to a LAN VMS** (v1.5.31)
+- ✅ **Software noise-reduction + digital stabilization — opt-in CPU post-processing of back-camera NV21 frames (motion-adaptive temporal denoise + translation-only stabilization) before H.264 encoding; self-disables if over budget; `ServerConfiguration.BackCameraStabilization`, off by default** (v1.5.31)
+- ✅ **Runtime camera switching — `SwitchCameras()` / `SetCameraActive(front, start)` start/stop a single camera without tearing down the server, for devices that cannot run both lenses at once; `STOP_CAMERA_*` / `SWITCH_CAMERA` bus commands now fully implemented** (v1.5.31)
+- ✅ **Live AAC audio wired end-to-end — the microphone→AAC-LC→RTP pipeline is now complete: `AudioCaptureService` (PCM-16, 1024 samples/access unit) → `AacEncoder` (hardware `audio/mp4a-latm`, raw access units) → `AacEncoderManager` fan-out → `RtpPacketBuilder.BuildAacRtpPacket` (RFC 3640 mpeg4-generic AAC-hbr) emits live audio RTP on `trackID=1`; earlier builds only advertised the track/accepted SETUP without emitting audio. Starts on first audio SETUP, torn down when the last client leaves; `EnableAudioTrack`, off by default** (v1.5.32)
 
 ### Planned (v1.6+)
 - ⬜ Fix image rotation on some devices
@@ -1790,7 +1884,25 @@ There are few (if any) options to integrate RTSP servers with Android using C# a
 
 ## Patch Notes
 
-- v1.6.0: **ONVIF Profile S support** — the device now behaves as a standard ONVIF camera, so it auto-discovers into any VMS/NVR/ONVIF client and is queried for its streams over SOAP. Opt-in and backward compatible: gated on `ServerConfiguration.Onvif` (default `null`/disabled), so existing deployments are unchanged. Adds only the discovery + description layer — the RTSP/H.264 media pipeline is untouched.
+- v1.5.32: **Live audio — the AAC-LC pipeline is now wired end-to-end.**
+
+  **Audio actually plays now.** The optional `m=audio` AAC-LC track (`trackID=1`) has been advertised in the SDP since v1.5.28, but earlier builds only exercised the multi-track RTSP/SDP path — they advertised the track and accepted `SETUP` for `trackID=1` **without emitting any audio RTP**. v1.5.32 completes the pipeline so audio genuinely plays in VLC, FFmpeg, and ONVIF/VMS clients.
+
+  **End-to-end pipeline:**
+  - **Capture (`Services/AudioCaptureService.cs`):** records PCM-16 from the microphone on a dedicated background thread, sized to exactly one AAC-LC access unit (1024 samples/channel) per emitted frame (~43 fps at 44.1 kHz, ~47 fps at 48 kHz). Decoupled from the camera pipeline.
+  - **Encode (`RTSP/AacEncoder.cs`):** hardware AAC-LC via `MediaCodec` (`audio/mp4a-latm`), producing raw access units (no ADTS header) ready for RFC 3640 packetization. The first encoded frame carries the `AudioSpecificConfig` so the SDP `config=` fmtp parameter matches what the hardware actually produced.
+  - **Fan-out (`RTSP/Streaming/AacEncoderManager.cs`):** owns the single shared encoder and fans encoded frames out to each audio-enabled client's bounded channel.
+  - **Packetize + send (`RTSP/Transport/RtpPacketBuilder.cs` → `BuildAacRtpPacket`, `RTSP/Streaming/StreamingController.cs`):** emits live RTP per RFC 3640 mpeg4-generic AAC-hbr. The audio track has its own `SSRC`, sequence number, and RTP timestamp space (`Client.AudioSsrcId` / `AudioSequenceNumber` / `AudioRtpTimestamp` / `AudioBaseEncoderTimestamp` / `AudioBaseRtpTimestamp`), fully isolated from the video state.
+
+  **Lifecycle.** The audio pipeline starts on the **first audio-track `SETUP`** (`PreStartAudioPipelineIfNeeded`) and is torn down when the last client leaves or the server stops. Off by default (`ServerConfiguration.EnableAudioTrack = false`) so single-track clients see byte-identical SDP; `AudioSampleRateHz` / `AudioChannels` are configurable. Requires `android.permission.RECORD_AUDIO` in the host manifest **plus** a runtime grant — if the grant is missing, the video pipeline keeps working and `AudioCaptureService` raises `ErrorOccurred` instead of crashing.
+
+  **Still on the roadmap:** RTCP Sender Reports for the audio track and explicit A/V lip-sync hardening (see [Planned (v1.6+)](#planned-v16)).
+
+  **Documentation-only release** on top of v1.5.31: the media-pipeline behavior is unchanged beyond the version bump — this note documents the now-complete audio path and rolls the reported firmware/package version to 1.5.32. (Also carries the v1.5.31 runtime camera switching and LAN-aware IP selection work.)
+
+- v1.5.31: **ONVIF Profile S + LAN-aware discovery, software stabilization, and runtime camera switching.**
+
+  **ONVIF Profile S support** — the device now behaves as a standard ONVIF camera, so it auto-discovers into any VMS/NVR/ONVIF client and is queried for its streams over SOAP. Opt-in and backward compatible: gated on `ServerConfiguration.Onvif` (default `null`/disabled), so existing deployments are unchanged. Adds only the discovery + description layer — the RTSP/H.264 media pipeline is untouched.
 
   **Discovery (`Services/Onvif/WsDiscoveryService.cs` + `WsDiscoveryMessages.cs`):**
   - Joins multicast `239.255.255.250:3702`, answers client `Probe` with a unicast `ProbeMatch`, and announces the device with `Hello` on start / `Bye` on stop. Advertises types `dn:NetworkVideoTransmitter tds:Device` and the streaming scopes.
@@ -1807,10 +1919,23 @@ There are few (if any) options to integrate RTSP servers with Android using C# a
   **Snapshot (`Services/MjpegServer.cs`):**
   - New `/snapshot/back.jpg` + `/snapshot/front.jpg` endpoint on the MJPEG port returns a single cached JPEG (503 until the first frame is encoded). Referenced by ONVIF `GetSnapshotUri`.
 
+  **LAN-aware IP selection (`SdpGenerator.GetLocalIpAddress`):**
+  - The advertised host (ONVIF XAddr / GetStreamUri / GetSnapshotUri / WS-Discovery, and the RTSP SDP `c=` line) now prefers a directly-reachable LAN interface and only falls back to a VPN tunnel (e.g. Tailscale `tun0`, WireGuard) when no LAN address exists. Interfaces are classified **by name** (`wlan*`/`eth*`/`rmnet*` vs `tun*`/`wg*`/`ppp*`), because Mono-on-Android reports `NetworkInterfaceType` as `Unknown` for the Wi-Fi NIC — a type-based check silently advertised the VPN IP, which is unreachable from a LAN VMS. Loopback and link-local addresses are excluded.
+
+  **Verified live:** on a MediaTek device running Tailscale — WS-Discovery probe → ProbeMatch, the full Device/Media operation set over SOAP, and the advertised RTSP URL streaming H.264 1080p + AAC, all reporting the reachable LAN address.
+
   **Architecture & testing:**
   - All SOAP/XML/digest/discovery *logic* lives in Android-free classes (`OnvifSoap`, `OnvifSecurity`, `OnvifDeviceService`, `OnvifMediaService`, `WsDiscoveryMessages`); only the transport shells touch the platform. The logic is linked into the test project and covered by unit tests (SOAP parsing, a known-answer PasswordDigest vector, GetStreamUri/GetProfiles composition, ProbeMatch content).
   - New config: `ServerConfiguration.Onvif` (`OnvifOptions`: `Enabled`, `Port`, `Manufacturer`, `Model`, `FirmwareVersion`, `SerialNumber`, `HardwareId`).
   - Scope: Profile S (streaming) only — no PTZ/Events/Imaging; HTTP only on the ONVIF port.
+
+  **Software noise-reduction + digital stabilization (`Services/FrameStabilizer.cs` + `FrameStabilizerMath.cs`):**
+  - Opt-in CPU post-processing of **back-camera** NV21 frames before H.264 encoding, off by default (`ServerConfiguration.BackCameraStabilization`, a `VideoStabilizationOptions`). Two stages: motion-adaptive temporal denoise (blends static pixels toward the previous frame, passes moving pixels through — also cuts bitrate by removing sensor noise) and translation-only digital stabilization (integral-projection motion estimate on downscaled luma, low-pass trajectory, integer-pixel shift within a small crop margin).
+  - Deliberately conservative: it never touches the native camera library (works only over the bytes the AAR returns), reuses scratch buffers (no steady-state GC), and **self-disables permanently** if it runs over `FrameBudgetMs` for `OverBudgetFramesToDisable` consecutive frames — so enabling it can never silently regress encoder framerate. The denoise/shift/projection kernels are Android-free (`FrameStabilizerMath`) and unit-tested.
+
+  **Runtime camera switching (`RTSP/Server.cs`):**
+  - New public API for devices that cannot run both cameras at once: `Server.SetCameraActive(bool front, bool start)` starts/stops one camera independently, and `Server.SwitchCameras()` stops the active camera and starts the other (stop-before-start releases the native camera lock first). Both route through the event bus.
+  - `BussCommand.START_CAMERA_*` / `STOP_CAMERA_*` / `SWITCH_CAMERA` are now fully implemented — `STOP_CAMERA_*` actually releases the camera (previously ignored to protect continuous streaming). Camera lifecycle is owned by the RTSP `Server`; `MjpegServer.Stop()` no longer tears down shared cameras on its own teardown.
 
 - v1.5.30: **Stall Resilience — dark "STREAM STALLED" placeholder** — a stalled camera no longer drops the client. While the camera delivers no frames, the server keeps the H.264/MJPEG session alive by feeding a synthetic dark placeholder frame, and real video resumes seamlessly on the same session once the camera recovers. Gated on `ServerConfiguration.StallPlaceholderEnabled` (default `true`).
 

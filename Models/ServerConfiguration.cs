@@ -74,7 +74,7 @@ public class ServerConfiguration
     /// </summary>
     /// <remarks>
     /// The effective resolution (this preset, or <see cref="BackCameraWidth"/>/<see cref="BackCameraHeight"/>
-    /// when set) drives the automatic H.264 bitrate, scaled at ~0.1 bits/pixel/frame. Override the bitrate
+    /// when set) drives the automatic H.264 bitrate, scaled at ~0.2 bits/pixel/frame. Override the bitrate
     /// at runtime with <c>Server.SetBackCameraBitrate(int)</c>, or pass 0 / call <c>SetBackCameraAutoBitrate()</c>
     /// to return to automatic. For custom resolutions, use <see cref="BackCameraWidth"/> and <see cref="BackCameraHeight"/>.
     /// </remarks>
@@ -100,7 +100,7 @@ public class ServerConfiguration
     /// </summary>
     /// <remarks>
     /// The effective resolution (this preset, or <see cref="FrontCameraWidth"/>/<see cref="FrontCameraHeight"/>
-    /// when set) drives the automatic H.264 bitrate, scaled at ~0.1 bits/pixel/frame. Override the bitrate
+    /// when set) drives the automatic H.264 bitrate, scaled at ~0.2 bits/pixel/frame. Override the bitrate
     /// at runtime with <c>Server.SetFrontCameraBitrate(int)</c>, or pass 0 / call <c>SetFrontCameraAutoBitrate()</c>
     /// to return to automatic. For custom resolutions, use <see cref="FrontCameraWidth"/> and <see cref="FrontCameraHeight"/>.
     /// </remarks>
@@ -279,11 +279,15 @@ public class ServerConfiguration
     /// <c>m=audio</c> track alongside the video track. Default is false.
     /// </summary>
     /// <remarks>
-    /// When true, the SDP includes an AAC-LC audio track (payload type 97,
-    /// <c>a=control:trackID=1</c>) and SETUP for <c>trackID=1</c> is accepted.
-    /// In the current build no audio RTP packets are actually emitted — this flag
-    /// only exercises the multi-track RTSP/SDP path so player compatibility
-    /// (VLC, FFmpeg) can be validated ahead of the real AAC encoder work.
+    /// When true, the SDP advertises a hardware-encoded AAC-LC audio track
+    /// (<c>mpeg4-generic</c>, <c>a=control:trackID=1</c>) with RFC 3640 AAC-hbr fmtp
+    /// parameters, SETUP for <c>trackID=1</c> is accepted with its own SSRC/sequence,
+    /// and live audio RTP is emitted alongside the H.264 video track (each access unit
+    /// packetised per RFC 3640). The audio pipeline starts on the first audio-track SETUP
+    /// and is torn down when the last client leaves. Sample rate and channel count come
+    /// from <see cref="AudioSampleRateHz"/> and <see cref="AudioChannels"/>. Off by default
+    /// so single-track clients see byte-identical SDP. Requires
+    /// <c>android.permission.RECORD_AUDIO</c> in the host manifest plus a runtime grant.
     /// </remarks>
     public bool EnableAudioTrack { get; set; } = false;
 
@@ -335,8 +339,8 @@ public class OnvifOptions
     /// <summary>Model name reported by <c>GetDeviceInformation</c> and the <c>name</c> discovery scope. Default "BaluMediaServer".</summary>
     public string Model { get; set; } = "BaluMediaServer";
 
-    /// <summary>Firmware/version string reported by <c>GetDeviceInformation</c>. Default "1.6.0".</summary>
-    public string FirmwareVersion { get; set; } = "1.6.0";
+    /// <summary>Firmware/version string reported by <c>GetDeviceInformation</c>. Default "1.5.32".</summary>
+    public string FirmwareVersion { get; set; } = "1.5.32";
 
     /// <summary>Per-unit serial number reported by <c>GetDeviceInformation</c>. Default empty — set a unique value per device.</summary>
     public string SerialNumber { get; set; } = string.Empty;

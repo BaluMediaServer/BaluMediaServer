@@ -561,8 +561,10 @@ public class MjpegServer : IDisposable
         BaluLogger.Warn("MJPEG SERVER", $"Stop() called - stack trace: {Environment.StackTrace}");
         _clientsBack.Clear();
         _clientsFront.Clear();
-        EventBuss.SendCommand(BussCommand.STOP_CAMERA_BACK);
-        EventBuss.SendCommand(BussCommand.STOP_CAMERA_FRONT);
+        // Do NOT stop the cameras here: STOP_CAMERA_* commands now actually release
+        // the cameras, and the RTSP server may still be streaming from them. Camera
+        // lifecycle is owned by the RTSP Server (Stop()) — the MJPEG server is only a
+        // secondary consumer and must not tear down a shared camera on its own teardown.
         _streamStarted = false;
         _listener.Stop();
     }

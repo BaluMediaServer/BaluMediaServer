@@ -273,26 +273,41 @@ public class SdpGenerator : ISdpGenerator
     {
         try
         {
+            // Prefer a real LAN interface (Wi-Fi / Ethernet / cellular) so the advertised address is
+            // reachable from clients on the same network. Only fall back to a VPN tunnel if there is
+            // no LAN IPv4 — otherwise a device running a VPN (e.g. Tailscale) advertises its
+            // unreachable tunnel IP, breaking ONVIF GetStreamUri/XAddr and the RTSP SDP for LAN clients.
+            //
+            // Classification is by interface NAME, not NetworkInterfaceType: Mono on Android reports
+            // the type as Unknown for wlan0/eth0, so a type-based check silently misses the LAN NIC and
+            // falls through to the tunnel. Names are stable (wlan*, eth*, rmnet*, tun*, wg*, ...).
+            string? tunnelFallback = null;
+
             foreach (var networkInterface in NetworkInterface.GetAllNetworkInterfaces())
             {
-                // Skip loopback and non-operational interfaces
                 if (networkInterface.OperationalStatus != OperationalStatus.Up)
                     continue;
 
-                // Check for WiFi or Ethernet interfaces on Android
-                if (networkInterface.NetworkInterfaceType == NetworkInterfaceType.Wireless80211 ||
-                    networkInterface.NetworkInterfaceType == NetworkInterfaceType.Ethernet ||
-                    networkInterface.Name.ToLower().Contains("tun0"))
+                var ipv4 = FirstIPv4(networkInterface);   // skips loopback + link-local
+                if (ipv4 is null)
+                    continue;
+
+                var name = networkInterface.Name.ToLowerInvariant();
+                bool isTunnel = name.StartsWith("tun") || name.StartsWith("tap") ||
+                                name.StartsWith("ppp") || name.StartsWith("wg") ||
+                                networkInterface.NetworkInterfaceType == NetworkInterfaceType.Tunnel;
+
+                if (isTunnel)
                 {
-                    foreach (var addr in networkInterface.GetIPProperties().UnicastAddresses)
-                    {
-                        if (addr.Address.AddressFamily == AddressFamily.InterNetwork)
-                        {
-                            return addr.Address.ToString();
-                        }
-                    }
+                    tunnelFallback ??= ipv4;             // remember, but only use if no LAN address exists
+                    continue;
                 }
+
+                return ipv4;                             // first non-tunnel, non-loopback IPv4 wins
             }
+
+            if (tunnelFallback is not null)
+                return tunnelFallback;
         }
         catch (Exception ex)
         {
@@ -300,6 +315,28 @@ public class SdpGenerator : ISdpGenerator
         }
 
         return "0.0.0.0";
+    }
+
+    /// <summary>
+    /// Returns the first usable IPv4 unicast address of an interface, or null if it has none.
+    /// Skips loopback (127.x) and link-local/APIPA (169.254.x) addresses so they are never advertised.
+    /// </summary>
+    private static string? FirstIPv4(NetworkInterface networkInterface)
+    {
+        if (networkInterface.NetworkInterfaceType == NetworkInterfaceType.Loopback ||
+            networkInterface.Name.Equals("lo", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        foreach (var addr in networkInterface.GetIPProperties().UnicastAddresses)
+        {
+            if (addr.Address.AddressFamily != AddressFamily.InterNetwork)
+                continue;
+            var ip = addr.Address.ToString();
+            if (ip.StartsWith("127.") || ip.StartsWith("169.254."))
+                continue;
+            return ip;
+        }
+        return null;
     }
 
     /// <summary>

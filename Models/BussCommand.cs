@@ -37,8 +37,10 @@ public enum BussCommand : int
     STOP_MJPEG_SERVER,
 
     /// <summary>
-    /// Command to switch between front and back cameras.
-    /// Reserved for future implementation.
+    /// Command to switch the active camera for devices that cannot run both
+    /// cameras simultaneously: stops the currently-active camera and starts the
+    /// other one. If only the back camera is active it switches to front;
+    /// otherwise it switches to back.
     /// </summary>
     SWITCH_CAMERA,
 }

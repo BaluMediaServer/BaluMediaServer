@@ -706,44 +706,16 @@ public class Server : IDisposable
             switch (command)
             {
                 case BussCommand.START_CAMERA_FRONT:
-                    lock (_frontCameraLock)
-                    {
-                        if (!_isCapturingFront && _frontCameraEnabled)
-                        {
-                            if (!IsRunning)
-                            {
-                                _frontService = new();
-                                _frontService.FrameReceived += OnFrontFrameAvailable;
-                            }
-                            _frontService.StartCapture(_frontCameraWidth, _frontCameraHeight);
-                            _isCapturingFront = true;
-                        }
-                    }
+                    StartFrontCamera();
                     break;
                 case BussCommand.STOP_CAMERA_FRONT:
-                    // NOTE: Camera stop disabled for continuous streaming to prevent interruptions
-                    // To stop cameras, use the explicit Stop() method or stop the server
-                    BaluLogger.Debug("[RTSP Server]", "STOP_CAMERA_FRONT command ignored - continuous streaming mode enabled");
+                    StopFrontCamera();
                     break;
                 case BussCommand.START_CAMERA_BACK:
-                    lock (_backCameraLock)
-                    {
-                        if (!_isCapturingBack && _backCameraEnabled)
-                        {
-                            if (!IsRunning)
-                            {
-                                _backService = new();
-                                _backService.FrameReceived += OnBackFrameAvailable;
-                            }
-                            _backService.StartCapture(_backCameraWidth, _backCameraHeight);
-                            _isCapturingBack = true;
-                        }
-                    }
+                    StartBackCamera();
                     break;
                 case BussCommand.STOP_CAMERA_BACK:
-                    // NOTE: Camera stop disabled for continuous streaming to prevent interruptions
-                    // To stop cameras, use the explicit Stop() method or stop the server
-                    BaluLogger.Debug("[RTSP Server]", "STOP_CAMERA_BACK command ignored - continuous streaming mode enabled");
+                    StopBackCamera();
                     break;
                 case BussCommand.START_MJPEG_SERVER:
                     if (!_mjpegServerEnabled)
@@ -759,7 +731,7 @@ public class Server : IDisposable
                     BaluLogger.Debug("[RTSP Server]", "STOP_MJPEG_SERVER command ignored - continuous streaming mode enabled");
                     break;
                 case BussCommand.SWITCH_CAMERA:
-                    // Implementation unchanged
+                    SwitchCamera();
                     break;
             }
         }
@@ -767,6 +739,143 @@ public class Server : IDisposable
         {
             BaluLogger.Error("BALU MEDIA SERVER SERVER", ex.Message);
         }
+    }
+
+    /// <summary>
+    /// Starts the front camera capture if it is enabled and not already running.
+    /// Reuses the existing service instance while the server is running so the
+    /// FrameReceived subscription is preserved across stop/start cycles.
+    /// </summary>
+    private void StartFrontCamera()
+    {
+        lock (_frontCameraLock)
+        {
+            if (!_isCapturingFront && _frontCameraEnabled)
+            {
+                if (!IsRunning)
+                {
+                    _frontService = new();
+                    _frontService.FrameReceived += OnFrontFrameAvailable;
+                }
+                _frontService.StartCapture(_frontCameraWidth, _frontCameraHeight);
+                _isCapturingFront = true;
+                BaluLogger.Info("[RTSP Server]", "Front camera started");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Stops the front camera capture and releases the native camera, freeing it
+    /// for the back camera on devices that cannot run both simultaneously. The
+    /// service instance is kept (StopCapture, not Dispose) so it can be restarted.
+    /// </summary>
+    private void StopFrontCamera()
+    {
+        lock (_frontCameraLock)
+        {
+            if (_isCapturingFront)
+            {
+                try { _frontService.StopCapture(); }
+                catch (Exception ex) { BaluLogger.Warn("[RTSP Server]", $"Front camera stop error: {ex.Message}"); }
+                _isCapturingFront = false;
+                BaluLogger.Info("[RTSP Server]", "Front camera stopped");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Starts the back camera capture if it is enabled and not already running.
+    /// Reuses the existing service instance while the server is running so the
+    /// FrameReceived subscription is preserved across stop/start cycles.
+    /// </summary>
+    private void StartBackCamera()
+    {
+        lock (_backCameraLock)
+        {
+            if (!_isCapturingBack && _backCameraEnabled)
+            {
+                if (!IsRunning)
+                {
+                    _backService = new();
+                    _backService.FrameReceived += OnBackFrameAvailable;
+                }
+                _backService.StartCapture(_backCameraWidth, _backCameraHeight);
+                _isCapturingBack = true;
+                BaluLogger.Info("[RTSP Server]", "Back camera started");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Stops the back camera capture and releases the native camera, freeing it
+    /// for the front camera on devices that cannot run both simultaneously. The
+    /// service instance is kept (StopCapture, not Dispose) so it can be restarted.
+    /// </summary>
+    private void StopBackCamera()
+    {
+        lock (_backCameraLock)
+        {
+            if (_isCapturingBack)
+            {
+                try { _backService.StopCapture(); }
+                catch (Exception ex) { BaluLogger.Warn("[RTSP Server]", $"Back camera stop error: {ex.Message}"); }
+                _isCapturingBack = false;
+                BaluLogger.Info("[RTSP Server]", "Back camera stopped");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Switches the active camera for devices that cannot run both cameras at the
+    /// same time: stops the currently-active camera and starts the other one.
+    /// Stop happens before start so the native camera lock is released first.
+    /// <para>
+    /// Target selection: if only the back camera is active, switches to front;
+    /// otherwise (front active, neither active, or both active) switches to back.
+    /// A camera disabled via <see cref="ServerConfiguration"/> is skipped by the
+    /// underlying start, so switching to a disabled camera is a no-op.
+    /// </para>
+    /// </summary>
+    private void SwitchCamera()
+    {
+        bool switchToFront = _isCapturingBack && !_isCapturingFront;
+        if (switchToFront)
+        {
+            StopBackCamera();
+            StartFrontCamera();
+        }
+        else
+        {
+            StopFrontCamera();
+            StartBackCamera();
+        }
+        BaluLogger.Info("[RTSP Server]", $"SWITCH_CAMERA -> {(switchToFront ? "front" : "back")}");
+    }
+
+    /// <summary>
+    /// Switches the active camera to the other lens (stop current, start other).
+    /// Convenience wrapper so callers can switch without using the event bus.
+    /// Intended for devices that cannot run both cameras simultaneously.
+    /// </summary>
+    public void SwitchCameras() => EventBuss.SendCommand(BussCommand.SWITCH_CAMERA);
+
+    /// <summary>
+    /// Starts or stops a single camera without affecting the server or the other
+    /// camera. Lets callers free one camera so the other can open on devices that
+    /// cannot run both at once.
+    /// </summary>
+    /// <param name="front">True to target the front camera, false for the back camera.</param>
+    /// <param name="start">True to start capture, false to stop it.</param>
+    public void SetCameraActive(bool front, bool start)
+    {
+        BussCommand command = (front, start) switch
+        {
+            (true, true) => BussCommand.START_CAMERA_FRONT,
+            (true, false) => BussCommand.STOP_CAMERA_FRONT,
+            (false, true) => BussCommand.START_CAMERA_BACK,
+            (false, false) => BussCommand.STOP_CAMERA_BACK,
+        };
+        EventBuss.SendCommand(command);
     }
 
     private bool _loggedFirstBackFrame;
